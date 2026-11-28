@@ -9,7 +9,7 @@ import { launch, mockWizardApis, sessionStub, wizard } from "./helpers/wizard";
 
 const HEADER = "[data-testid='sidebar-group-header']";
 const ROW = "[data-testid='sidebar-session-row']";
-const AXIS_TOGGLE = "[data-testid='sidebar-axis-toggle']";
+const AXIS_TOGGLE = "[data-testid='sidebar-view-toggle']";
 
 function twoRepoSessions(): MockSessionInput[] {
   return [
@@ -127,10 +127,11 @@ test.describe("sidebar repo groups (#1220)", () => {
     await expect(page.getByText("repo-beta")).toBeVisible();
 
     await expect(page.locator(ROW)).toHaveCount(2);
-    await expect(page.getByText("alpha-session")).toBeVisible();
-    await expect(page.getByText("beta-session")).toBeVisible();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeVisible();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("beta-session")).toBeVisible();
 
-    await page.getByLabel("Filter sessions").click();
+    await page.getByTestId("sidebar-view-toggle").click();
+    await page.getByTestId("sidebar-filter-toggle").click();
     const filter = page.locator("[data-testid='sidebar-filter-input']");
     await expect(filter).toBeVisible();
 
@@ -163,7 +164,7 @@ test.describe("sidebar repo groups (#1220)", () => {
 
     // Collapsed, the header uses the projected token; border-brand-600 fails contrast on catppuccin-latte.
     await expandBtn.click();
-    await expect(page.getByText("alpha-session")).toBeHidden();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeHidden();
     expect(await alphaHeader.getAttribute("class")).toContain("border-session-active");
     expect(await betaHeader.getAttribute("class")).not.toContain("border-session-active");
     // toHaveCSS polls past the color transition.
@@ -359,7 +360,7 @@ test.describe("sidebar status axis (#4867)", () => {
     await gotoDesktop(page);
 
     const axisToggle = page.locator(AXIS_TOGGLE);
-    const menu = page.getByTestId("sidebar-axis-menu");
+    const menu = page.getByTestId("sidebar-view-menu");
     const option = (target: string) => page.getByTestId(`sidebar-axis-option-${target}`);
     await axisToggle.focus();
     await page.keyboard.press("Enter");
@@ -373,15 +374,16 @@ test.describe("sidebar status axis (#4867)", () => {
     await expect(option("repo")).toBeFocused();
     await expect(option("repo")).toHaveAttribute("tabindex", "-1");
 
+    // One View options menu holds grouping, sorting and the filter; the arrows walk all of it.
     await page.keyboard.press("ArrowDown");
     await expect(option("org")).toBeFocused();
     await page.keyboard.press("End");
-    await expect(option("status")).toBeFocused();
+    await expect(page.getByTestId("sidebar-filter-toggle")).toBeFocused();
     // Both ends wrap.
     await page.keyboard.press("ArrowDown");
     await expect(option("repo")).toBeFocused();
     await page.keyboard.press("ArrowUp");
-    await expect(option("status")).toBeFocused();
+    await expect(page.getByTestId("sidebar-filter-toggle")).toBeFocused();
     await page.keyboard.press("Home");
     await expect(option("repo")).toBeFocused();
 
@@ -673,8 +675,8 @@ test.describe("sidebar org axis (#3283)", () => {
 
     await alphaExpand.click();
     await expect(alphaExpand).toHaveAttribute("aria-expanded", "false");
-    await expect(page.getByText("alpha-session")).toBeHidden();
-    await expect(page.getByText("beta-session")).toBeVisible();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeHidden();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("beta-session")).toBeVisible();
 
     await page.reload();
     await expect(axisToggle).toHaveAttribute("data-axis", "org");

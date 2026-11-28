@@ -14,9 +14,6 @@ pub struct RestartRequest {
     /// cascade and hands the post-cascade snapshot back in `RestartResult`.
     pub instance: Instance,
     pub size: Option<(u16, u16)>,
-    /// Keys to send once the pane is live again. Empty disables the wake-up
-    /// (the documented opt-out via `session.restart_wake_message`).
-    pub wake_message: String,
     /// Skip on_launch hooks that already ran in the background creation poller.
     pub skip_on_launch: bool,
     /// Kill a hook that outlives the recovery hook timeout, so a hung hook
@@ -52,15 +49,12 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
         session_id,
         mut instance,
         size,
-        wake_message,
         skip_on_launch,
         bound_hooks,
         discard_sandbox_container,
         conversation_carry,
     } = request;
 
-    let title = instance.title.clone();
-    let tool = instance.tool.clone();
     let before = instance.clone();
 
     // Recovery bounds hooks so a hanging command cannot wedge its worker.
@@ -80,90 +74,11 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
             .map_err(|e| e.to_string())
     };
 
-    // On a successful restart, send the wake-up keys on a detached thread so the result (and the
-    // row's status update) propagate back immediately rather than waiting out the up-to-3s
-    // pane-readiness probe.
-    let should_wake = launched_agent(&outcome);
-    if should_wake && !wake_message.is_empty() {
-        let delay = instance.send_keys_enter_delay();
-        spawn_wake_worker(session_id.clone(), title, tool, wake_message, None, delay);
-    }
-
     RestartResult {
         session_id,
         before: Box::new(before),
         instance: Box::new(instance),
         outcome,
-    }
-}
-
-/// Whether the restart left the agent running in a live pane.
-pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
-    matches!(
-        outcome,
-        Ok(StartOutcome::Fresh
-            | StartOutcome::Resumed
-            | StartOutcome::FreshAfterFailedResume { .. })
-    )
-}
-
-/// Wait for the restarted pane to become live and past its boot shell, then
-/// send the wake-up message. Best-effort: a failure to spawn or send is logged,
-/// never fatal.
-pub(crate) fn spawn_wake_worker(
-    session_id: String,
-    title: String,
-    tool: String,
-    wake_message: String,
-    identity: Option<(String, u64)>,
-    delay: u64,
-) {
-    let spawn_result = std::thread::Builder::new()
-        .name(format!("aoe-restart-wake/{}", session_id))
-        .stack_size(128 * 1024)
-        .spawn(move || {
-            let Ok(tmux_session) = crate::tmux::Session::new(&session_id, &title) else {
-                return;
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
-            loop {
-                if !tmux_session.exists() {
-                    return;
-                }
-                let pane_alive = !tmux_session.is_pane_dead();
-                let hook_active = crate::hooks::read_hook_status(&session_id).is_some();
-                if pane_alive && (hook_active || !tmux_session.is_pane_running_shell()) {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-
-            if !tmux_session.exists() {
-                return;
-            }
-            if let Some((profile, generation)) = identity {
-                let current = crate::session::Storage::new_unwatched(&profile)
-                    .and_then(|storage| storage.load())
-                    .ok()
-                    .is_some_and(|rows| rows.iter().any(|row| {
-                        row.id == session_id
-                            && row.lifecycle_generation == generation
-                            && row.title == title
-                            && row.tool == tool
-                    }));
-                if !current {
-                    return;
-                }
-            }
-            if let Err(e) = tmux_session.send_keys_with_delay(&wake_message, delay) {
-                tracing::warn!(target: "session.restart", "failed to send wake-up message after restart: {}", e);
-            }
-        });
-    if let Err(err) = spawn_result {
-        tracing::warn!(target: "session.restart", ?err, "failed to spawn restart wake-up worker");
     }
 }
 
@@ -245,7 +160,6 @@ mod tests {
                 session_id: instance.id.clone(),
                 instance,
                 size: None,
-                wake_message: String::new(),
                 skip_on_launch: false,
                 bound_hooks: true,
                 discard_sandbox_container: true,
@@ -266,17 +180,5 @@ mod tests {
                 "peer_reserved={peer_reserved}: {error}"
             );
         }
-    }
-
-    #[test]
-    fn restart_wake_requires_a_successful_launch() {
-        let sid = "11111111-2222-3333-4444-555555555555".to_string();
-        assert!(!launched_agent(&Ok(StartOutcome::ResumeFailed {
-            sid: sid.clone(),
-        })));
-        assert!(launched_agent(&Ok(StartOutcome::FreshAfterFailedResume {
-            sid,
-        })));
-        assert!(!launched_agent(&Err("launch refused".into())));
     }
 }

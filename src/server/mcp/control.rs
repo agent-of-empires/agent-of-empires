@@ -14,7 +14,7 @@ use crate::acp::dispatch::PromptDispatch;
 use crate::daemon::{CreateSessionBody, SessionResponse};
 use crate::server::api::sessions::{
     capture_terminal_output, create_session_with, send_terminal_message, CaptureError,
-    SendKeysError,
+    CreateOrigin, SendKeysError, SendPane,
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
@@ -33,6 +33,12 @@ const PROMPT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// Pane lines `read_output` captures when the caller names none, as `GET /output` does.
 const DEFAULT_LINES: u32 = 200;
+
+/// A create's prompt result: sent, how, why not, and `prompt_error_code`.
+type PromptOutcome = (bool, PromptDelivery, Option<String>, Option<&'static str>);
+
+/// The code for a terminal pane whose input box holds a person's draft.
+const INPUT_LINE_BUSY: &str = "input_line_busy";
 
 /// Why a `create_session` prompt did not reach a session another one manages.
 const IGNORED_PROMPT: &str =
@@ -122,6 +128,10 @@ pub(super) struct CreatedSession {
     /// Why the prompt was not delivered, for `failed`, `blocked_waiting` and `not_ready`.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_error: Option<String>,
+    /// `input_line_busy` when the prompt was refused because the input box held a person's
+    /// draft, as `send` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_error_code: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -133,6 +143,27 @@ pub(super) struct SendParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub(super) struct SendToParentParams {
     message: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct SuggestSessionParams {
+    /// Short title of the suggested session.
+    title: String,
+    /// The first prompt the suggested session starts with.
+    prompt: String,
+    /// Why this is worth doing now.
+    #[serde(default)]
+    reason: String,
+    /// Registered Project name or path the session belongs in.
+    project: Option<String>,
+    /// A stable key; suggesting the same one again replaces that suggestion.
+    id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct SuggestOutcome {
+    /// The suggestion's id.
+    id: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -237,8 +268,10 @@ impl McpServer {
             &reference,
             wait_ready,
             body,
-            initial_turn,
-            crate::daemon::PromptOrigin::Mcp,
+            CreateOrigin {
+                initial_turn,
+                ..CreateOrigin::wizard(crate::daemon::PromptOrigin::Mcp)
+            },
         )
         .await;
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
@@ -246,17 +279,19 @@ impl McpServer {
         // comes up did not ask for this prompt to land there.
         let ignored =
             prompt.is_some() && fresh && !structured && self.session_is_ignored(&session.id).await;
-        let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
-            None => (false, PromptDelivery::None, None),
-            Some(_) if !fresh => (false, PromptDelivery::Replayed, None),
-            Some(_) if structured => (true, PromptDelivery::PendingInitialTurn, None),
+        let (prompt_sent, prompt_delivery, prompt_error, prompt_error_code) = match prompt {
+            None => (false, PromptDelivery::None, None, None),
+            Some(_) if !fresh => (false, PromptDelivery::Replayed, None, None),
+            Some(_) if structured => (true, PromptDelivery::PendingInitialTurn, None, None),
             Some(_) if ignored => (
                 false,
                 PromptDelivery::Ignored,
                 Some(IGNORED_PROMPT.to_string()),
+                None,
             ),
             Some(text) => {
-                let readiness = wait_for_input_prompt(&self.state, &session.id).await;
+                let (readiness, checked_pane) =
+                    wait_for_input_prompt(&self.state, &session.id).await;
                 // The wait can outlast a person's ignore, so it is checked again before
                 // the readiness result decides what the caller is told.
                 if self.session_is_ignored(&session.id).await {
@@ -264,72 +299,11 @@ impl McpServer {
                         false,
                         PromptDelivery::Ignored,
                         Some(IGNORED_PROMPT.to_string()),
+                        None,
                     )
                 } else {
-                    match readiness {
-                PaneReadiness::Waiting => (
-                    false,
-                    PromptDelivery::BlockedWaiting,
-                    Some(
-                        "The agent is waiting on a dialog in its terminal, such as a folder-trust \
-                         question. Nothing was typed: a person answers it there, then `send` the \
-                         prompt."
-                            .to_string(),
-                    ),
-                ),
-                PaneReadiness::NotYet | PaneReadiness::Unreadable => (
-                    false,
-                    PromptDelivery::NotReady,
-                    Some(format!(
-                        "The agent did not reach its input prompt within {} s, so nothing was \
-                         typed. `send` the prompt once it is ready.",
-                        PROMPT_READY_TIMEOUT.as_secs()
-                    )),
-                ),
-                PaneReadiness::NoPromptRule => (
-                    false,
-                    PromptDelivery::NotReady,
-                    Some(
-                        "This agent has no status rules that show its input prompt, so nothing \
-                         was typed. `send` the prompt instead."
-                            .to_string(),
-                    ),
-                ),
-                PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None),
-                // A session that just failed to start is not restarted behind the caller's back.
-                PaneReadiness::AtPrompt => match send_terminal_message(
-                    &self.state.session_service,
-                    &session.id,
-                    text.clone(),
-                    false,
-                    true,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        log_terminal_message_sent(&session.id, &text);
-                        self.publish().await;
-                        (true, PromptDelivery::Sent, None)
-                    }
-                    Err(e) => match e.error {
-                        SendKeysError::Ignored => (
-                            false,
-                            PromptDelivery::Ignored,
-                            Some(IGNORED_PROMPT.to_string()),
-                        ),
-                        SendKeysError::NotRunning => (false, PromptDelivery::NotRunning, None),
-                        other => {
-                            let refusal = terminal_refusal(&session.id, other).await;
-                            let message = refusal
-                                .structured_content
-                                .as_ref()
-                                .and_then(|c| c["message"].as_str())
-                                .map(str::to_string);
-                            (false, PromptDelivery::Failed, message)
-                        }
-                    },
-                },
-                    }
+                    self.deliver_terminal_prompt(&session.id, text, readiness, checked_pane)
+                        .await
                 }
             }
         };
@@ -339,6 +313,7 @@ impl McpServer {
             prompt_sent,
             prompt_delivery,
             prompt_error,
+            prompt_error_code,
         }))
     }
 
@@ -358,6 +333,46 @@ impl McpServer {
             .await
             .map(Json)
             .map_err(|e| *e)
+    }
+
+    #[rmcp::tool(
+        description = "Suggest a session for the user to start: it appears under Suggested \
+            sessions in the dashboard and the TUI until they start or dismiss it. Give a \
+            title, the prompt the session starts with, and why. Suggesting the same `id` again \
+            replaces it."
+    )]
+    async fn suggest_session(
+        &self,
+        Parameters(params): Parameters<SuggestSessionParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<SuggestOutcome>, CallToolResult> {
+        if let Some(refusal) = read_only_refusal(&self.state) {
+            return Err(refusal);
+        }
+        let pushed_by = match caller_session_id(&context) {
+            Some(id) => self
+                .state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .map(|inst| inst.title.clone()),
+            None => None,
+        }
+        .unwrap_or_else(|| "Agent".to_string());
+        let input = crate::plugin::suggestions::AgentPush {
+            id: params.id,
+            title: params.title,
+            reason: params.reason,
+            prompt: params.prompt,
+            project: params.project,
+            pushed_by,
+        };
+        crate::server::api::push_agent_suggestion(&self.state, input)
+            .await
+            .map(|id| Json(SuggestOutcome { id }))
+            .map_err(|(_, code, message)| tool_error(code, message))
     }
 
     #[rmcp::tool(
@@ -505,14 +520,7 @@ impl McpServer {
         // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so MCP refuses a
         // pane whose status rules detect one; an agent without status rules gets no check. HTTP
         // `POST /send` is left as is: a person at the dashboard sees the pane.
-        if self.terminal_pane_waiting(&id).await {
-            return Err(Box::new(tool_error(
-                "waiting",
-                "The agent is waiting on a dialog or question in its terminal, or its pane could \
-                 not be read, so nothing was typed. A person answers a dialog there; retry once \
-                 the pane can be read.",
-            )));
-        }
+        let checked_pane = self.terminal_pane_refusal(&id).await?;
         // No revival: a restarted agent can open on a dialog the check above never saw.
         if let Err(e) = send_terminal_message(
             &self.state.session_service,
@@ -520,6 +528,10 @@ impl McpServer {
             message.clone(),
             false,
             true,
+            SendPane {
+                checked: Some(checked_pane),
+                draft_wait: std::time::Duration::ZERO,
+            },
         )
         .await
         {
@@ -598,11 +610,106 @@ impl McpServer {
             .map(|i| i.view)
     }
 
-    /// Whether a terminal session's status rules detect a dialog or question waiting on a
-    /// person, read once, without waiting. A check that fails to run counts as waiting, as does,
-    /// for an agent with a status manifest, a pane that can't be captured. `send` is explicit, so
-    /// an agent without one (`NoPromptRule`) is not refused.
-    async fn terminal_pane_waiting(&self, id: &str) -> bool {
+    /// What a create tells its caller about its terminal prompt once the wait for the agent's
+    /// input prompt has settled as `readiness` on `checked_pane`: whether it was sent, how, why
+    /// not, and the code for a refused draft.
+    async fn deliver_terminal_prompt(
+        &self,
+        id: &str,
+        text: String,
+        readiness: PaneReadiness,
+        checked_pane: Option<String>,
+    ) -> PromptOutcome {
+        match readiness {
+            PaneReadiness::Waiting => (
+                false,
+                PromptDelivery::BlockedWaiting,
+                Some(
+                    "The agent is waiting on a dialog in its terminal, such as a folder-trust \
+                     question. Nothing was typed: a person answers it there, then `send` the \
+                     prompt."
+                        .to_string(),
+                ),
+                None,
+            ),
+            PaneReadiness::NotYet | PaneReadiness::Unreadable => (
+                false,
+                PromptDelivery::NotReady,
+                Some(format!(
+                    "The agent did not reach its input prompt within {} s, so nothing was \
+                     typed. `send` the prompt once it is ready.",
+                    PROMPT_READY_TIMEOUT.as_secs()
+                )),
+                None,
+            ),
+            PaneReadiness::Drafted => (
+                false,
+                PromptDelivery::NotReady,
+                Some(crate::tmux::InputLine::BUSY_MESSAGE.to_string()),
+                Some(INPUT_LINE_BUSY),
+            ),
+            PaneReadiness::NoPromptRule => (
+                false,
+                PromptDelivery::NotReady,
+                Some(
+                    "This agent has no status rules that show its input prompt, so nothing \
+                     was typed. `send` the prompt instead."
+                        .to_string(),
+                ),
+                None,
+            ),
+            PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None, None),
+            // A session that just failed to start is not restarted behind the caller's back.
+            PaneReadiness::AtPrompt => match send_terminal_message(
+                &self.state.session_service,
+                id,
+                text.clone(),
+                false,
+                true,
+                SendPane {
+                    checked: checked_pane,
+                    draft_wait: std::time::Duration::ZERO,
+                },
+            )
+            .await
+            {
+                Ok(_) => {
+                    log_terminal_message_sent(id, &text);
+                    self.publish().await;
+                    (true, PromptDelivery::Sent, None, None)
+                }
+                Err(e) => match e.error {
+                    SendKeysError::Ignored => (
+                        false,
+                        PromptDelivery::Ignored,
+                        Some(IGNORED_PROMPT.to_string()),
+                        None,
+                    ),
+                    SendKeysError::NotRunning => (false, PromptDelivery::NotRunning, None, None),
+                    other => {
+                        let code = matches!(other, SendKeysError::InputLineBusy)
+                            .then_some(INPUT_LINE_BUSY);
+                        let refusal = terminal_refusal(id, other).await;
+                        let message = refusal
+                            .structured_content
+                            .as_ref()
+                            .and_then(|c| c["message"].as_str())
+                            .map(str::to_string);
+                        (false, PromptDelivery::Failed, message, code)
+                    }
+                },
+            },
+        }
+    }
+
+    /// Why `send` refuses a terminal session's pane, read once, without waiting: its status rules
+    /// detect a dialog or question waiting on a person, or its input box holds a person's draft.
+    /// A check that fails to run counts as waiting, as does, for an agent with a status manifest,
+    /// a pane that can't be captured. `send` is explicit, so an agent without one
+    /// (`NoPromptRule`) is not refused. A session with no pane to check is refused as not
+    /// running, so `send` never types into a pane that appeared after the check. Otherwise
+    /// answers the pane it checked, for the send.
+    async fn terminal_pane_refusal(&self, id: &str) -> Result<String, Box<CallToolResult>> {
         let instance = self
             .state
             .instances
@@ -612,11 +719,31 @@ impl McpServer {
             .find(|i| i.id == id)
             .cloned();
         let Some(instance) = instance else {
-            return false;
+            return Err(Box::new(
+                terminal_refusal(id, SendKeysError::NotFound).await,
+            ));
         };
-        tokio::task::spawn_blocking(move || refuses_send(pane_readiness(&instance)))
+        let (readiness, pane) = tokio::task::spawn_blocking(move || pane_readiness(&instance))
             .await
-            .unwrap_or(true)
+            .unwrap_or((PaneReadiness::Unreadable, None));
+        match readiness {
+            PaneReadiness::Drafted => Err(Box::new(tool_error(
+                INPUT_LINE_BUSY,
+                crate::tmux::InputLine::BUSY_MESSAGE,
+            ))),
+            readiness if refuses_send(readiness) => Err(Box::new(tool_error(
+                "waiting",
+                "The agent is waiting on a dialog or question in its terminal, or its pane could \
+                 not be read, so nothing was typed. A person answers a dialog there; retry once \
+                 the pane can be read.",
+            ))),
+            _ => match pane {
+                Some(pane) => Ok(pane),
+                None => Err(Box::new(
+                    terminal_refusal(id, SendKeysError::NotRunning).await,
+                )),
+            },
+        }
     }
 
     /// Mutations reach the dashboard through a published snapshot, as the HTTP routes do.
@@ -675,6 +802,8 @@ enum PaneReadiness {
     AtPrompt,
     /// A rule matched a dialog or question waiting for a person.
     Waiting,
+    /// The input box holds text a person typed and has not sent.
+    Drafted,
     /// Neither yet: still starting, working, idle by a rule that does not see the prompt box, or
     /// the pane could not be captured.
     NotYet,
@@ -687,11 +816,12 @@ enum PaneReadiness {
 }
 
 /// Waits up to [`PROMPT_READY_TIMEOUT`] for a terminal session's agent to reach its input
-/// prompt, so a first prompt is never typed into a dialog. Returns at once on a dialog.
+/// prompt, so a first prompt is never typed into a dialog. Returns at once on a dialog, with the
+/// pane the last check read.
 async fn wait_for_input_prompt(
     state: &std::sync::Arc<crate::server::AppState>,
     id: &str,
-) -> PaneReadiness {
+) -> (PaneReadiness, Option<String>) {
     let deadline = tokio::time::Instant::now() + PROMPT_READY_TIMEOUT;
     loop {
         let instance = state
@@ -702,54 +832,80 @@ async fn wait_for_input_prompt(
             .find(|i| i.id == id)
             .cloned();
         let Some(instance) = instance else {
-            return PaneReadiness::Gone;
+            return (PaneReadiness::Gone, None);
         };
-        let readiness = tokio::task::spawn_blocking(move || pane_readiness(&instance))
+        let checked = tokio::task::spawn_blocking(move || pane_readiness(&instance))
             .await
-            .unwrap_or(PaneReadiness::NotYet);
-        let settled = !matches!(readiness, PaneReadiness::NotYet | PaneReadiness::Unreadable);
+            .unwrap_or((PaneReadiness::NotYet, None));
+        let settled = !matches!(checked.0, PaneReadiness::NotYet | PaneReadiness::Unreadable);
         if settled || tokio::time::Instant::now() >= deadline {
-            return readiness;
+            return checked;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
 /// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
-/// show` reads it. A stopped session is `Gone` before any capture, whose failure would read as
-/// `Unreadable`.
-fn pane_readiness(instance: &Instance) -> PaneReadiness {
+/// show` reads it, and the pane it read, so the send types into that one. A stopped session is
+/// `Gone` before any capture, whose failure would read as `Unreadable`.
+fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
     if matches!(
         instance.status,
         Status::Error | Status::Stopped | Status::Deleting
     ) {
-        return PaneReadiness::Gone;
+        return (PaneReadiness::Gone, None);
     }
     let Ok(session) = instance.tmux_session() else {
-        return PaneReadiness::Gone;
+        return (PaneReadiness::Gone, None);
     };
     if !session.exists() || session.is_pane_dead() {
-        return PaneReadiness::Gone;
+        return (PaneReadiness::Gone, None);
     }
-    readiness_of(instance.detect_pane_now(&instance.source_profile, &session, None))
+    let pane = session
+        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+        .ok();
+    readiness_in(instance, &session, pane)
 }
 
-/// MCP `send` refuses a pane whose status rules detect a dialog, or one it could not read. An
-/// agent without status rules (`NoPromptRule`) gets no dialog check.
+/// [`pane_readiness`] of the pane its lookup found. Without one nothing is captured: the
+/// session's default target may be another pane than the one a send would type into.
+fn readiness_in(
+    instance: &Instance,
+    session: &crate::tmux::Session,
+    pane: Option<String>,
+) -> (PaneReadiness, Option<String>) {
+    let Some(pane) = pane else {
+        return (PaneReadiness::Unreadable, None);
+    };
+    let (detected, input_line) =
+        instance.detect_pane_and_input_line_now(&instance.source_profile, session, &pane);
+    let readiness = readiness_of(detected, input_line);
+    #[cfg(test)]
+    crate::tmux::test_helpers::after_input_check(&pane);
+    (readiness, Some(pane))
+}
+
+/// MCP `send` refuses a pane whose status rules detect a dialog, one holding a draft, or one it
+/// could not read. An agent without status rules (`NoPromptRule`) gets no dialog check.
 fn refuses_send(readiness: PaneReadiness) -> bool {
     matches!(
         readiness,
-        PaneReadiness::Waiting | PaneReadiness::Unreadable
+        PaneReadiness::Waiting | PaneReadiness::Drafted | PaneReadiness::Unreadable
     )
 }
 
 /// Only a rule that sees the prompt box counts as at the prompt: other idle rules (a finished
 /// turn, an interrupt banner, the pane title) also hold while a dialog is on screen.
-fn readiness_of(detected: Option<(Option<Status>, &str)>) -> PaneReadiness {
+/// A dialog outranks a draft, which outranks the prompt box.
+fn readiness_of(
+    detected: Option<(Option<Status>, &str)>,
+    input_line: crate::tmux::InputLine,
+) -> PaneReadiness {
     match detected {
         None => PaneReadiness::NoPromptRule,
         Some((_, CAPTURE_FAILED_RULE)) => PaneReadiness::Unreadable,
         Some((Some(Status::Waiting), _)) => PaneReadiness::Waiting,
+        _ if input_line == crate::tmux::InputLine::Draft => PaneReadiness::Drafted,
         Some((Some(Status::Idle), "ready_prompt" | "live_prompt_box")) => PaneReadiness::AtPrompt,
         Some(_) => PaneReadiness::NotYet,
     }
@@ -991,6 +1147,9 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
              reclaim ownership or unignore it before MCP sends a prompt.",
         ),
         SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        SendKeysError::InputLineBusy => {
+            tool_error(INPUT_LINE_BUSY, crate::tmux::InputLine::BUSY_MESSAGE)
+        }
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "terminal send failed");
             tool_error("send_failed", "Terminal send failed")
@@ -1007,32 +1166,335 @@ pub(super) fn not_found(id: &str) -> CallToolResult {
 mod tests {
     use super::*;
 
+    /// A create's prompt refused for a person's draft carries `input_line_busy`, whether the
+    /// wait read the draft or the send did.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn a_create_prompt_refused_for_a_draft_names_its_code() {
+        use crate::tmux::test_helpers::{only_pane_id, TmuxTestSession, INPUT_BOX_SCRIPT};
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let shows = |pane: &str, text: &str| {
+            crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", pane])
+                .output()
+                .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(text))
+        };
+        // (case, how the wait for the input prompt settled)
+        for (case, readiness) in [
+            ("drafted", PaneReadiness::Drafted),
+            ("drafted-at-send", PaneReadiness::AtPrompt),
+        ] {
+            let mut instance = Instance::new(case, "/tmp/aoe-mcp-draft-code");
+            instance.source_profile = "default".into();
+            instance.view = View::Terminal;
+            instance.status = Status::Idle;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                &instance.source_profile,
+                vec![instance.clone()],
+            );
+            let session = instance.tmux_session().unwrap();
+            let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "sh", "-c"]
+                .map(str::to_string)
+                .to_vec();
+            args.push(INPUT_BOX_SCRIPT.to_string());
+            crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+            assert!(crate::tmux::tmux_command()
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+            let _cleanup = TmuxTestSession::from_name(session.name());
+            let pane = only_pane_id(session.name());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !shows(&pane, "for shortcuts") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{case}: the box shows"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(crate::tmux::tmux_command()
+                .args(["send-keys", "-t", &pane, "-l", "half typed"])
+                .status()
+                .unwrap()
+                .success());
+            while !shows(&pane, "❯ half typed") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{case}: the draft shows"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let (sent, _, _, code) = McpServer::new(state)
+                .deliver_terminal_prompt(
+                    &instance.id,
+                    "typed-by-create".into(),
+                    readiness,
+                    Some(pane.clone()),
+                )
+                .await;
+            assert!(!sent, "{case}");
+            assert_eq!(code, Some(INPUT_LINE_BUSY), "{case}");
+            let screen = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &pane])
+                .output()
+                .unwrap();
+            assert!(screen.status.success(), "{case}: the pane is captured");
+            assert!(
+                !String::from_utf8_lossy(&screen.stdout).contains("typed-by-create"),
+                "{case}"
+            );
+        }
+    }
+
+    /// A pane the lookup didn't find is unreadable, even when the session's default target
+    /// shows the agent at its prompt.
+    #[test]
+    #[serial_test::serial]
+    fn readiness_without_a_looked_up_pane_is_unreadable() {
+        use crate::tmux::test_helpers::{only_pane_id, TmuxTestSession, INPUT_BOX_SCRIPT};
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut instance = Instance::new("mcp-readiness", "/tmp/aoe-mcp-readiness");
+        instance.source_profile = "default".into();
+        let session = instance.tmux_session().unwrap();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "sh", "-c"]
+            .map(str::to_string)
+            .to_vec();
+        args.push(INPUT_BOX_SCRIPT.to_string());
+        crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+        let _cleanup = TmuxTestSession::from_name(session.name());
+        let pane = only_pane_id(session.name());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session
+            .try_capture_pane_in(&pane, 0)
+            .is_ok_and(|screen| screen.contains("for shortcuts"))
+        {
+            assert!(std::time::Instant::now() < deadline, "the box shows");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // (case, the lookup's pane, readiness; the send gets the looked-up pane back)
+        for (case, looked_up, want) in [
+            ("looked-up", Some(pane.clone()), PaneReadiness::AtPrompt),
+            ("lookup-failed", None, PaneReadiness::Unreadable),
+        ] {
+            let (readiness, checked) = readiness_in(&instance, &session, looked_up.clone());
+            assert_eq!(readiness, want, "{case}");
+            assert_eq!(checked, looked_up, "{case}");
+        }
+    }
+
+    /// The status and the input box come from one capture: a screen that changes after it can't
+    /// pair the first frame's prompt box with the next frame's missing one, and a failed capture
+    /// isn't followed by a status read alone.
+    #[test]
+    #[serial_test::serial]
+    fn readiness_reads_status_and_draft_from_one_capture() {
+        use crate::tmux::test_helpers::{only_pane_id, TmuxTestSession, INPUT_BOX_SCRIPT};
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let _guard = crate::session::test_support::isolate_app_dir();
+        // (case, tool, readiness captures that fail, replaced after its capture, want)
+        for (case, tool, failures, replaced, want) in [
+            (
+                "draft-then-replaced",
+                "claude",
+                0,
+                true,
+                PaneReadiness::Drafted,
+            ),
+            (
+                "first-capture-fails",
+                "claude",
+                1,
+                false,
+                PaneReadiness::Drafted,
+            ),
+            (
+                "both-captures-fail",
+                "claude",
+                2,
+                false,
+                PaneReadiness::Unreadable,
+            ),
+            (
+                "no-rules-both-fail",
+                "no-manifest-agent",
+                2,
+                false,
+                PaneReadiness::NoPromptRule,
+            ),
+        ] {
+            let mut instance = Instance::new(
+                &format!("mcp-one-capture-{case}"),
+                "/tmp/aoe-mcp-one-capture",
+            );
+            instance.tool = tool.into();
+            instance.source_profile = "default".into();
+            let session = instance.tmux_session().unwrap();
+            let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "sh", "-c"]
+                .map(str::to_string)
+                .to_vec();
+            args.push(INPUT_BOX_SCRIPT.to_string());
+            crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+            assert!(crate::tmux::tmux_command()
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+            let _cleanup = TmuxTestSession::from_name(session.name());
+            let pane = only_pane_id(session.name());
+            let shows = |text: &str| {
+                session
+                    .try_capture_pane_in(&pane, 0)
+                    .is_ok_and(|screen| screen.contains(text))
+            };
+            let wait_until_shown = |text: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !shows(text) {
+                    assert!(std::time::Instant::now() < deadline, "{case}: {text} shows");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            };
+            wait_until_shown("for shortcuts");
+            assert!(crate::tmux::tmux_command()
+                .args(["send-keys", "-t", &pane, "-l", "half typed"])
+                .status()
+                .unwrap()
+                .success());
+            wait_until_shown("❯ half typed");
+
+            crate::tmux::test_helpers::fail_screen_captures(&pane, failures);
+            if replaced {
+                // After the capture, the pane is replaced by a screen with no input box.
+                let replaced = pane.clone();
+                crate::tmux::test_helpers::on_screen_captured(&pane, move || {
+                    assert!(crate::tmux::tmux_command()
+                        .args([
+                            "respawn-pane",
+                            "-k",
+                            "-t",
+                            &replaced,
+                            "printf 'another screen\\n'; exec cat",
+                        ])
+                        .status()
+                        .unwrap()
+                        .success());
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !crate::tmux::tmux_command()
+                        .args(["capture-pane", "-p", "-t", &replaced])
+                        .output()
+                        .is_ok_and(|out| {
+                            String::from_utf8_lossy(&out.stdout).contains("another screen")
+                        })
+                    {
+                        assert!(std::time::Instant::now() < deadline, "the new screen shows");
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                });
+            }
+            let (readiness, checked) = readiness_in(&instance, &session, Some(pane.clone()));
+            assert_eq!(readiness, want, "{case}");
+            assert_eq!(checked, Some(pane), "{case}");
+        }
+    }
+
     #[test]
     fn only_a_prompt_box_rule_reads_as_at_the_prompt() {
+        use crate::tmux::InputLine::{Draft, Empty, Unknown};
         use PaneReadiness::*;
-        // (detected, readiness, whether MCP `send` refuses it)
+        // (detected, input line, readiness, whether MCP `send` refuses it)
         let cases = [
-            (None, NoPromptRule, false),
-            (Some((Some(Status::Waiting), "trust_dialog")), Waiting, true),
-            (Some((Some(Status::Idle), "ready_prompt")), AtPrompt, false),
+            (None, Unknown, NoPromptRule, false),
             (
-                Some((Some(Status::Idle), "live_prompt_box")),
+                Some((Some(Status::Waiting), "trust_dialog")),
+                Unknown,
+                Waiting,
+                true,
+            ),
+            (
+                Some((Some(Status::Waiting), "trust_dialog")),
+                Draft,
+                Waiting,
+                true,
+            ),
+            (
+                Some((Some(Status::Idle), "ready_prompt")),
+                Empty,
                 AtPrompt,
                 false,
             ),
-            (Some((Some(Status::Idle), "osc_title_idle")), NotYet, false),
-            (Some((Some(Status::Idle), "completed_turn")), NotYet, false),
             (
-                Some((Some(Status::Idle), "interrupt_banner")),
+                Some((Some(Status::Idle), "ready_prompt")),
+                Draft,
+                Drafted,
+                true,
+            ),
+            (
+                Some((Some(Status::Idle), "live_prompt_box")),
+                Unknown,
+                AtPrompt,
+                false,
+            ),
+            (
+                Some((Some(Status::Idle), "osc_title_idle")),
+                Unknown,
                 NotYet,
                 false,
             ),
-            (Some((Some(Status::Idle), "no_rule")), NotYet, false),
-            (Some((Some(Status::Running), "spinner")), NotYet, false),
-            (Some((None, CAPTURE_FAILED_RULE)), Unreadable, true),
+            (
+                Some((Some(Status::Idle), "completed_turn")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Idle), "interrupt_banner")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Idle), "no_rule")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Running), "spinner")),
+                Unknown,
+                NotYet,
+                false,
+            ),
+            (
+                Some((Some(Status::Running), "spinner")),
+                Draft,
+                Drafted,
+                true,
+            ),
+            (Some((None, CAPTURE_FAILED_RULE)), Draft, Unreadable, true),
         ];
-        for (detected, want, refused) in cases {
-            assert_eq!(readiness_of(detected), want, "{detected:?}");
+        for (detected, input_line, want, refused) in cases {
+            assert_eq!(
+                readiness_of(detected, input_line),
+                want,
+                "{detected:?} {input_line:?}"
+            );
             assert_eq!(refuses_send(want), refused, "{want:?}");
         }
     }
@@ -1172,6 +1634,7 @@ mod tests {
             ),
             (SendKeysError::NotRunning, "not_running"),
             (SendKeysError::Ignored, "ignored"),
+            (SendKeysError::InputLineBusy, "input_line_busy"),
             (SendKeysError::Gone, "not_found"),
         ];
         for (error, code) in cases {

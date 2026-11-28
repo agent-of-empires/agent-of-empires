@@ -30,7 +30,6 @@ impl HomeView {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
-        let sound_config = resolved.sound.clone();
         let strict_hotkeys = resolved.session.strict_hotkeys;
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let host_tab_title = resolved.session.host_tab_title;
@@ -39,29 +38,27 @@ impl HomeView {
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         crate::session::set_favorites_first(resolved.session.favorites_first);
         crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
+        let keybind_warnings = super::config_refresh::install_keybinds(&resolved);
+        let live_send_chords = live_send::LiveSendChords::from_config(&resolved);
         let sort_order = user_config
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
             .unwrap_or_default();
-        // New users (who haven't dismissed the welcome screen) default to Project grouping
-        // so they see the web dashboard's layout; existing users keep Manual unless they
-        // toggle with `g`.
-        let is_new_user = user_config
-            .as_ref()
-            .is_none_or(|c| !c.app_state.has_seen_welcome);
-        let default_group_by = if is_new_user {
-            GroupByMode::Project
-        } else {
-            GroupByMode::Manual
-        };
         let group_by = user_config
             .as_ref()
             .and_then(|c| c.app_state.group_by)
-            .unwrap_or(default_group_by);
-        let tips_unseen = user_config.as_ref().map_or_else(
-            || tips_unseen_count(&crate::session::Config::default()),
-            tips_unseen_count,
-        );
+            .unwrap_or_default();
+        // No suggestions snapshot yet, so that signal starts false.
+        let tips_config = user_config.clone().unwrap_or_default();
+        let tips_unseen = if tips_config.session.show_tips {
+            crate::tips::unseen_count(
+                crate::tips::TipSurface::Tui,
+                &tips_config.app_state.tips_seen,
+                &crate::tips::TipSignals::from(&tips_config),
+            )
+        } else {
+            0
+        };
         let view_mode = ViewMode::default();
 
         let disk_watch = DiskWatchState {
@@ -105,6 +102,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             show_activity_age: resolved.session.show_activity_age,
             show_structured_badge: resolved.session.show_structured_badge,
+            hide_snoozed_with_stopped: resolved.session.hide_snoozed_with_stopped,
             sidebar_position: resolved.session.sidebar_position,
             narrow_layout: resolved.session.narrow_layout,
             narrow_breakpoint: resolved.session.narrow_breakpoint,
@@ -123,27 +121,6 @@ impl HomeView {
                         .collect()
                 })
                 .unwrap_or_default(),
-            org_group_collapsed: user_config
-                .as_ref()
-                .map(|c| {
-                    c.app_state
-                        .org_group_collapsed
-                        .iter()
-                        .map(|path| (path.clone(), true))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            status_group_collapsed: user_config
-                .as_ref()
-                .map(|c| {
-                    c.app_state
-                        .status_group_collapsed
-                        .iter()
-                        .map(|path| (path.clone(), true))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            remote_owner_cache: std::cell::RefCell::new(HashMap::new()),
             registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
@@ -185,6 +162,11 @@ impl HomeView {
             projects_dialog: None,
             plugin_manager_dialog: None,
             skills_manager_dialog: None,
+            sandbox_login_dialog: None,
+            sandbox_login_poller: None,
+            sandbox_login_retiring: Vec::new(),
+            sandbox_login_clock: Default::default(),
+            sandbox_login_selection: None,
             command_palette: None,
             serve_view: None,
             serve_jobs: super::super::dialogs::ServeJobs::default(),
@@ -238,6 +220,7 @@ impl HomeView {
             pending_paste: None,
             pending_paste_for_structured_view: HashMap::new(),
             pending_attach_after_warning: None,
+            refused_send: None,
             pending_stop_session: None,
             pending_stop_auxiliary: None,
             pending_legacy_tool_preparation: None,
@@ -314,7 +297,6 @@ impl HomeView {
             manual_unread_hold: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
-            sound_config,
             strict_hotkeys,
             confirm_before_quit,
             host_tab_title,
@@ -328,6 +310,7 @@ impl HomeView {
             settings_view: None,
             settings_close_confirm: false,
             diff_view: None,
+            suggestions_view: None,
             list_width: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_list_width)
@@ -366,6 +349,14 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            suggestions_focused: false,
+            prompt_failures_announced: std::collections::HashSet::new(),
+            prompt_failures_seeded: false,
+            prompt_failure_queue: Vec::new(),
+            suggested_sessions_tip_armed: false,
+            undelivered_prompt: None,
+            start_after_trash: None,
+            suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             opener_exits: Vec::new(),
@@ -374,6 +365,7 @@ impl HomeView {
                 .as_ref()
                 .map(|c| c.tools.clone())
                 .unwrap_or_default(),
+            live_send_chords,
             tool_hotkey_cache: Vec::new(),
             tool_picker_dialog: None,
             file_watch,
@@ -386,13 +378,7 @@ impl HomeView {
         };
 
         view.tool_hotkey_cache = input::build_tool_hotkey_cache(&view.tool_configs);
-        let hotkey_warnings = input::validate_tool_hotkeys(&view.tool_configs);
-        if !hotkey_warnings.is_empty() && view.info_dialog.is_none() {
-            view.info_dialog = Some(InfoDialog::new(
-                "Tool hotkey config errors",
-                &hotkey_warnings.join("\n"),
-            ));
-        }
+        view.show_key_config_errors(keybind_warnings);
 
         view.refresh_registered_projects();
         view.refresh_flat_items();
@@ -455,7 +441,7 @@ impl HomeView {
             .iter()
             .flat_map(|(_, _, rows)| rows)
             .filter(|row| reports.iter().all(|report| report.id != row.id))
-            .map(|row| crate::server::api::sessions::session_response_from_instance(row, false))
+            .map(crate::server::api::sessions::session_response_from_instance)
             .collect();
         let default_profile = view
             .active_profile
@@ -509,8 +495,6 @@ impl HomeView {
     }
 
     pub(super) fn refresh_projection_presentation(&mut self) {
-        self.remote_owner_cache.borrow_mut().clear();
-
         let prev_selected_session = self.selected_session.clone();
 
         self.rebuild_flat_items_keeping_cursor();

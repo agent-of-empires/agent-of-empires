@@ -461,6 +461,57 @@ impl HomeView {
         self.creating_hook_progress.remove(stub_id);
     }
 
+    /// Queues a notice, once per failure, when a session was created but its
+    /// first prompt was not delivered. The tick path opens it.
+    pub(super) fn announce_prompt_failure(&mut self, row: &crate::daemon::SessionResponse) {
+        let Some(error) = &row.initial_prompt_error else {
+            self.prompt_failures_announced.remove(&row.id);
+            self.prompt_failure_queue.retain(|(id, _)| *id != row.id);
+            return;
+        };
+        if !self.prompt_failures_announced.insert(row.id.clone()) || !self.prompt_failures_seeded {
+            return;
+        }
+        let message = format!(
+            "{} was created, but its first prompt was not delivered: {error}",
+            row.title
+        );
+        self.prompt_failure_queue.push((row.id.clone(), message));
+    }
+
+    /// Opens the oldest queued prompt failure when no other dialog is open,
+    /// offering to copy the retained prompt. True when one opened.
+    pub(super) fn promote_prompt_failure(&mut self) -> bool {
+        if self.prompt_failure_queue.is_empty()
+            || self.info_dialog.is_some()
+            || self.confirm_dialog.is_some()
+            || self.has_non_live_send_overlay()
+        {
+            return false;
+        }
+        let (id, mut message) = self.prompt_failure_queue.remove(0);
+        let prompt = self
+            .get_instance(&id)
+            .and_then(|i| i.pending_initial_turn.as_ref())
+            .map(|turn| turn.text.clone());
+        match prompt {
+            Some(text) => {
+                message.push_str("\n\nCopy the prompt, then attach the session and paste it.");
+                self.undelivered_prompt = Some(text);
+                self.confirm_dialog = Some(
+                    ConfirmDialog::new("Prompt not delivered", &message, "copy_undelivered_prompt")
+                        .neutral()
+                        .buttons("Copy prompt", "Close"),
+                );
+            }
+            None => {
+                message.push_str("\n\nAttach the session and type the prompt again.");
+                self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
+            }
+        }
+        true
+    }
+
     fn commit_created_session(&mut self) -> Option<String> {
         // During the synchronous load the committed row must not be hidden as a reservation.
         let mut pending = self.pending_creation.take()?;
@@ -494,6 +545,13 @@ impl HomeView {
                 Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
             self.pending_creation = Some(pending);
             return None;
+        }
+        if let Some(origin) = self
+            .get_instance(&row.id)
+            .and_then(|i| i.suggestion.clone())
+        {
+            self.suggestions_feed
+                .link_started(&(origin.provider_id, origin.id), &row.id);
         }
         self.clear_creation_tracking(&pending.request_key);
         self.rebuild_group_trees();
@@ -660,7 +718,8 @@ fn wizard_create_body(
         repo_bases: Vec::new(),
         command_override: data.command_override.clone(),
         custom_instruction: None,
-        initial_prompt: None,
+        initial_prompt: data.initial_prompt.clone(),
+        suggestion: data.suggestion.clone(),
         profile: Some(data.profile.clone()),
         view: if data.structured {
             crate::session::View::Structured
@@ -732,15 +791,6 @@ impl HomeView {
                 // snapshot so the preview follows the row back.
                 self.pending_archive_cursor = Some(pending);
                 return false;
-            }
-            return true;
-        }
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            // Attention sort is a triage flow: the cursor advances to the next
-            // item that needs attention.
-            self.select_top_attention(None);
-            if self.selected_session.as_deref() == Some(pending.id.as_str()) {
-                self.clear_selection_off_archived_row();
             }
             return true;
         }

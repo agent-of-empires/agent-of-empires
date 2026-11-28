@@ -1,6 +1,6 @@
 ---
 name: record-pr-demo
-description: Record a demo video of a PR's change by driving real Chromium against a real `aoe serve` with real tmux sessions, then publish MP4 + inline GIF to the PR. Use when asked for a demo, video, GIF or recording of a PR or branch, or to show a dashboard change working.
+description: Record a demo video of a PR's change by driving real Chromium against a real `aoe serve` with real tmux sessions, then attach the MP4 to a PR comment, where it plays inline. Use when asked for a demo, video, GIF or recording of a PR or branch, or to show a dashboard change working.
 ---
 
 # Record a PR demo
@@ -10,9 +10,8 @@ Each clip is evidence a reviewer can watch: a real daemon, real sessions, real b
 Files beside this one:
 
 - `demo-lib.mjs`: Playwright helpers (`launch`, `finish`, `caption`, `ring`, `glide`, `prep`) with a visible pointer overlay.
-- `convert.sh`: webm to MP4 + GIF + a contact sheet of frames.
-- `publish.sh`: push clips to the `e2e-recordings` branch and print their URLs.
-- [`TECHNIQUES.md`](TECHNIQUES.md): read when a clip needs touch input, a native `<select>`, link hover/click proof, a WebSocket counter, or a simulated lost event.
+- `convert.sh`: webm to MP4 plus a contact sheet of frames.
+- [`TECHNIQUES.md`](TECHNIQUES.md): read when a clip needs touch input, a native `<select>`, link hover/click proof, a WebSocket counter, a simulated lost event, or the native TUI.
 
 ## 1. Build
 
@@ -49,10 +48,10 @@ Make small git repos under `$DEMO/projects/` so sessions fall into real groups, 
 
 ```sh
 aoe add -t shell-urls -g web-shop --tool shell -l .
-aoe add -t claude-agent -g web-shop --tool claude -l --prompt '<one tiny prompt>' .
+aoe add -t claude-agent -g web-shop --tool claude -l --structured-view --prompt '<one tiny prompt>' .
 ```
 
-Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list` and its tmux pane holds the state you will film.
+Before adding a `--structured-view` session, run `aoe acp doctor` (`--fix` installs the Claude adapter); without it the session falls back to a terminal view. Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list`. Terminal sessions must have a tmux pane holding the state you will film. Structured sessions (`--structured-view`) have no agent pane, and `aoe list` shows the same persisted state for both view modes, so it cannot prove the view. Require the transcript as evidence: `GET /api/sessions/<id>/acp/replay` (with the dashboard token) must return events for your prompt. A refused replay (non-structured session) or no events after the prompt means it fell back to a terminal view, so fix the adapter before recording.
 
 ## 4. Record
 
@@ -64,34 +63,48 @@ Write one script per clip in a scratch dir, importing `demo-lib.mjs`. Each clip 
 
 Run with `AOE_DEMO_TOKEN_FILE` (or `AOE_DEMO_TOKEN`) and `AOE_DEMO_RAW=<scratch>/raw` set. On arm64 Linux add `PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-arm64 PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1`.
 
+### TUI clips
+
+Run the dev `aoe` in ttyd and drive it with Playwright, as `web/scripts/record-tui-demo.mjs` does (read it for the ttyd and `aoe` setup). Here the script uses `demo-lib.mjs` (`launch`, `caption`) and `convert.sh`, so the clip matches the web ones. Use the step 2 environment and start ttyd with `--cwd` set to a scene repo (no `cd`, so later steps keep their repo-root paths). ttyd runs a writable shell with your env, so it takes a password:
+
+```sh
+export TTYD_PW=$(openssl rand -hex 12)
+nohup ttyd --port 7683 --interface 127.0.0.1 --cwd "$DEMO/projects/<scene>" -c demo:$TTYD_PW -t rendererType=dom -t fontSize=15 --writable aoe > "$DEMO/ttyd.log" 2>&1 &
+echo $! > "$DEMO/ttyd.pid"
+```
+
+In the clip script: `const h = await launch("<clip>")` (the name also goes to `finish(h, "<clip>")` at the end), `await h.context.setHTTPCredentials({ username: "demo", password: process.env.TTYD_PW })`, `h.page.goto("http://127.0.0.1:7683")`, click `.xterm`, then `h.page.keyboard.press`. Set `AOE_DEMO_TOKEN=-` only if the script never calls `prep()` (no dashboard token); `prep()` opens the dashboard, so a script that uses it needs the real token. Assert on `document.body.innerText` before each key. Traps are in [`TECHNIQUES.md`](TECHNIQUES.md#tui-clips-ttyd). For scripted e2e tests, `RECORD_E2E=1` records asciinema casts that `agg` converts; both must be on `PATH` (`tests/e2e/harness.rs`).
+
+Done when the contact sheet shows each key's effect at the moment its caption claims.
+
 ## 5. Convert and check
 
 ```sh
 .claude/skills/record-pr-demo/convert.sh <raw>/<clip>.webm <out-dir>
 ```
 
-Read every contact sheet it prints. Done when each clip visibly shows its behavior at the moments the captions claim, the GIF is at most 8 MB, and no overlay hides the thing being shown. Re-record any clip that fails.
+Read every contact sheet it prints. Done when each clip visibly shows its behavior at the moments the captions claim, the MP4 is at most 10 MB (the attachment limit), and no overlay hides the thing being shown. Re-record any clip that fails.
 
 ## 6. Publish
 
 Posting is outward-facing: confirm with the user before this step.
 
-```sh
-.claude/skills/record-pr-demo/publish.sh <out-dir> <subdir-name>
-```
-
-It commits the files onto the `e2e-recordings` branch (the same branch `e2e-recording.yml` uses) without touching any worktree, and prints raw GIF and MP4 page URLs. GitHub has no API for PR video attachments; a raw GIF URL renders inline in a comment. Post one comment per PR:
+Write the comment to `<out-dir>/body.md`, referencing each clip by relative path, and post it with one `--attach` per clip (gh 2.103 or later):
 
 ```md
 **Demo** (real Chromium, debug `aoe serve` at <sha>, real tmux sessions)
 
 <one or two sentences on what the clip shows, plus any simulated input or overlay a reviewer should know about>
 
-![<clip>](<raw gif url>)
-
-[MP4](<mp4 blob url>)
+![<clip>](./<clip>.mp4)
 ```
+
+```sh
+gh pr comment <N> --body-file <out-dir>/body.md --attach <out-dir>/<clip>.mp4
+```
+
+`gh` uploads each file to GitHub's attachment storage and rewrites its reference to the uploaded URL, which renders as a video player. A video reference must be alone in its paragraph. `gh pr create` and `gh pr edit` take `--attach` the same way. Never commit clips to a branch of the repo.
 
 ## 7. Clean up
 
-`aoe serve --stop`, `tmux -S $AOE_TMUX_SOCKET kill-server`, and remove `$DEMO` once the user is happy with the clips.
+`aoe serve --stop`, `kill $(cat $DEMO/ttyd.pid)` for a TUI clip, `tmux -S $AOE_TMUX_SOCKET kill-server`, and remove `$DEMO` once the user is happy with the clips.

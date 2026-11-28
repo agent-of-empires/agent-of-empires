@@ -14,13 +14,17 @@ test.describe("sidebar legend on desktop", () => {
     await page.goto("/");
   });
 
-  test("? opens the legend as a popover; Escape, a second press and an outside click close it", async ({ page }) => {
-    const toggle = page.getByRole("button", { name: "What do these symbols mean?" });
+  test("⋯ › Symbol legend opens a popover; Escape and an outside click close it", async ({ page }) => {
+    const more = page.getByRole("button", { name: "More options" });
     const legend = page.getByTestId("sidebar-legend");
+    const open = async () => {
+      await more.click();
+      await page.getByRole("menuitem", { name: "Symbol legend" }).click();
+      await expect(legend).toBeVisible();
+    };
+    await expect(page.getByRole("button", { name: "What do these symbols mean?" })).toHaveCount(0);
 
-    await toggle.click();
-    await expect(legend).toBeVisible();
-    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await open();
     // Every status row, generated from the glyph tables, plus the other marks.
     await expect(legend.getByTestId("sidebar-legend-status")).toHaveCount(10);
     for (const text of [
@@ -37,36 +41,21 @@ test.describe("sidebar legend on desktop", () => {
 
     await page.keyboard.press("Escape");
     await expect(legend).toBeHidden();
-    await expect(toggle).toBeFocused();
+    await expect(more).toBeFocused();
 
-    await toggle.click();
-    await expect(legend).toBeVisible();
-    await toggle.click();
-    await expect(legend).toBeHidden();
-
-    await toggle.click();
-    await expect(legend).toBeVisible();
+    await open();
     // The outside-click listener attaches a frame after opening, as for every context menu.
     await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
-    await page.mouse.click(1200, 680);
+    await page.mouse.click(640, 680);
     await expect(legend).toBeHidden();
-    // Blank space takes no focus, so it returns to "?".
-    await expect(toggle).toBeFocused();
+    // Blank space takes no focus, so it returns to ⋯.
+    await expect(more).toBeFocused();
 
-    // A control clicked outside keeps the focus it took.
-    await toggle.click();
-    await expect(legend).toBeVisible();
-    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
-    await page.getByRole("button", { name: "Filter sessions" }).click();
-    await expect(legend).toBeHidden();
-    await expect(page.getByTestId("sidebar-filter-input")).toBeFocused();
-
-    // The compact rail keeps "?", where the glyph is the only signal left on a row.
+    // The compact rail, where the glyph is the only signal left on a row, still reaches it.
     await page.getByRole("separator", { name: "Resize sidebar" }).focus();
     await page.keyboard.press("Home");
     await expect(page.locator('[data-tour="sidebar"]')).toHaveAttribute("data-compact", "true");
-    await toggle.click();
-    await expect(legend).toBeVisible();
+    await open();
   });
 
   test("a keyboard-focused row is described by its glyph's tooltip, and the row keeps focus", async ({ page }) => {
@@ -108,9 +97,12 @@ test.describe("sidebar legend on a phone", () => {
     await openMobileSidebar(page);
   });
 
-  test("? opens the legend as a sheet that the backdrop closes", async ({ page }) => {
-    const toggle = page.getByRole("button", { name: "What do these symbols mean?" });
-    await toggle.tap();
+  test("⋯ › Symbol legend opens a sheet that the backdrop closes", async ({ page }) => {
+    const more = page
+      .getByRole("navigation", { name: "Sessions sidebar" })
+      .getByRole("button", { name: "More options" });
+    await more.tap();
+    await page.getByRole("menuitem", { name: "Symbol legend" }).tap();
     const legend = page.getByTestId("sidebar-legend");
     await expect(legend).toBeVisible();
     await expect(legend).toHaveAttribute("role", "dialog");
@@ -128,7 +120,7 @@ test.describe("sidebar legend on a phone", () => {
 
     await page.touchscreen.tap(187, 40);
     await expect(legend).toBeHidden();
-    await expect(toggle).toBeFocused();
+    await expect(more).toBeFocused();
   });
 
   test("a tap on a glyph opens the Session and shows no tooltip", async ({ page }) => {

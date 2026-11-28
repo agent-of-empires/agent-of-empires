@@ -86,6 +86,10 @@ fn refusal(error: HttpError, identifier: &str) -> anyhow::Error {
         "session_not_running" => anyhow::anyhow!(
             "Session is not running. Start it first with: aoe session start {identifier}"
         ),
+        "input_line_busy" => anyhow::anyhow!(
+            "Someone has typed text into {identifier}'s input box and not sent it. Send or clear \
+             it in the terminal, then retry."
+        ),
         "session_archived" => anyhow::anyhow!(StartBlocked::Archived),
         "session_trashed" => anyhow::anyhow!(StartBlocked::Trashed),
         _ => error.into(),
@@ -113,6 +117,7 @@ mod tests {
                         ApiErrorCode::SessionNotRunning,
                         "Terminal session is not running",
                     ),
+                    "drafted" => api_error_with_code_header(ApiErrorCode::InputLineBusy, "busy"),
                     _ => api_error_with_code_header(ApiErrorCode::StartFailed, "boom"),
                 }
             }),
@@ -131,6 +136,11 @@ mod tests {
             (
                 "dead",
                 "Session is not running. Start it first with: aoe session start dead",
+            ),
+            (
+                "drafted",
+                "Someone has typed text into drafted's input box and not sent it. Send or clear \
+                 it in the terminal, then retry.",
             ),
             ("archived", "session is archived; unarchive it first"),
             ("trashed", "session is in trash; restore it first"),

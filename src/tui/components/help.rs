@@ -79,12 +79,15 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
         }
     }
 
-    // Enter / Tab are structural keys (not relocatable registry actions); they
-    // lead the Actions section and swap descriptions with the attach mode.
-    let mut actions_rows = vec![
-        ("Enter".to_string(), enter_desc.to_string()),
-        ("Tab".to_string(), tab_desc.to_string()),
-    ];
+    // The activation keys lead the Actions section and swap descriptions with the attach mode.
+    let mut actions_rows: Vec<(String, String)> = [
+        (bindings::ActionId::Activate, enter_desc),
+        (bindings::ActionId::ActivateAlt, tab_desc),
+    ]
+    .into_iter()
+    .map(|(id, desc)| (bindings::label(id, strict), desc.to_string()))
+    .filter(|(label, _)| !label.is_empty())
+    .collect();
     actions_rows.append(&mut actions);
 
     // Rows with no single registry binding. Tips has no global hotkey at all
@@ -97,10 +100,9 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
         ("\u{1f4a1}", "Tips (badge, or Ctrl+K \u{2192} \"tips\")"),
     ]));
 
-    // Navigation is mode-invariant except the collapse row: in non-strict mode
-    // bare `h` is the contextual snooze key, so only `<-` is advertised for
-    // collapse; in strict mode `h` always collapses.
-    let nav_collapse = if strict { "h/\u{2190}" } else { "\u{2190}" };
+    // Bare `h` snoozes on a session row and collapses on a group header, so the
+    // collapse row can advertise it in both modes.
+    let nav_collapse = "h/\u{2190}";
     let navigation = owned([
         ("j/\u{2193}", "Move down"),
         ("k/\u{2191}", "Move up"),
@@ -115,14 +117,7 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     } else {
         "Actions"
     };
-    // Favorite is an Attention-section shortcut, but it also works outside the
-    // Attention sort while `favorites_first` is on, so the heading lists it as
-    // an exception only then. Archive is always an exception.
-    let attention_title = if crate::session::favorites_first() {
-        "Attention (Attention sort only, except Archive and Favorite)"
-    } else {
-        "Attention (Attention sort only, except Archive)"
-    };
+    let attention_title = "Attention";
     vec![
         ("Navigation", navigation),
         (actions_title, actions_rows),
@@ -563,7 +558,7 @@ mod tests {
         assert_eq!(lens, [2, 1, 1]);
 
         // That split keeps the tallest real column within the top-two sum.
-        let sections = build_sections(false, SortOrder::Newest, false);
+        let sections = build_sections(false, SortOrder::Custom, false);
         let heights: Vec<usize> = sections.iter().map(section_height).collect();
         let max_h = distribute_sections(sections.len(), 3)
             .iter()
@@ -585,7 +580,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                HelpOverlay::render(frame, area, &theme, SortOrder::Newest, false, false, scroll);
+                HelpOverlay::render(frame, area, &theme, SortOrder::Custom, false, false, scroll);
             })
             .unwrap();
         terminal.backend().buffer().clone()

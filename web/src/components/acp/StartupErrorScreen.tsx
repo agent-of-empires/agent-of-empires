@@ -5,7 +5,8 @@ import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
 import { fetchAgentInstallInfo, type AgentInstallInfo, type InstallAgentResponse } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { splitInstallHint, useAdapterInstall } from "./adapterRecovery";
-import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { BUTTON_INLINE, CAPTION_INLINE } from "../../lib/surfaces";
+import { CommandBlock, InlineCode, RecoveryActionRow, RecoveryScreen, type RecoveryAction } from "./RecoveryActionRow";
 import { RecreateContainerDialog } from "../sidebar/RecreateContainerDialog";
 
 interface Props {
@@ -19,9 +20,7 @@ interface Props {
 
 const SETTING_PATH = 'TUI › Settings › Global › Acp › Advanced › "Let the Web dashboard install Agents"';
 
-function Code({ children }: { children: React.ReactNode }) {
-  return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
-}
+const Code = InlineCode;
 
 /** install-info, re-read when the page regains focus so a setting turned on in
  *  the TUI unlocks the install without a reload. */
@@ -102,6 +101,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
     onClick: () => void respawn(),
     testId: "startup-error-restart",
     disabled: busy,
+    busy: respawnState === "retrying",
   };
   const update: RecoveryAction = {
     label: updating ? "Updating…" : updateFailed ? "Try again" : "Update & restart",
@@ -111,6 +111,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
       }),
     testId: "startup-error-update-restart",
     disabled: busy || !allowed,
+    busy: updating,
     describedBy: allowed ? undefined : stepOneId,
   };
   const startContainer: RecoveryAction = {
@@ -118,6 +119,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
     onClick: () => void respawn(),
     testId: "startup-error-start-container",
     disabled: busy,
+    busy: respawnState === "retrying",
   };
   const primary = containerDown ? startContainer : webInstall ? update : checkAgain;
   const allowStep = (
@@ -154,185 +156,178 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
   const secondary = [...(webInstall && !containerDown ? [checkAgain] : []), ...(canRecreate ? [recreate] : [])];
 
   return (
-    <div
-      role="alert"
-      aria-live="assertive"
-      data-testid="startup-error-screen"
-      className="flex h-full flex-1 items-center justify-center bg-surface-900 px-4 py-12"
-    >
-      <div className="w-full max-w-xl rounded-lg border border-status-error/60 bg-surface-850 p-4 text-text-primary shadow-lg sm:p-6">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-status-error-text">
-          {updateFailed
-            ? "Update failed"
-            : detail.kind === "unsupported_protocol_version"
-              ? "Adapter not supported"
-              : detail.kind === "invalid_proxy_hello"
-                ? "Agent proxy rejected"
-                : "Adapter out of date"}
-        </div>
-        <h2 className="mt-2 text-lg font-semibold text-text-primary">
-          {updateFailed
-            ? `${agentStart} couldn't be updated${sandboxed ? " in this sandbox" : ""}`
-            : headlineFor(detail, agentStart, sandboxed)}
-        </h2>
-        <p data-testid="startup-error-version" className="mt-1 break-words font-mono text-[12px] text-text-subtle">
-          {updateFailed ? failureLine(install.result, install.error) : versionLineFor(detail)}
-        </p>
+    <RecoveryScreen role="alert" aria-live="assertive" data-testid="startup-error-screen">
+      <div className={CAPTION_INLINE.replace("text-text-dim", "text-status-error-text")}>
+        {updateFailed
+          ? "Update failed"
+          : detail.kind === "unsupported_protocol_version"
+            ? "Adapter not supported"
+            : detail.kind === "invalid_proxy_hello"
+              ? "Agent proxy rejected"
+              : "Adapter out of date"}
+      </div>
+      <h2 className="mt-2 text-lg font-semibold text-text-primary">
+        {updateFailed
+          ? `${agentStart} couldn't be updated${sandboxed ? " in this sandbox" : ""}`
+          : headlineFor(detail, agentStart, sandboxed)}
+      </h2>
+      <p data-testid="startup-error-version" className="mt-1 break-words font-mono text-[12px] text-text-subtle">
+        {updateFailed ? failureLine(install.result, install.error) : versionLineFor(detail)}
+      </p>
 
-        {updateFailed ? (
-          <>
-            {/* Installs turned off since the failure: Try again is disabled until the setting is back on. */}
-            {!allowed && (
-              <ol className="mt-4 text-sm" data-testid="startup-error-steps">
-                {allowStep}
-              </ol>
-            )}
-            {fallback}
-          </>
-        ) : (
-          <>
-            {failsAgain && (
-              <p data-testid="startup-error-fails-again" className="mt-3 text-sm text-status-error-text">
-                The update finished, but the adapter still fails the check, so the install didn't change the version it
-                reports. Run the command below by hand, then Check again.
-              </p>
-            )}
-            {containerDown && (
-              <p data-testid="startup-error-container-down" className="mt-3 text-sm text-status-error-text">
-                This Session's container isn't running, so the update has nowhere to run. Start the container, then
-                update the adapter.
-              </p>
-            )}
-
-            <ol className="mt-4 space-y-3 text-sm" data-testid="startup-error-steps">
-              {detail.kind === "invalid_proxy_hello" ? (
-                <>
-                  <Step n={1} title="Update the agent plugin or aoe">
-                    The agent's proxy sent a hello this aoe build rejects: {detail.reason}.
-                  </Step>
-                  {!observer && <Step n={2} title="Click Check again" />}
-                </>
-              ) : detail.kind === "unsupported_protocol_version" ? (
-                <>
-                  <Step n={1} title={`Install an adapter that speaks ACP protocol ${detail.expected}`}>
-                    This aoe build negotiates protocol {detail.expected}; the adapter speaks {detail.received}. Install
-                    an adapter version for protocol {detail.expected}, or update aoe.
-                  </Step>
-                  {!observer && <Step n={2} title="Click Check again" />}
-                </>
-              ) : containerDown ? (
-                <>
-                  <Step n={1} title="Click Start the container" />
-                  <Step n={2} title="Then update the adapter">
-                    The update comes back here once the container is running.
-                  </Step>
-                </>
-              ) : webInstall ? (
-                <>
-                  {allowed ? (
-                    <Step n={1} id={stepOneId} done title="Installs from the Web dashboard are allowed" />
-                  ) : (
-                    allowStep
-                  )}
-                  {updating ? (
-                    <Step n={2} title={sandboxed ? "Updating inside the container" : `Updating ${agent}`}>
-                      {agentStart} restarts when it's done.
-                    </Step>
-                  ) : (
-                    <Step n={2} title={`Update ${agent}${sandboxed ? " in this sandbox" : ""}`}>
-                      AoE installs it {sandboxed ? "in this Session's container" : "where the Daemon runs"}, then
-                      restarts the Agent.
-                      {fallback}
-                    </Step>
-                  )}
-                </>
-              ) : manualWaitsOnContainer ? (
-                <>
-                  <Step n={1} title="Click Check again to start the container" />
-                  <Step n={2} title={manualTitle}>
-                    Once it's running, run this, then Check again:
-                    <div className="mt-2">{manualStep}</div>
-                  </Step>
-                </>
-              ) : (
-                <>
-                  <Step n={1} title={manualTitle}>
-                    {manualStep}
-                  </Step>
-                  <Step n={2} title={observer ? "Restart the agent from the TUI" : "Click Check again"}>
-                    {observer &&
-                      (info?.install_blocked === "cityhall"
-                        ? "A CityHall dashboard can't restart the agent."
-                        : "This dashboard is read-only, so it can't restart the agent.")}
-                  </Step>
-                </>
-              )}
+      {updateFailed ? (
+        <>
+          {/* Installs turned off since the failure: Try again is disabled until the setting is back on. */}
+          {!allowed && (
+            <ol className="mt-4 text-sm" data-testid="startup-error-steps">
+              {allowStep}
             </ol>
-          </>
-        )}
+          )}
+          {fallback}
+        </>
+      ) : (
+        <>
+          {failsAgain && (
+            <p data-testid="startup-error-fails-again" className="mt-3 text-sm text-status-error-text">
+              The update finished, but the adapter still fails the check, so the install didn't change the version it
+              reports. Run the command below by hand, then Check again.
+            </p>
+          )}
+          {containerDown && (
+            <p data-testid="startup-error-container-down" className="mt-3 text-sm text-status-error-text">
+              This Session's container isn't running, so the update has nowhere to run. Start the container, then update
+              the adapter.
+            </p>
+          )}
 
-        {!observer && (
-          <RecoveryActionRow
-            primary={primary}
-            secondary={secondary}
-            install={{
-              // The failed card and the stopped-container steps say this themselves.
-              error:
-                updateFailed || containerDown || install.errorCode === "container_not_running" ? null : install.error,
-              output: updateFailed || containerDown ? null : install.output,
-            }}
-          />
-        )}
+          <ol className="mt-4 space-y-3 text-sm" data-testid="startup-error-steps">
+            {detail.kind === "invalid_proxy_hello" ? (
+              <>
+                <Step n={1} title="Update the agent plugin or aoe">
+                  The agent's proxy sent a hello this aoe build rejects: {detail.reason}.
+                </Step>
+                {!observer && <Step n={2} title="Click Check again" />}
+              </>
+            ) : detail.kind === "unsupported_protocol_version" ? (
+              <>
+                <Step n={1} title={`Install an adapter that speaks ACP protocol ${detail.expected}`}>
+                  This aoe build negotiates protocol {detail.expected}; the adapter speaks {detail.received}. Install an
+                  adapter version for protocol {detail.expected}, or update aoe.
+                </Step>
+                {!observer && <Step n={2} title="Click Check again" />}
+              </>
+            ) : containerDown ? (
+              <>
+                <Step n={1} title="Click Start the container" />
+                <Step n={2} title="Then update the adapter">
+                  The update comes back here once the container is running.
+                </Step>
+              </>
+            ) : webInstall ? (
+              <>
+                {allowed ? (
+                  <Step n={1} id={stepOneId} done title="Installs from the Web dashboard are allowed" />
+                ) : (
+                  allowStep
+                )}
+                {updating ? (
+                  <Step n={2} title={sandboxed ? "Updating inside the container" : `Updating ${agent}`}>
+                    {agentStart} restarts when it's done.
+                  </Step>
+                ) : (
+                  <Step n={2} title={`Update ${agent}${sandboxed ? " in this sandbox" : ""}`}>
+                    AoE installs it {sandboxed ? "in this Session's container" : "where the Daemon runs"}, then restarts
+                    the Agent.
+                    {fallback}
+                  </Step>
+                )}
+              </>
+            ) : manualWaitsOnContainer ? (
+              <>
+                <Step n={1} title="Click Check again to start the container" />
+                <Step n={2} title={manualTitle}>
+                  Once it's running, run this, then Check again:
+                  <div className="mt-2">{manualStep}</div>
+                </Step>
+              </>
+            ) : (
+              <>
+                <Step n={1} title={manualTitle}>
+                  {manualStep}
+                </Step>
+                <Step n={2} title={observer ? "Restart the agent from the TUI" : "Click Check again"}>
+                  {observer &&
+                    (info?.install_blocked === "cityhall"
+                      ? "A CityHall dashboard can't restart the agent."
+                      : "This dashboard is read-only, so it can't restart the agent.")}
+                </Step>
+              </>
+            )}
+          </ol>
+        </>
+      )}
 
-        {respawnState === "ok" && (
-          <div className="mt-2 text-xs text-text-subtle">
-            Checking again. The adapter's version is checked when it starts.
-            {install.recovered > 0 &&
-              ` Also restarting ${install.recovered} other Session${install.recovered === 1 ? "" : "s"} blocked on the same adapter.`}
+      {!observer && (
+        <RecoveryActionRow
+          primary={primary}
+          secondary={secondary}
+          install={{
+            // The failed card and the stopped-container steps say this themselves.
+            error:
+              updateFailed || containerDown || install.errorCode === "container_not_running" ? null : install.error,
+            output: updateFailed || containerDown ? null : install.output,
+          }}
+        />
+      )}
+
+      {respawnState === "ok" && (
+        <div className="mt-2 text-xs text-text-subtle">
+          Checking again. The adapter's version is checked when it starts.
+          {install.recovered > 0 &&
+            ` Also restarting ${install.recovered} other Session${install.recovered === 1 ? "" : "s"} blocked on the same adapter.`}
+        </div>
+      )}
+      {respawnState === "failed" && respawnError && (
+        <div className="mt-2 text-xs text-status-error-text">Check again failed: {respawnError}</div>
+      )}
+
+      <div className="mt-4 border-t border-surface-700 pt-2">
+        <button
+          type="button"
+          data-testid="startup-error-details"
+          aria-expanded={detailsOpen}
+          onClick={() => setDetailsOpen(!detailsOpen)}
+          className={BUTTON_INLINE}
+        >
+          Details
+        </button>
+        {detailsOpen && (
+          <div data-testid="startup-error-details-body" className="mt-2 space-y-2 text-xs text-text-subtle">
+            {updateFailed && install.output && (
+              <pre
+                data-testid="startup-error-install-output"
+                className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-subtle"
+              >
+                {install.output}
+              </pre>
+            )}
+            <p>{rationaleFor(detail)}</p>
+            {sandboxed && (
+              <p>
+                Refreshing the Sandbox image fixes new Sessions only: this Session's container keeps the image it
+                started with. When a newer image is published and update checks are on, the dashboard's "Sandbox image
+                update available" banner offers Update now to pull it, or shows the command to run.
+                {canRecreate &&
+                  " Recreate container restarts this Session on the current image; files outside the Working directory and mounted folders are lost."}
+              </p>
+            )}
+            <p>
+              Check again restarts the agent, and the check runs again at the next ACP <Code>initialize</Code>{" "}
+              handshake. <Code>aoe serve</Code> doesn't need a restart.
+            </p>
+            <DetailRows detail={detail} sandboxed={sandboxed} />
           </div>
         )}
-        {respawnState === "failed" && respawnError && (
-          <div className="mt-2 text-xs text-status-error-text">Check again failed: {respawnError}</div>
-        )}
-
-        <div className="mt-4 border-t border-surface-700 pt-2">
-          <button
-            type="button"
-            data-testid="startup-error-details"
-            aria-expanded={detailsOpen}
-            onClick={() => setDetailsOpen(!detailsOpen)}
-            className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
-          >
-            Details
-          </button>
-          {detailsOpen && (
-            <div data-testid="startup-error-details-body" className="mt-2 space-y-2 text-xs text-text-subtle">
-              {updateFailed && install.output && (
-                <pre
-                  data-testid="startup-error-install-output"
-                  className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-subtle"
-                >
-                  {install.output}
-                </pre>
-              )}
-              <p>{rationaleFor(detail)}</p>
-              {sandboxed && (
-                <p>
-                  Refreshing the Sandbox image fixes new Sessions only: this Session's container keeps the image it
-                  started with. When a newer image is published and update checks are on, the dashboard's "Sandbox image
-                  update available" banner offers Update now to pull it, or shows the command to run.
-                  {canRecreate &&
-                    " Recreate container restarts this Session on the current image; files outside the Working directory and mounted folders are lost."}
-                </p>
-              )}
-              <p>
-                Check again restarts the agent, and the check runs again at the next ACP <Code>initialize</Code>{" "}
-                handshake. <Code>aoe serve</Code> doesn't need a restart.
-              </p>
-              <DetailRows detail={detail} sandboxed={sandboxed} />
-            </div>
-          )}
-        </div>
       </div>
       {recreating &&
         recreateContainerTitle !== undefined &&
@@ -344,7 +339,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
           />,
           document.body,
         )}
-    </div>
+    </RecoveryScreen>
   );
 }
 

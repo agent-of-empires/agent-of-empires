@@ -47,11 +47,12 @@ impl StartBlocked {
 
 /// A sandbox launch refused in `separate_login` mode while the shared credential its agent
 /// needs holds none. `tool` is the session's tool, which `aoe sandbox login --tool` takes;
-/// `credential` is the shared file the launch waits for. `profile` is the session's profile
-/// and `command` its own command for the tool: each is set only when the recovery needs it,
-/// `profile` when it is not the default one (the CLI runs under the default profile unless
-/// `-p` says otherwise) and `command` when `--tool` alone would log in another file than the
-/// one the launch waits for and `--command` with it reaches that file.
+/// `credential` is the shared file the launch waits for. `profile` is the session's profile,
+/// always named so a daemon serving another one logs in the right file; the CLI line leaves
+/// it out when it is the default one, which the CLI runs under unless `-p` says otherwise.
+/// `command` is the session's own command for the tool, set only when `--tool` alone would
+/// log in another file than the one the launch waits for and `--command` with it reaches
+/// that file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLoginRequired {
     pub tool: String,
@@ -79,7 +80,11 @@ impl SandboxLoginRequired {
             }
         }
         let mut line = String::from("aoe sandbox login");
-        if let Some(profile) = &self.profile {
+        if let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| **profile != crate::session::config::effective_profile(""))
+        {
             flag(&mut line, Some("-p"), "--profile", profile);
         }
         flag(&mut line, None, "--tool", &self.tool);
@@ -87,6 +92,16 @@ impl SandboxLoginRequired {
             flag(&mut line, None, "--command", command);
         }
         line
+    }
+}
+
+impl SandboxLoginRequired {
+    /// The cause a launch error carries to clients that act on it.
+    pub fn startup_cause(&self) -> crate::acp::state::StartupCause {
+        crate::acp::state::StartupCause::SandboxLoginRequired {
+            command: self.command.clone(),
+            profile: self.profile.clone(),
+        }
     }
 }
 
@@ -115,6 +130,14 @@ pub struct SandboxLoginUnsupported;
 impl SandboxLoginUnsupported {
     /// Stable machine-readable code for API error bodies.
     pub const CODE: &'static str = "sandbox_login_unsupported";
+
+    /// The cause a launch error carries to clients that act on it: this one's when `error`
+    /// is the refusal.
+    pub fn cause_of(error: &anyhow::Error) -> Option<crate::acp::state::StartupCause> {
+        error
+            .downcast_ref::<Self>()
+            .map(|_| crate::acp::state::StartupCause::SandboxLoginUnsupported)
+    }
 }
 
 impl Instance {
@@ -241,6 +264,16 @@ impl Instance {
 
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
+    }
+
+    /// Rank among siblings under `SortOrder::Custom`: rows never moved first, newest first,
+    /// then by `sort_index`. The display and the Daemon's reorder must share it.
+    pub fn custom_order_key(&self) -> (bool, Option<u32>, std::cmp::Reverse<Timestamp>) {
+        (
+            self.sort_index.is_some(),
+            self.sort_index,
+            std::cmp::Reverse(self.created_at),
+        )
     }
 
     /// Soft-delete the session into the trash bucket. Stops the live

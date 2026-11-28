@@ -13,8 +13,8 @@ use super::update_bar::UpdateBar;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
-    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN,
-    ICON_UNREAD,
+    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL, ICON_TRASH_SECTION,
+    ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::session::config::{GroupByMode, NarrowLayout, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
@@ -35,7 +35,7 @@ fn session_offset(created_at: &Timestamp) -> usize {
 /// Build the list-pane title. `prefix` is the leading label ("aoe", "Terminals",
 /// "Tool: <name>"); `profile` is `Some(name)` only when a real filter is active, so the
 /// default all-profiles state drops the `[<profile>]` segment. Group and sort state hang
-/// off the prefix as `· project` / `· <sort label>`, each dropped when it is the default.
+/// off the prefix as `· groups` / `· name`, each dropped when it is the default.
 fn compose_list_title(
     prefix: &str,
     profile: Option<&str>,
@@ -43,15 +43,13 @@ fn compose_list_title(
     sort_order: SortOrder,
 ) -> String {
     let mut suffix = String::new();
-    match group_by {
-        GroupByMode::Project => suffix.push_str(" · project"),
-        GroupByMode::Org => suffix.push_str(" · org"),
-        GroupByMode::Status => suffix.push_str(" · status"),
-        GroupByMode::Manual => {}
+    if group_by != GroupByMode::default() {
+        suffix.push_str(" · ");
+        suffix.push_str(&group_by.label().to_lowercase());
     }
     if sort_order != SortOrder::default() {
         suffix.push_str(" · ");
-        suffix.push_str(sort_order.label());
+        suffix.push_str(&sort_order.label().to_lowercase());
     }
     let profile_tag = match profile {
         Some(name) => format!(" [{}]", name),
@@ -491,7 +489,6 @@ enum SunkRow {
 /// row; see [`SunkRow`].
 fn decorate_row(
     inst: &crate::session::Instance,
-    in_attention: bool,
     seed: RowSeed,
     sunk: SunkRow,
     theme: &Theme,
@@ -515,17 +512,14 @@ fn decorate_row(
         // is the textual cue, so this is a dim color with no italic modifier.
         icon = sunk_icon;
         style = Style::default().fg(theme.dimmed);
-    } else if in_attention && (inst.is_snoozed() || inst.is_ignored()) {
-        // Snooze and ignore decoration is Attention-only; elsewhere the row paints its
-        // real state. Ignored rows stay present and live, unlike archive and trash.
+    } else if inst.is_snoozed() || inst.is_ignored() {
+        // Ignored rows stay present and live, unlike archive and trash.
         icon = sunk_icon;
         style = Style::default()
             .fg(theme.dimmed)
             .add_modifier(Modifier::ITALIC)
             .add_modifier(Modifier::DIM);
-    } else if in_attention && inst.is_urgent() {
-        // Urgent decoration is Attention-only: the flag persists in other modes, but the
-        // cross-tier promoter visual only means something when tiers order the list.
+    } else if inst.is_urgent() {
         style = Style::default()
             .fg(theme.error)
             .add_modifier(Modifier::BOLD)
@@ -533,15 +527,13 @@ fn decorate_row(
     }
 
     // Prefix priority: archive (none) > snooze (`z `) > ignore (`i `) > urgent (`! `).
-    // Snooze, ignore and urgent are Attention-only so other sorts show no decoration
-    // for state the user did not opt into.
     let title_text = if inst.is_archived() || inst.is_trashed() {
         Cow::Owned(inst.title.clone())
-    } else if in_attention && inst.is_snoozed() {
+    } else if inst.is_snoozed() {
         Cow::Owned(format!("z {}", inst.title))
-    } else if in_attention && inst.is_ignored() {
+    } else if inst.is_ignored() {
         Cow::Owned(format!("i {}", inst.title))
-    } else if in_attention && inst.is_urgent() {
+    } else if inst.is_urgent() {
         Cow::Owned(format!("! {}", inst.title))
     } else {
         Cow::Owned(inst.title.clone())
@@ -614,10 +606,10 @@ fn render_placeholder(frame: &mut Frame, area: Rect, theme: &Theme, placeholder:
     frame.render_widget(para, area);
 }
 
-fn press_hint(theme: &Theme, key: &'static str, tail: &'static str) -> Line<'static> {
+fn press_hint(theme: &Theme, key: impl Into<String>, tail: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled("Press ", Style::default().fg(theme.dimmed)),
-        Span::styled(key, Style::default().fg(theme.hint).bold()),
+        Span::styled(key.into(), Style::default().fg(theme.hint).bold()),
         Span::styled(tail, Style::default().fg(theme.dimmed)),
     ])
 }
@@ -1039,11 +1031,11 @@ fn plan_plugin_statuses<'a>(
     plan
 }
 
-/// The activity column's text: remaining snooze under Attention sort, else the age of a
+/// The activity column's text: remaining snooze, else the age of a
 /// resting (Idle or Unknown) row, else blank. `last_accessed_at` is only a fallback for a
 /// missing `idle_entered_at`; on an active row it reads as idle time.
-fn row_age(inst: &crate::session::Instance, in_attention: bool) -> String {
-    if let Some(remaining) = in_attention.then(|| inst.snooze_remaining()).flatten() {
+fn row_age(inst: &crate::session::Instance) -> String {
+    if let Some(remaining) = inst.snooze_remaining() {
         return format_snooze_remaining(remaining);
     }
     if !matches!(inst.status, Status::Idle | Status::Unknown) {
@@ -1371,6 +1363,7 @@ impl HomeView {
             group_delete_options_dialog,
             rename_dialog,
             worktree_name_dialog,
+            sandbox_login_dialog,
             restart_dialog,
             hooks_install_dialog,
             volume_ignores_glob_dialog,
@@ -1563,10 +1556,10 @@ impl HomeView {
             }
         };
         let borders = layout.list_borders();
-        // The Trash / Archived sections render in a pinned bottom shelf instead of
-        // scrolling with the list. They are a contiguous suffix of `flat_items` starting at
-        // `list_len`, with a divider between; when that divider shows it carries the sort
-        // indicator, so the bottom-border copy is suppressed.
+        // The Suggested row and the Archived / Trash sections render in a pinned bottom
+        // shelf instead of scrolling with the list. They are a contiguous suffix of
+        // `flat_items` starting at `list_len`, with a divider between; when that divider
+        // shows it carries the sort indicator, so the bottom-border copy is suppressed.
         let shelf_start = self.shelf_start();
         let list_len = shelf_start.unwrap_or(self.flat_items.len());
         let show_divider = shelf_start.is_some() && list_len > 0;
@@ -1631,7 +1624,7 @@ impl HomeView {
             );
         }
 
-        if !self.has_instances() && !self.has_any_groups() {
+        if !self.has_instances() && !self.has_any_groups() && self.flat_items.is_empty() {
             let empty_text = vec![
                 Line::from(""),
                 Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
@@ -1898,6 +1891,7 @@ impl HomeView {
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
+            || self.sandbox_login_dialog.is_some()
             || self.repo_trust_dialog.is_some()
             || self.create_hook_failed.is_some()
             || self.hooks_install_dialog.is_some()
@@ -1923,11 +1917,10 @@ impl HomeView {
     }
 
     /// Reserve the favorite gutter on every row while any session is a pinned favorite,
-    /// so titles stay aligned and collapsing a group does not shift the list. Favorite
-    /// pins under Attention sort, or in any sort with favorites-first on (the
-    /// `Context::FavoritesUsable` predicate).
+    /// so titles stay aligned and collapsing a group does not shift the list. Favorites
+    /// pin only with favorites-first on (the `Context::FavoritesUsable` predicate).
     pub(super) fn favorite_gutter(&self) -> bool {
-        (self.sort_order == SortOrder::Attention || crate::session::favorites_first())
+        crate::session::favorites_first()
             && self
                 .instances
                 .values()
@@ -1944,12 +1937,6 @@ impl HomeView {
         favorite_gutter: bool,
     ) -> Line<'static> {
         let indent = get_indent(item.depth());
-
-        // Snooze and urgent visuals render only under Attention sort, so the sidebar
-        // stays clean for users who don't run a triage workflow. Archive is universal:
-        // it is a lifecycle action and its rows live in the pinned Archived section in
-        // every sort mode.
-        let in_attention = self.sort_order == SortOrder::Attention;
 
         use std::borrow::Cow;
 
@@ -1972,6 +1959,7 @@ impl HomeView {
                 // pinned project reads as deliberate rather than stale. Project view
                 // only; the registry lookup is keyed by the header label.
                 let pinned = self.group_by == GroupByMode::Project
+                    && !path.contains('/')
                     && !crate::session::is_synthetic_project_header(path)
                     && self.is_project_label_pinned(name);
                 // Top-level shelf section headers get a leading type glyph so they read
@@ -2020,6 +2008,18 @@ impl HomeView {
                 }
                 (icon, text, style)
             }
+            // A provider that failed to refresh marks the row; its pane says why.
+            Item::Suggested { total, failed } => (
+                ICON_SUGGESTED,
+                Cow::Owned(if *failed {
+                    format!("Suggested ({total}) !")
+                } else {
+                    format!("Suggested ({total})")
+                }),
+                Style::default()
+                    .fg(if *failed { theme.error } else { theme.group })
+                    .bold(),
+            ),
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
                     // Each view mode contributes only the live-state glyph and color for
@@ -2125,7 +2125,7 @@ impl HomeView {
                             )
                         }
                     };
-                    decorate_row(inst, in_attention, seed, sunk, theme)
+                    decorate_row(inst, seed, sunk, theme)
                 } else {
                     (
                         "?",
@@ -2217,18 +2217,13 @@ impl HomeView {
         let terminal_badge = (self.view_mode == ViewMode::Structured
             && self.paired_terminal_running_for_display(inst))
         .then(|| format!(" {ICON_TERMINAL}"));
-        // Paint must not fork tmux, so this skips the resume gate the menu applies.
-        let update_badge = (!inst.is_structured()
-            && crate::session::update_restart::binary_updated(inst))
-        .then_some(" [update]");
         // Its on_create hooks were skipped at creation, so their setup never ran.
         let setup_badge = inst.created_without_setup.then_some(" [no setup]");
         let badge_width = badge_text.map_or(0, |s| s.len())
             + terminal_badge.as_ref().map_or(0, |s| s.len())
-            + update_badge.map_or(0, |s| s.len())
             + setup_badge.map_or(0, |s| s.len());
         let age = if self.show_activity_age {
-            row_age(inst, in_attention)
+            row_age(inst)
         } else {
             String::new()
         };
@@ -2286,17 +2281,6 @@ impl HomeView {
 
         if let Some(badge) = terminal_badge {
             let badge_style = Style::default().fg(theme.terminal_active);
-            line_spans.push(Span::styled(
-                badge,
-                if is_selected {
-                    selected_row_style(badge_style, theme)
-                } else {
-                    badge_style
-                },
-            ));
-        }
-        if let Some(badge) = update_badge {
-            let badge_style = Style::default().fg(theme.waiting);
             line_spans.push(Span::styled(
                 badge,
                 if is_selected {
@@ -2548,17 +2532,22 @@ impl HomeView {
                 .get_instance(&id)
                 .is_some_and(|inst| self.paired_terminal_running_for_display(inst))
         {
-            let key = if self.strict_hotkeys { "Ctrl+T" } else { "T" };
-            // Live mode forwards `T` to the agent; only the leader reaches the swap.
+            let key = self.key_label(ActionId::AttachTerminal);
+            // Live mode forwards the attach key to the agent; only the leader reaches the swap.
             let how = match self.live_send.as_ref().map(|state| state.leader) {
                 Some(Some(leader)) => {
-                    format!("Press {} then t", live_send::display_chord(leader))
+                    Some(format!("Press {} then t", live_send::display_chord(leader)))
                 }
-                Some(None) => format!("Exit live mode, then press {key}"),
-                None => format!("Press {key}"),
+                _ if key.is_empty() => None,
+                Some(None) => Some(format!("Exit live mode, then press {key}")),
+                None => Some(format!("Press {key}")),
+            };
+            let text = match how {
+                Some(how) => format!("No terminal running. {how} to start one."),
+                None => "No terminal running.".to_string(),
             };
             frame.render_widget(
-                Paragraph::new(format!("No terminal running. {how} to start one."))
+                Paragraph::new(text)
                     .style(Style::default().fg(theme.dimmed))
                     .alignment(Alignment::Center),
                 rect,
@@ -2622,6 +2611,7 @@ impl HomeView {
                 theme,
                 compact,
                 false,
+                &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
             );
         }
         frame.buffer_mut().set_style(
@@ -3278,6 +3268,9 @@ impl HomeView {
             );
             return;
         }
+        if self.render_suggestions_pane(frame, area, theme) {
+            return;
+        }
         let compact = responsive::is_narrow(area.width, self.narrow_breakpoint);
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
@@ -3388,8 +3381,8 @@ impl HomeView {
             // Advertise the info-header toggle: `i` gates the header in every view mode
             // (Agent's worktree-flavored one, Terminal/Tool's minimal one), so the hint
             // applies everywhere except the compact branch, whose title is taken.
-            let key = if self.strict_hotkeys { "I" } else { "i" };
-            let hint_text = if split.is_some() {
+            let key = self.key_label(ActionId::TogglePreviewInfo);
+            let hint_text = if split.is_some() || key.is_empty() {
                 String::new()
             } else if show_info {
                 format!(" hide info with {key} ")
@@ -3783,6 +3776,7 @@ impl HomeView {
                             theme,
                             compact,
                             show_info,
+                            &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
                         );
                     }
                 } else {
@@ -3841,6 +3835,7 @@ impl HomeView {
                             theme,
                             compact,
                             show_info,
+                            &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
                         );
                     }
                 } else {
@@ -4129,7 +4124,7 @@ impl HomeView {
             return;
         }
 
-        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        let key = self.key_label(ActionId::ToggleArchive);
         let parked = if title.is_empty() {
             "This session is parked. Its agent was stopped.".to_string()
         } else {
@@ -4143,7 +4138,7 @@ impl HomeView {
                 heading: "Archived",
                 body: parked.into(),
                 inst,
-                hint: Some(press_hint(theme, key, " to unarchive it.")),
+                hint: (!key.is_empty()).then(|| press_hint(theme, key, " to unarchive it.")),
                 wrap: true,
             },
         );
@@ -4242,6 +4237,17 @@ impl HomeView {
         }
     }
 
+    /// The action's primary key in the active hotkey mode, or "" when it is unbound.
+    pub(super) fn key_label(&self, id: ActionId) -> String {
+        super::bindings::label(id, self.strict_hotkeys)
+    }
+
+    /// "Press <activate key> {tail}", or nothing when activation is unbound.
+    fn activate_hint(&self, theme: &Theme, tail: &'static str) -> Option<Line<'static>> {
+        let key = self.key_label(ActionId::Activate);
+        (!key.is_empty()).then(|| press_hint(theme, key, tail))
+    }
+
     /// Calm placeholder for a pane that is simply gone (the generic gone-error), in
     /// place of the red crash error; the row's status icon still signals the state.
     fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -4253,7 +4259,7 @@ impl HomeView {
                 heading: "Stopped",
                 body: "This session isn't running.".into(),
                 inst: None,
-                hint: Some(press_hint(theme, "Enter", " to start it.")),
+                hint: self.activate_hint(theme, " to start it."),
                 wrap: false,
             },
         );
@@ -4290,7 +4296,7 @@ impl HomeView {
                 heading: "Structured view",
                 body: body.into(),
                 inst: None,
-                hint: Some(press_hint(theme, "Enter", " to open the transcript.")),
+                hint: self.activate_hint(theme, " to open the transcript."),
                 wrap: false,
             },
         );
@@ -4522,10 +4528,18 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        // Key a footer button synthesizes on click, for the few entries outside the registry.
-        let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // The activation keys, shown as one-cell glyphs while on their defaults.
+        let activation = |id: ActionId, default: &str, glyph: &str| {
+            let label = super::bindings::label(id, strict);
+            let label = if label == default {
+                glyph.to_string()
+            } else {
+                label.replace("Ctrl+", "^")
+            };
+            (super::bindings::key_event(id, strict), label)
+        };
+        let (kenter, enter_label) = activation(ActionId::Activate, "Enter", "↵");
+        let (ktab, tab_label) = activation(ActionId::ActivateAlt, "Tab", "⇥ ");
         // Click key and compact label (`^G`) for an action's chord in the active mode.
         let bound = |id: ActionId| {
             (
@@ -4537,7 +4551,14 @@ impl HomeView {
         // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
         let mut serving_status = None;
-        if !self.selected_is_trashed() {
+        // The focused suggestions pane lists its own keys.
+        if self.suggestions_focused {
+            groups.push((
+                0,
+                Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                mk("Esc", "Sessions"),
+            ));
+        } else if !self.selected_is_trashed() {
             // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
             // watching the same sessions clash over pane sizes (tmux reflows to the smallest
             // client). Recomputed on a throttle in the app loop, not per frame.
@@ -4569,6 +4590,7 @@ impl HomeView {
             // Enter to live-send or tmux attach and Tab does the other, so both labels resolve
             // here and can never advertise the same action. Acp rows ignore the setting and
             // keep the plain "Attach" label. Mirrors `HelpOverlay`'s wording.
+            let on_suggested = self.on_suggested_row();
             let (enter_action_text, tab_action_text) = match self.flat_items.get(self.cursor) {
                 Some(Item::Group {
                     collapsed: true, ..
@@ -4591,6 +4613,7 @@ impl HomeView {
                         (Some("Attach"), Some("Live"))
                     }
                 }
+                Some(Item::Suggested { .. }) => (Some("Browse"), None),
                 None => (None, None),
             };
             // After another window took live control: its status, then the key that takes
@@ -4611,35 +4634,41 @@ impl HomeView {
                 ));
                 // No key hint where neither key enters live mode; the row's hints stay.
                 let (click, key) = match self.live_key(self.selected_session.as_deref()?)? {
-                    live_send::LiveKey::Tab => (ktab, "Tab"),
-                    live_send::LiveKey::Enter => (kenter, "↵"),
+                    live_send::LiveKey::Tab => (
+                        ktab,
+                        super::bindings::label(ActionId::ActivateAlt, strict).replace("Ctrl+", "^"),
+                    ),
+                    live_send::LiveKey::Enter => (kenter, enter_label.clone()),
                 };
-                groups.push((0, click, mk(key, "take control")));
+                click?;
+                groups.push((0, click, mk(&key, "take control")));
                 Some(click)
             });
-            if let Some(enter_action_text) = enter_action_text {
-                // U+21B5 keeps Enter to one display cell without shortening its action label.
+            if let (Some(enter_action_text), Some(_)) = (enter_action_text, kenter) {
                 if live_key != Some(kenter) {
-                    groups.push((0, kenter, mk("↵", enter_action_text)));
+                    groups.push((0, kenter, mk(&enter_label, enter_action_text)));
                 }
             }
-            if let Some(tab_action_text) = tab_action_text {
+            if let (Some(tab_action_text), Some(_)) = (tab_action_text, ktab) {
                 if live_key != Some(ktab) {
-                    groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                    groups.push((2, ktab, mk(&tab_label, tab_action_text)));
                 }
             }
 
-            let (click, key) = bound(ActionId::ToggleView);
-            groups.push((2, click, mk(&key, "View")));
-            if matches!(self.view_mode, ViewMode::Tool(_)) {
-                let (click, key) = bound(ActionId::ToolPicker);
-                groups.push((1, click, mk(&key, "Back")));
-            } else if self.has_tool_targets() {
-                let (click, key) = bound(ActionId::ToolPicker);
-                groups.push((2, click, mk(&key, "Tools")));
+            // The Suggested row is not a session: view, tool and group keys do not apply.
+            if !on_suggested {
+                let (click, key) = bound(ActionId::ToggleView);
+                groups.push((2, click, mk(&key, "View")));
+                if matches!(self.view_mode, ViewMode::Tool(_)) {
+                    let (click, key) = bound(ActionId::ToolPicker);
+                    groups.push((1, click, mk(&key, "Back")));
+                } else if self.has_tool_targets() {
+                    let (click, key) = bound(ActionId::ToolPicker);
+                    groups.push((2, click, mk(&key, "Tools")));
+                }
+                let (click, key) = bound(ActionId::GroupBy);
+                groups.push((3, click, mk(&key, "Group")));
             }
-            let (click, key) = bound(ActionId::GroupBy);
-            groups.push((3, click, mk(&key, "Group")));
 
             // c: container/host toggle hint for sandboxed sessions in Terminal view
             if self.view_mode == ViewMode::Terminal {
@@ -4653,16 +4682,22 @@ impl HomeView {
                 }
             }
 
-            // New session: bare `n` is the usual chord, but while a committed search borrows
-            // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
-            // already uses `N`.
-            let new_uses_shift = committed_search && !strict;
-            let (click, key) = if new_uses_shift {
-                (kc('N'), "N".to_string())
-            } else {
-                bound(ActionId::NewSession)
+            // New session: while a committed search claims a New chord for cycling, advertise
+            // one it leaves free, else new-from-selection (Shift+N by default), which still
+            // creates (#3038) but only from a selected session or group.
+            let new_key = |id| {
+                let shadow = committed_search.then_some(ActionId::SearchNext);
+                super::bindings::key_event_unshadowed(id, shadow, strict)
             };
-            groups.push((1, click, mk(&key, "New")));
+            let has_selection = self.selected_session.is_some() || self.selected_group.is_some();
+            let new = new_key(ActionId::NewSession).or_else(|| {
+                has_selection
+                    .then(|| new_key(ActionId::NewFromSelection))
+                    .flatten()
+            });
+            if let Some((event, label)) = new {
+                groups.push((1, Some(event), mk(&label.replace("Ctrl+", "^"), "New")));
+            }
 
             // Priority 1 is the core daily workflow (new, message, the web dashboard), which
             // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
@@ -4670,49 +4705,44 @@ impl HomeView {
                 let (click, key) = bound(ActionId::SendMessage);
                 groups.push((1, click, mk(&key, "Msg")));
             }
-            if !self.flat_items.is_empty() {
+            if !self.flat_items.is_empty() && !on_suggested {
                 let (click, key) = bound(ActionId::Delete);
                 groups.push((3, click, mk(&key, "Del")));
             }
-            // Archive / Snooze render only in Attention sort: they shape the Attention queue
-            // and do nothing visible elsewhere, so they would just take footer space.
-            let in_attention = self.sort_order == SortOrder::Attention;
-            if in_attention {
-                if !self.flat_items.is_empty() {
-                    let (click, key) = bound(ActionId::ToggleArchive);
-                    groups.push((1, click, mk(&key, "Archive")));
-                }
-                if self.selected_session.is_some() {
-                    let (click, key) = bound(ActionId::ToggleSnooze);
-                    groups.push((1, click, mk(&key, "Snooze")));
-                }
+            if self.selected_session.is_some() {
+                let (click, key) = bound(ActionId::ToggleSnooze);
+                groups.push((1, click, mk(&key, "Snooze")));
             }
             // Fav follows the key's own gate (`Context::FavoritesUsable`), so the footer
             // advertises it wherever `f` actually does something.
-            if self.selected_session.is_some()
-                && (in_attention || crate::session::favorites_first())
-            {
+            if self.selected_session.is_some() && crate::session::favorites_first() {
                 let (click, key) = bound(ActionId::ToggleFavorite);
                 groups.push((2, click, mk(&key, "Fav")));
             }
 
-            // Committed-search cue: `n` cycles matches and `Esc` clears (#3038). The `[i/N]`
-            // counter lives on the search bar, so it isn't duplicated here. Priority 0 so it
-            // survives the pack; clicking it cycles to the next match.
+            // Committed-search cue: search-next cycles matches and `Esc` clears (#3038). The
+            // `[i/N]` counter lives on the search bar, so it isn't duplicated here. Priority 0
+            // so it survives the pack; clicking it cycles to the next match, or clears the
+            // search when search-next is unbound.
             if committed_search {
-                let hint = vec![
-                    Span::styled("n", key_style),
-                    Span::styled(" next ", desc_style),
-                    Span::styled("Esc", key_style),
-                    Span::styled(" clear", desc_style),
-                ];
-                groups.push((0, kc('n'), hint));
+                let (click, key) = bound(ActionId::SearchNext);
+                let mut hint = Vec::new();
+                if click.is_some() {
+                    hint.push(Span::styled(key, key_style));
+                    hint.push(Span::styled(" next ", desc_style));
+                }
+                hint.push(Span::styled("Esc", key_style));
+                hint.push(Span::styled(" clear", desc_style));
+                let esc = Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                groups.push((0, click.or(esc), hint));
             }
 
             let (click, key) = bound(ActionId::SearchStart);
             groups.push((4, click, mk_key(&key)));
-            let (click, key) = bound(ActionId::Diff);
-            groups.push((4, click, mk(&key, "Diff")));
+            if !on_suggested {
+                let (click, key) = bound(ActionId::Diff);
+                groups.push((4, click, mk(&key, "Diff")));
+            }
             // The R entry carries one state: a Daemon problem or limit, else the Web dashboard.
             let attention = self.daemon_attention();
             if attention.is_some() || !super::input::web_plugin_disabled() {
@@ -4735,7 +4765,9 @@ impl HomeView {
                     mk("Esc", "Sessions"),
                 ));
             } else {
-                groups.push((0, kenter, mk("↵", "Read")));
+                if kenter.is_some() {
+                    groups.push((0, kenter, mk(&enter_label, "Read")));
+                }
                 let (click, key) = bound(ActionId::ToggleArchive);
                 groups.push((0, click, mk(&key, "Restore")));
                 let (click, key) = bound(ActionId::Delete);
@@ -5296,52 +5328,29 @@ mod tests {
 
     #[test]
     fn compose_list_title_cases() {
-        use crate::session::config::GroupByMode::{Manual, Org, Project};
-        use crate::session::config::SortOrder::{LastActivity, Newest, Oldest, AZ, ZA};
-        // Newest and Manual are the defaults and add no suffix; the profile tag shows only
+        use crate::session::config::GroupByMode::{Group, Project};
+        use crate::session::config::SortOrder::{Custom, Name, Newest};
+        // Repository and Custom are the defaults and add no suffix; the profile tag shows only
         // while a profile filter is active.
         let cases = [
-            ("aoe", None, Manual, Newest, " aoe "),
+            ("aoe", None, Project, Custom, " aoe "),
             (
                 "aoe",
                 Some("my-profile"),
-                Manual,
-                Newest,
+                Project,
+                Custom,
                 " aoe [my-profile] ",
             ),
-            ("aoe", None, Project, Newest, " aoe · project "),
-            ("aoe", None, Org, Newest, " aoe · org "),
-            ("aoe", None, Manual, LastActivity, " aoe · Recent "),
-            ("aoe", None, Manual, Oldest, " aoe · Oldest "),
-            ("aoe", None, Manual, ZA, " aoe · Z-A "),
-            (
-                "aoe",
-                None,
-                Project,
-                LastActivity,
-                " aoe · project · Recent ",
-            ),
-            (
-                "aoe",
-                Some("alpha"),
-                Manual,
-                LastActivity,
-                " aoe [alpha] · Recent ",
-            ),
-            (
-                "aoe",
-                Some("alpha"),
-                Project,
-                LastActivity,
-                " aoe [alpha] · project · Recent ",
-            ),
-            ("Tool: foo", None, Manual, AZ, " Tool: foo · A-Z "),
+            ("aoe", None, Group, Custom, " aoe · groups "),
+            ("aoe", None, Project, Name, " aoe · name "),
+            ("aoe", None, Project, Newest, " aoe · newest first "),
+            ("aoe", None, Group, Name, " aoe · groups · name "),
             (
                 "Terminals",
                 Some("work"),
-                Project,
-                Newest,
-                " Terminals [work] · project ",
+                Group,
+                Name,
+                " Terminals [work] · groups · name ",
             ),
         ];
         for (prefix, profile, group_by, sort, expected) in cases {
@@ -5649,19 +5658,15 @@ mod tests {
             (Status::Error, ""),
         ] {
             inst.status = status;
-            assert_eq!(row_age(&inst, false), expected, "{status:?}");
+            assert_eq!(row_age(&inst), expected, "{status:?}");
         }
         inst.idle_entered_at = None;
         inst.status = Status::Idle;
-        assert_eq!(row_age(&inst, false), "5m", "falls back to last access");
+        assert_eq!(row_age(&inst), "5m", "falls back to last access");
 
         inst.status = Status::Running;
         inst.snooze(30);
-        assert_eq!(row_age(&inst, false), "", "snooze hidden outside Attention");
-        assert!(
-            !row_age(&inst, true).is_empty(),
-            "snooze shown under Attention"
-        );
+        assert!(!row_age(&inst).is_empty(), "snooze shows on a running row");
     }
 
     /// The bracketed tag must occupy `max_width + 2` cells as the renderer paints them:

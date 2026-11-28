@@ -15,7 +15,7 @@ use crate::session::config::settings_schema::{
     clear_path, merge_json, FieldDescriptor, ValidationKind, WidgetKind,
 };
 use crate::session::{validate_snooze_duration, Config, ProfileConfig};
-use crate::sound::{validate_sound_exists, volume_from_option, volume_options, volume_to_index};
+use crate::sound::{volume_from_option, volume_options, volume_to_index};
 use crate::tui::styles::available_themes;
 
 use super::SettingsScope;
@@ -42,6 +42,7 @@ pub enum SettingsCategory {
     Diff,
     Logging,
     Plugins,
+    Keybinds,
 }
 
 impl SettingsCategory {
@@ -65,11 +66,12 @@ impl SettingsCategory {
             Self::Diff => "Diff",
             Self::Logging => "Logging",
             Self::Plugins => "Plugins",
+            Self::Keybinds => "Keybinds",
         }
     }
 
-    /// The `category` string the schema emits for this tab. `Hooks` has no
-    /// schema fields, so its name is only for completeness.
+    /// The `category` string the schema emits for this tab. `Hooks` and
+    /// `Keybinds` have no schema fields, so their names are only for completeness.
     fn schema_name(&self) -> &'static str {
         match self {
             Self::Theme => "Theme",
@@ -90,6 +92,7 @@ impl SettingsCategory {
             Self::Telemetry => "Telemetry",
             Self::Logging => "Logging",
             Self::Plugins => "Plugins",
+            Self::Keybinds => "Keybinds",
         }
     }
 }
@@ -137,6 +140,10 @@ pub enum FieldKind {
     /// One per-target logging-level row, carrying the index into
     /// [`crate::logging::KNOWN_SUB_TARGETS`].
     LoggingTarget(usize),
+    /// A `[keybinds]` action, by name; read-only.
+    Keybind(String),
+    /// An ignored `[keybinds]` entry, by name; read-only.
+    KeybindIgnored(String),
     /// Non-interactive divider rendered as a styled heading.
     SectionMarker,
 }
@@ -156,6 +163,8 @@ pub enum FieldValue {
     /// Non-interactive divider: label is the heading, description the
     /// subtitle. Navigation skips it; apply/clear no-op.
     SectionHeader,
+    /// Selectable but not editable; Enter and apply/clear no-op.
+    ReadOnly(String),
 }
 
 /// A setting field with metadata.
@@ -249,6 +258,8 @@ impl SettingField {
             FieldKind::Hook(h) => format!("hooks.{}", h.field()),
             FieldKind::HostEnvironment => "environment".to_string(),
             FieldKind::LoggingTarget(i) => format!("logging.targets.{i}"),
+            FieldKind::Keybind(name) => format!("keybinds.{name}"),
+            FieldKind::KeybindIgnored(name) => format!("keybinds.ignored.{name}"),
             FieldKind::SectionMarker => format!("__section.{}", self.label),
         }
     }
@@ -321,15 +332,6 @@ impl SettingField {
                     Err(e) => Err(format!("Invalid JSON: {e}")),
                 }
             }
-            // Sound files must exist on disk if named.
-            (FieldKind::Schema { section, .. }, FieldValue::OptionalText(Some(name)))
-                if section == "sound" =>
-            {
-                if !name.is_empty() {
-                    validate_sound_exists(name)?;
-                }
-                Ok(())
-            }
             // Everything else: enforce the schema's server-authoritative rule.
             (FieldKind::Schema { validation, .. }, value) => {
                 validate_field_value(validation, value)
@@ -367,7 +369,7 @@ fn field_value_to_json_for_validation(value: &FieldValue) -> Value {
             json!(options.get(*selected).cloned().unwrap_or_default())
         }
         FieldValue::List(items) => json!(items),
-        FieldValue::SectionHeader => Value::Null,
+        FieldValue::SectionHeader | FieldValue::ReadOnly(_) => Value::Null,
     }
 }
 
@@ -389,6 +391,7 @@ fn value_display_string(value: &FieldValue) -> String {
         FieldValue::List(items) => format!("[{} items]", items.len()),
         FieldValue::OptionalText(v) => v.clone().unwrap_or_else(|| "(empty)".to_string()),
         FieldValue::SectionHeader => String::new(),
+        FieldValue::ReadOnly(v) => v.clone(),
     }
 }
 
@@ -780,6 +783,11 @@ pub fn build_fields_for_category(
     if category == SettingsCategory::Hooks {
         return build_hook_rows(&ctx);
     }
+    if category == SettingsCategory::Keybinds {
+        // `[keybinds]` is global, but the hotkey mode, leader and exit chord it is checked
+        // against can come from the profile, as they do for the running home view.
+        return build_keybind_rows(&crate::session::merge_configs(base.clone(), overrides));
+    }
 
     let mut primary: Vec<SettingField> = Vec::new();
     let mut advanced: Vec<SettingField> = Vec::new();
@@ -925,6 +933,87 @@ fn build_schema_row(
         has_override,
         inherited_display,
     }
+}
+
+/// The whole Keybinds tab: ignored `[keybinds]` entries, then every action's keys in the
+/// active hotkey mode.
+fn build_keybind_rows(config: &Config) -> Vec<SettingField> {
+    let (actions, warnings) = crate::tui::home::keybinds::describe(config);
+    let header = |label: &str, description: &str| SettingField {
+        kind: FieldKind::SectionMarker,
+        label: label.to_string(),
+        description: description.to_string(),
+        value: FieldValue::SectionHeader,
+        category: SettingsCategory::Keybinds,
+        has_override: false,
+        inherited_display: None,
+    };
+    let row = |kind: FieldKind, label: String, value: String, description: String| SettingField {
+        kind,
+        label,
+        description,
+        value: FieldValue::ReadOnly(value),
+        category: SettingsCategory::Keybinds,
+        has_override: false,
+        inherited_display: None,
+    };
+    let mut rows = Vec::new();
+    if !warnings.is_empty() {
+        rows.push(header(
+            "Ignored entries",
+            "These [keybinds] entries were not applied; their actions keep the default keys.",
+        ));
+        rows.extend(warnings.iter().map(|w| {
+            row(
+                FieldKind::KeybindIgnored(w.name.clone()),
+                w.name.clone(),
+                "ignored".to_string(),
+                w.reason.clone(),
+            )
+        }));
+    }
+    let mode = if config.session.strict_hotkeys {
+        "strict"
+    } else {
+        "standard"
+    };
+    rows.push(header(
+        "Keybinds",
+        &format!(
+            "Read-only, for the {mode} hotkey mode. To change one, map its action name to a \
+             list of keys under [keybinds] in config.toml; [] unbinds it."
+        ),
+    ));
+    rows.extend(actions.into_iter().map(|a| {
+        let mut value = if a.keys.is_empty() {
+            "unbound".to_string()
+        } else {
+            a.keys
+        };
+        if a.overridden {
+            value.push_str(" (custom)");
+        }
+        let default_keys = if a.default_keys.is_empty() {
+            "none"
+        } else {
+            &a.default_keys
+        };
+        let label = if a.title.is_empty() { a.name } else { a.title };
+        // The value row is one line wide; a custom list can be longer, so it is repeated in
+        // the wrapped description.
+        let keys = if a.overridden {
+            format!(" Keys: {value}.")
+        } else {
+            String::new()
+        };
+        row(
+            FieldKind::Keybind(a.name.to_string()),
+            label.to_string(),
+            value,
+            format!("Action name: {}.{keys} Default: {default_keys}.", a.name),
+        )
+    }));
+    rows
 }
 
 /// The three lifecycle-hook rows (the whole Hooks tab).
@@ -1214,8 +1303,11 @@ pub fn clear_override(field: &SettingField, profile: &mut ProfileConfig) {
                 clear_override_path(profile, section, field);
             }
         }
-        // Logging is global-only and section markers are non-interactive.
-        FieldKind::LoggingTarget(_) | FieldKind::SectionMarker => {}
+        // Logging and keybinds are global-only; section markers are non-interactive.
+        FieldKind::LoggingTarget(_)
+        | FieldKind::Keybind(_)
+        | FieldKind::KeybindIgnored(_)
+        | FieldKind::SectionMarker => {}
     }
 }
 
@@ -1322,6 +1414,73 @@ mod tests {
             f.value = FieldValue::OptionalText(value.map(str::to_string));
             assert_eq!(f.validate().is_ok(), ok, "{value:?}");
         }
+    }
+
+    #[test]
+    fn keybinds_tab_lists_ignored_entries_then_effective_keys_read_only() {
+        let config = Config {
+            keybinds: [
+                ("stop", vec!["d", "F2"]),
+                ("restart", vec!["C-S-e"]),
+                ("bogus", vec!["F3"]),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+            .collect(),
+            ..Config::default()
+        };
+        let build_with = |profile: &ProfileConfig| {
+            let rows = build_fields_for_category(
+                SettingsCategory::Keybinds,
+                SettingsScope::Global,
+                &config,
+                profile,
+            );
+            assert!(rows
+                .iter()
+                .all(|f| matches!(f.value, FieldValue::ReadOnly(_) | FieldValue::SectionHeader)));
+            rows
+        };
+        let find = |rows: &[SettingField], ident: &str| {
+            rows.iter()
+                .position(|f| f.ident() == ident)
+                .unwrap_or_else(|| panic!("{ident} missing"))
+        };
+
+        // Standard mode: `d` is delete's, so stop's entry is ignored, under its own id.
+        let rows = build_with(&ProfileConfig::default());
+        let (ignored, header, stop) = (
+            find(&rows, "keybinds.ignored.stop"),
+            find(&rows, "__section.Keybinds"),
+            find(&rows, "keybinds.stop"),
+        );
+        assert!(ignored < header && header < stop);
+        assert_eq!(rows[ignored].display_value(), "ignored");
+        assert_eq!(rows[ignored].description, "d is bound to delete");
+        assert_eq!(
+            rows[find(&rows, "keybinds.ignored.bogus")].description,
+            "unknown action"
+        );
+        assert_eq!(rows[stop].display_value(), "x");
+        let restart = &rows[find(&rows, "keybinds.restart")];
+        assert_eq!(restart.display_value(), "Ctrl+Shift+E (custom)");
+        assert!(restart.description.contains("Keys: Ctrl+Shift+E (custom)."));
+        assert_eq!(
+            rows[find(&rows, "keybinds.plugins")].display_value(),
+            "unbound"
+        );
+
+        // The profile's strict mode applies, as in the home view: `d` is free there.
+        let strict: ProfileConfig = toml::from_str("[session]\nstrict_hotkeys = true\n").unwrap();
+        let rows = build_with(&strict);
+        assert!(rows.iter().all(|f| f.ident() != "keybinds.ignored.stop"));
+        assert_eq!(
+            rows[find(&rows, "keybinds.stop")].display_value(),
+            "d, F2 (custom)"
+        );
+        assert!(rows[find(&rows, "__section.Keybinds")]
+            .description
+            .contains("strict"));
     }
 
     #[test]

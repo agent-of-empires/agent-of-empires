@@ -189,3 +189,85 @@ describe("service worker notification click with focus-mode windows", () => {
     }
   });
 });
+
+describe("service worker offline shell", () => {
+  function loadFetchSw(fetchImpl: (request: unknown) => Promise<Response>) {
+    const handlers = new Map<string, Handler[]>();
+    const stores = new Map<string, Map<string, Response>>();
+    const store = (name: string) => {
+      if (!stores.has(name)) stores.set(name, new Map());
+      const entries = stores.get(name)!;
+      const key = (r: unknown) => (typeof r === "string" ? r : new URL((r as { url: string }).url).pathname);
+      return {
+        match: async (r: unknown) => entries.get(key(r))?.clone(),
+        put: async (r: unknown, res: Response) => void entries.set(key(r), res),
+        keys: async () => [...entries.keys()],
+        delete: async (r: unknown) => entries.delete(key(r)),
+      };
+    };
+    const caches = {
+      open: vi.fn(async (name: string) => store(name)),
+      match: async (r: string, { cacheName }: { cacheName: string }) => store(cacheName).match(r),
+      keys: vi.fn(),
+      delete: vi.fn(),
+    };
+    const fetch = vi.fn(fetchImpl);
+    const self = {
+      addEventListener: (type: string, fn: Handler) => handlers.set(type, [...(handlers.get(type) ?? []), fn]),
+      location: { origin: "https://aoe.test" },
+    };
+    vm.runInNewContext(swSource, { self, URL, Response, caches, fetch });
+    const dispatch = (path: string, init: { mode?: string; destination?: string; method?: string } = {}) => {
+      let responded: Promise<Response> | undefined;
+      const request = {
+        method: "GET",
+        mode: "cors",
+        destination: "",
+        ...init,
+        url: new URL(path, "https://aoe.test").href,
+      };
+      for (const fn of handlers.get("fetch") ?? [])
+        fn({ request, respondWith: (p: Promise<Response>) => (responded = p) });
+      return responded;
+    };
+    return { dispatch, fetch, caches, stores };
+  }
+  const html = (body: string) => new Response(body, { headers: { "content-type": "text/html" } });
+  const page = { mode: "navigate", destination: "document" };
+
+  it("keeps the last page and serves it, or the offline page, when the network fails", async () => {
+    let online = true;
+    const sw = loadFetchSw(async () => (online ? html("app") : Promise.reject(new TypeError("offline"))));
+    expect(await (await sw.dispatch("/session/s1", page))!.text()).toBe("app");
+    await vi.waitFor(() => expect(sw.stores.get("aoe-shell-v1")?.has("/index.html")).toBe(true));
+    online = false;
+    expect(await (await sw.dispatch("/", page))!.text()).toBe("app");
+
+    const fresh = loadFetchSw(async () => Promise.reject(new TypeError("offline")));
+    const fallback = (await fresh.dispatch("/", page))!;
+    expect(fallback.headers.get("content-type")).toContain("text/html");
+    expect(await fallback.text()).toContain("Try again");
+  });
+
+  it("serves a cached asset without the network, and a Cache Storage failure never fails a fetched one", async () => {
+    const sw = loadFetchSw(async () => new Response("js"));
+    expect(await (await sw.dispatch("/assets/a.js"))!.text()).toBe("js");
+    await vi.waitFor(() => expect(sw.stores.get("aoe-assets-v1")?.has("/assets/a.js")).toBe(true));
+    expect(await (await sw.dispatch("/assets/a.js"))!.text()).toBe("js");
+    expect(sw.fetch).toHaveBeenCalledTimes(1);
+
+    sw.caches.open.mockRejectedValue(new Error("quota"));
+    expect(await (await sw.dispatch("/assets/b.js"))!.text()).toBe("js");
+  });
+
+  it.each<[string, string, { mode?: string; destination?: string; method?: string }]>([
+    ["a plugin page frame", "/api/plugins/p/pages/x", { mode: "navigate", destination: "iframe" }],
+    ["an API page opened as a document", "/api/plugins/p/pages/x", page],
+    ["an API request", "/api/sessions", {}],
+    ["a non-GET asset request", "/assets/a.js", { method: "POST" }],
+    ["another origin's page", "https://elsewhere.test/", page],
+  ])("leaves %s to the network", (_label, path, init) => {
+    const sw = loadFetchSw(async () => html("x"));
+    expect(sw.dispatch(path, init)).toBeUndefined();
+  });
+});

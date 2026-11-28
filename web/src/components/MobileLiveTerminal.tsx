@@ -125,6 +125,14 @@ function pushFlickSample(samples: FlickSample[], sample: FlickSample) {
   while (samples.length > 1 && sample.t - samples[0]!.t > FLICK_VELOCITY_WINDOW_MS) samples.shift();
 }
 
+/** After the key event: iOS can ignore a blur made while it still handles the Enter that caused it. */
+function dismissSoftKeyboard() {
+  setTimeout(() => {
+    const el = document.activeElement;
+    if (el instanceof HTMLElement) el.blur();
+  }, 0);
+}
+
 export function MobileLiveTerminal({
   readOnly,
   frame: streamFrame,
@@ -292,8 +300,10 @@ export function MobileLiveTerminal({
   // blanks for bottom alignment does not bounce with a spinner on the last row.
   const [renderRowCount, setRenderRowCount] = useState(0);
   const shrinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rowTargetRef = useRef(0);
   useEffect(() => {
     const target = Math.max(0, lastNonBlankRow + 1);
+    rowTargetRef.current = target;
     setRenderRowCount((current) => {
       if (target >= current) {
         if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
@@ -302,7 +312,8 @@ export function MobileLiveTerminal({
       }
       shrinkTimerRef.current ??= setTimeout(() => {
         shrinkTimerRef.current = null;
-        setRenderRowCount(Math.max(0, lastNonBlankRow + 1));
+        // Rows may have arrived since this was scheduled; trim to the rows there now.
+        setRenderRowCount(rowTargetRef.current);
       }, SHRINK_DELAY_MS);
       return current;
     });
@@ -715,6 +726,9 @@ export function MobileLiveTerminal({
     uploadPastedImage,
     captureWriteAdmission,
     onTabEscape,
+    // Sending a line puts the soft keyboard away so the reply has the screen, as in a chat app. A hardware
+    // keyboard never occludes, so it keeps focus for the next line.
+    onSubmit: coarse && keyboardOpen ? dismissSoftKeyboard : undefined,
   });
 
   const cursorRow = connected && !reading ? live.row : -1;
@@ -754,8 +768,8 @@ export function MobileLiveTerminal({
             lineHeight: `${lineH}px`,
             // A variable, so a re-measure restyles mounted rows without re-rendering them.
             "--term-cell": `${charW}px`,
-            background: "var(--term-bg, #1c1c1f)",
-            color: "var(--term-fg, #e4e4e7)",
+            background: "var(--term-bg, #1f1f1f)",
+            color: "var(--term-fg, #e5e5e5)",
             // A fixed grid: ligatures would merge cells.
             fontVariantLigatures: "none",
             fontFeatureSettings: '"liga" 0, "calt" 0',

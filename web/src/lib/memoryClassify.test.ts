@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { cleanRecalledMemory, classifyMemory, isMemoryPath, parseMemoryFrontmatter } from "./memoryClassify";
 import type { ToolCall } from "./acpTypes";
+import { CLAUDE_PROFILE, CODEX_PROFILE, makeAgentProfile } from "./__tests__/agentProfileFixtures";
 
 const DIR = "/Users/jules/.claude/projects/-Users-jules-foo/memory";
 const tool = (name: string, kind: ToolCall["kind"], args: Record<string, unknown>): ToolCall => ({
@@ -19,7 +20,13 @@ it.each([
   ["/Users/jules/.claude/projects/foo/memory.md", false],
   ["/tmp/projects/foo/memory/user.md", false],
 ])("isMemoryPath(%j) is %s", (path, expected) => {
-  expect(isMemoryPath(path)).toBe(expected);
+  expect(isMemoryPath(path, CLAUDE_PROFILE)).toBe(expected);
+});
+
+it("never matches without a regex, and tolerates an invalid one", () => {
+  const path = `${DIR}/a.md`;
+  expect(isMemoryPath(path, CODEX_PROFILE)).toBe(false);
+  expect(isMemoryPath(path, makeAgentProfile({ memory_path_regex: "(" }))).toBe(false);
 });
 
 it.each<[string, ToolCall, ReturnType<typeof classifyMemory>]>([
@@ -55,7 +62,7 @@ it.each<[string, ToolCall, ReturnType<typeof classifyMemory>]>([
     expect.objectContaining({ isMemory: false }),
   ],
 ])("classifyMemory: %s", (_name, call, expected) => {
-  expect(classifyMemory(call)).toEqual(expected);
+  expect(classifyMemory(call, CLAUDE_PROFILE)).toEqual(expected);
 });
 
 describe("parseMemoryFrontmatter", () => {

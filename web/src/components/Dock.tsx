@@ -1,11 +1,11 @@
 import { Fragment, type ReactNode } from "react";
-import { PanelBottom, PanelRight, Plus, X, type LucideIcon } from "lucide-react";
+import { Maximize2, Minimize2, PanelBottom, PanelRight, Plus, X, type LucideIcon } from "lucide-react";
 import { useDroppable } from "@dnd-kit/core";
 import { SortableContext, horizontalListSortingStrategy, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
 import { FileEditorPaneContext } from "../lib/fileEditGuard";
-import type { DockLocation } from "../lib/panes";
+import { isTerminalTabId, type DockLocation } from "../lib/panes";
 import { usePaneDnd, type PaneTabData, type SplitDropData } from "./paneDnd";
 import { PaneIcon } from "./PaneIcon";
 
@@ -15,9 +15,26 @@ export interface PaneDisplay {
   /** A plugin's manifest `icon_asset`, resolved to a fetchable URL. See
    *  `PaneIcon` for the precedence over `icon`. */
   iconAssetUrl?: string;
+  /** Short mono suffix after the title, e.g. a terminal's Container mode. */
+  badge?: string;
 }
 
-interface Props {
+/** Terminal controls each group of a dock shows. */
+export interface DockControls {
+  /** Omitted on read-only servers, where the terminal ensure route is
+   *  rejected, so the new-terminal control is hidden rather than dead-ended. */
+  onNewTerminal?: () => void;
+  /** Names what the new-terminal control opens. */
+  newTerminalLabel?: string;
+  /** Controls for the active tab, shown before the dock controls. */
+  tabActions?: (id: string) => ReactNode;
+  /** The terminal switcher trigger, shown beside the new-terminal control. */
+  terminalSwitcher?: ReactNode;
+  /** Lets the dock take the whole main area and give it back. */
+  maximize?: { maximized: boolean; onToggle: () => void };
+}
+
+interface Props extends DockControls {
   location: DockLocation;
   /** Persisted index of this group within its dock; carried on the drop
    *  payloads so a drop addresses the right group. */
@@ -32,9 +49,6 @@ interface Props {
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onMove: (id: string, dock: DockLocation) => void;
-  /** Omitted on read-only servers, where the terminal ensure route is
-   *  rejected, so the new-terminal control is hidden rather than dead-ended. */
-  onNewTerminal?: () => void;
 }
 
 const btn =
@@ -67,12 +81,8 @@ function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onC
     <div
       ref={setNodeRef}
       style={style}
-      className={`group flex items-center border-r border-surface-700/20 transition-colors ${
-        isDragging ? "opacity-40" : ""
-      } ${
-        isActive
-          ? "bg-surface-800 text-text-secondary"
-          : "text-text-dim hover:text-text-secondary hover:bg-surface-800/40"
+      className={`group flex items-center transition-colors ${isDragging ? "opacity-40" : ""} ${
+        isActive ? "text-text-primary" : "text-text-dim hover:text-text-secondary"
       }`}
     >
       {/* A real button so the tab is keyboard-reachable and Enter / Space
@@ -88,6 +98,7 @@ function SortableTab({ id, location, groupIndex, isActive, desc, onActivate, onC
       >
         <PaneIcon icon={desc.icon} iconAssetUrl={desc.iconAssetUrl} className="size-3.5 shrink-0" />
         <span className="text-[11px] font-medium truncate max-w-[10rem]">{desc.title}</span>
+        {desc.badge && <span className="font-mono text-[10px] text-text-dim shrink-0">{desc.badge}</span>}
       </button>
       <button
         type="button"
@@ -146,6 +157,10 @@ export function Dock({
   onClose,
   onMove,
   onNewTerminal,
+  newTerminalLabel = "New terminal",
+  tabActions,
+  terminalSwitcher,
+  maximize,
 }: Props) {
   const { activeTab, source, dropTarget } = usePaneDnd();
   const { setNodeRef: setGroupRef } = useDroppable({
@@ -167,6 +182,9 @@ export function Dock({
     dropTarget.group === groupIndex &&
     !isSourceGroup;
   const markerIndex = isDropTarget ? (dropTarget!.index ?? tabs.length) : null;
+  // Terminal controls belong to a group of terminals, and the dock-wide maximize to its first group.
+  const holdsTerminals = tabs.some(isTerminalTabId);
+  const showMaximize = maximize && groupIndex === 0;
 
   return (
     <section
@@ -179,7 +197,7 @@ export function Dock({
       <div
         ref={setGroupRef}
         role="tablist"
-        className="flex items-stretch h-7 shrink-0 bg-surface-900 border-b border-surface-700/20"
+        className="flex items-stretch h-8 shrink-0 px-1 border-b border-surface-700/30"
       >
         <div className="flex items-stretch min-w-0 overflow-x-auto">
           <SortableContext items={tabs} strategy={horizontalListSortingStrategy}>
@@ -201,6 +219,7 @@ export function Dock({
           </SortableContext>
         </div>
         <div className="flex items-center ml-auto px-1 gap-0.5 shrink-0">
+          {tabActions?.(activeId)}
           <button
             onClick={() => onMove(activeId, target)}
             className={btn}
@@ -209,8 +228,26 @@ export function Dock({
           >
             <MoveIcon className="size-3.5" aria-hidden />
           </button>
-          {onNewTerminal && (
-            <button onClick={onNewTerminal} className={btn} title="New terminal" aria-label="New terminal">
+          {showMaximize && (
+            <button
+              type="button"
+              onClick={maximize.onToggle}
+              aria-pressed={maximize.maximized}
+              className={btn}
+              title={maximize.maximized ? "Restore panel" : "Maximize panel"}
+              aria-label={maximize.maximized ? "Restore panel" : "Maximize panel"}
+              data-testid="dock-maximize"
+            >
+              {maximize.maximized ? (
+                <Minimize2 className="size-3.5" aria-hidden />
+              ) : (
+                <Maximize2 className="size-3.5" aria-hidden />
+              )}
+            </button>
+          )}
+          {holdsTerminals && terminalSwitcher}
+          {holdsTerminals && onNewTerminal && (
+            <button onClick={onNewTerminal} className={btn} title={newTerminalLabel} aria-label={newTerminalLabel}>
               <Plus className="size-3.5" aria-hidden />
             </button>
           )}

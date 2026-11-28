@@ -61,7 +61,7 @@ impl HomeView {
         path: &str,
     ) -> anyhow::Result<crate::daemon::GroupLocation> {
         anyhow::ensure!(
-            self.group_by == crate::session::config::GroupByMode::Manual
+            self.group_by == crate::session::config::GroupByMode::Group
                 && !crate::session::is_within_archived_section(path)
                 && !crate::session::is_within_trash_section(path),
             "This is not a manual namespace group"
@@ -128,6 +128,7 @@ impl HomeView {
                     let (owner, _) = owners.next()?;
                     return owners.next().is_none().then(|| owner.clone());
                 }
+                crate::session::Item::Suggested { .. } => {}
             }
         }
         None

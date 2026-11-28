@@ -11,7 +11,10 @@ use std::time::Duration;
 use serde_json::Value;
 use serial_test::parallel;
 
-use crate::harness::{app_dir_in, require_tmux, wait_until, write_executable, TuiTestHarness};
+use crate::harness::{
+    app_dir_in, install_path_preserving_test_shell, require_tmux, wait_until, write_executable,
+    TuiTestHarness,
+};
 
 /// A string field of the session titled `title`.
 fn session_field(h: &TuiTestHarness, title: &str, field: &str) -> Option<String> {
@@ -81,34 +84,6 @@ fn write_project_omp_dotenv(project: &Path, store: &Path) {
         ),
     )
     .expect("write project OMP dotenv");
-}
-
-fn install_path_preserving_test_shell(h: &mut TuiTestHarness, path_bin: &Path) {
-    for key in [
-        "NODE_ENV",
-        "OMP_PROFILE",
-        "PI_PROFILE",
-        "PI_CODING_AGENT_DIR",
-        "PI_CODING_AGENT_SESSION_DIR",
-        "PI_CONFIG_DIR",
-        "OMP_CODING_AGENT_DIR",
-        "OMP_CODING_AGENT_SESSION_DIR",
-        "OMP_CONFIG_DIR",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "AOE_INSTANCE_ID",
-    ] {
-        h.remove_env(key);
-    }
-    let shell = h.home_path().join("omp-test-shell");
-    write_executable(
-        &shell,
-        &format!(
-            "#!/bin/sh\n[ \"${{1-}}\" = -l ] && shift\nexport PATH={}:\"$PATH\"\nexec /bin/sh \"$@\"\n",
-            sh_quote(path_bin)
-        ),
-    );
-    h.set_env("SHELL", shell.to_str().expect("UTF-8 OMP test shell"));
 }
 
 fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {

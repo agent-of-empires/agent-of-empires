@@ -5,6 +5,7 @@ import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { restartSession } from "../../lib/api";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
 import type { ShellMode } from "../PairedTerminal";
+import { Spinner } from "../Dialog";
 import { useOutsideDismiss } from "../useOutsideDismiss";
 import { signInSteps } from "./signInSteps";
 import { useCopy } from "./useCopy";
@@ -22,7 +23,7 @@ export interface SignInContext {
 }
 
 const ACTION_CLASS =
-  "inline-flex min-h-8 items-center rounded-md border border-surface-700 bg-surface-900 px-2.5 text-xs text-text-secondary transition-colors hover:bg-surface-800 hover:text-text-primary disabled:opacity-60";
+  "inline-flex min-h-8 items-center gap-1.5 rounded-md border border-surface-700 bg-surface-900 px-2.5 text-xs text-text-secondary transition-colors hover:bg-surface-800 hover:text-text-primary disabled:opacity-60";
 
 function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
@@ -182,8 +183,10 @@ function SignInPanel({ id, signIn, onLeave }: { id: string; signIn?: SignInConte
               type="button"
               className={ACTION_CLASS}
               disabled={restart.state === "restarting"}
+              aria-busy={restart.state === "restarting"}
               onClick={() => void restartAgent(signIn.sessionId)}
             >
+              {restart.state === "restarting" && <Spinner />}
               {restart.state === "restarting" ? "Restarting…" : "Restart Agent"}
             </button>
           )}

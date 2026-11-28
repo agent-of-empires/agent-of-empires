@@ -2,15 +2,18 @@ import { test, expect } from "./helpers/mockedTest";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 
 test.describe("Top bar", () => {
-  test("renders sidebar toggle, brand, palette pill, overflow, and the offline badge", async ({ page }) => {
+  test("renders sidebar toggle, brand, palette pill and overflow, and says once that the Daemon is down", async ({
+    page,
+  }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.getByRole("button", { name: "Toggle sidebar" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Go to dashboard" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Open command palette" }).first()).toBeVisible();
     await expect(page.getByRole("button", { name: "More options" })).toBeVisible();
-    // No backend behind vite preview, so the connectivity badge shows.
-    await expect(page.getByText("offline")).toBeVisible();
+    // No backend behind vite preview: the app banner says so, and nothing in the header repeats it.
+    await expect(page.getByRole("alert").filter({ hasText: "Daemon unreachable" })).toHaveCount(1);
+    await expect(page.locator("header").getByText(/offline|unreachable|disconnected/i)).toHaveCount(0);
   });
 
   test("overflow About and Help open their modals; Escape and the X close About", async ({ page }) => {

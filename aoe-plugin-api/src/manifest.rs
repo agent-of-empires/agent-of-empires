@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{CapabilityId, PluginId, API_VERSION};
+use crate::{CapabilityId, PluginId, API_VERSION, MCP_SERVE_CAPABILITY};
 
 /// Parsed and validated `aoe-plugin.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +35,10 @@ pub struct PluginManifest {
     /// Commands the plugin contributes to the palette and CLI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandContribution>,
+
+    /// Named groups that nest their commands under one CLI verb (API v27).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_groups: Vec<CommandGroupContribution>,
 
     /// Keybinds the plugin contributes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -87,6 +91,19 @@ pub struct CommandContribution {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ClientAction>,
+    /// Group id this command nests under as `aoe <group> <id>` (API v27).
+    /// Ungrouped commands keep their flat top-level name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// A CLI verb that nests the commands naming it as `aoe <id> <command-id>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandGroupContribution {
+    pub id: String,
+    #[serde(default)]
+    pub about: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -806,6 +823,187 @@ fn declaration_method_ok(method: &str) -> bool {
         })
 }
 
+/// A CLI verb or leaf name: one bare lowercase segment clap can carry.
+fn cli_verb_ok(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+}
+
+/// A relative path of plain components, so it cannot leave the config directory.
+fn declaration_rel_path_ok(path: &str) -> bool {
+    use std::path::{Component, Path};
+    (1..=crate::agent_integration::AGENT_HOOK_PATH_MAX).contains(&path.len())
+        && path
+            .chars()
+            .all(|c| !c.is_control() && !matches!(c, ':' | ',' | '\\'))
+        && path.split('/').all(|part| !part.is_empty() && part != ".")
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// A config-directory variable: a launch environment name that is not
+/// credential-shaped, since the host reads its value as a directory.
+fn declaration_config_dir_var_ok(name: &str) -> bool {
+    name.len() <= 64
+        && declaration_env_name_ok(name)
+        && !name.starts_with("XDG_")
+        && !["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL", "AUTH"]
+            .iter()
+            .any(|word| name.contains(word))
+}
+
+/// Checks a declared `config_dir_env_var`: well-formed, and declared with a safe
+/// directory in `launch.container_env`, which is where the sandbox mounts it.
+fn validate_config_dir_var(
+    i: usize,
+    table: &str,
+    var: &str,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
+    check: &mut impl FnMut(bool, String),
+) {
+    check(
+        declaration_config_dir_var_ok(var),
+        format!(
+            "agent_integrations[{i}].{table}.config_dir_env_var must be a non-credential \
+             environment variable name"
+        ),
+    );
+    check(
+        integration
+            .launch
+            .as_ref()
+            .and_then(|launch| launch.container_env.get(var))
+            .is_some_and(|dir| crate::agent_integration::container_dir_ok(dir)),
+        format!(
+            "agent_integrations[{i}].{table}.config_dir_env_var must also be a \
+             launch.container_env key whose value is a normalized absolute directory"
+        ),
+    );
+}
+
+fn declaration_text_ok(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= crate::agent_integration::AGENT_HOOK_STRING_MAX
+        && value.chars().all(declaration_character_ok)
+}
+
+fn validate_agent_hooks(
+    i: usize,
+    hooks: &crate::agent_integration::AgentHooksDeclaration,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{AGENT_HOOK_EVENTS, AGENT_HOOK_EVENTS_MAX};
+    if hooks
+        .events
+        .iter()
+        .any(|event| event.identity_field.is_some())
+    {
+        // The executable names the identity hook's publisher guard; a name the guard
+        // cannot carry would silently lose it.
+        let bare = integration
+            .command
+            .as_deref()
+            .and_then(crate::agent_integration::launch_prefix)
+            .and_then(|(words, _)| words.last().copied())
+            .is_some_and(|program| {
+                !program.is_empty()
+                    && program
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            });
+        check(
+            bare,
+            format!(
+                "agent_integrations[{i}].hooks with an identity_field need a command whose \
+                 executable is a bare name of letters, digits, `.`, `_` and `-`"
+            ),
+        );
+    }
+    check(
+        declaration_rel_path_ok(&hooks.settings_rel_path)
+            && hooks.settings_rel_path.contains('/')
+            && hooks.settings_rel_path.ends_with(".json"),
+        format!(
+            "agent_integrations[{i}].hooks.settings_rel_path must be a relative `.json` file \
+             inside a directory, such as \".example/settings.json\", without `..`"
+        ),
+    );
+    if let Some(var) = &hooks.config_dir_env_var {
+        validate_config_dir_var(i, "hooks", var, integration, check);
+    }
+    check(
+        (1..=AGENT_HOOK_EVENTS_MAX).contains(&hooks.events.len()),
+        format!(
+            "agent_integrations[{i}].hooks.events must hold 1..={AGENT_HOOK_EVENTS_MAX} events"
+        ),
+    );
+    let mut seen = std::collections::HashSet::new();
+    for (j, event) in hooks.events.iter().enumerate() {
+        check(
+            AGENT_HOOK_EVENTS.contains(&event.event.as_str()),
+            format!(
+                "agent_integrations[{i}].hooks.events[{j}].event must be one of {AGENT_HOOK_EVENTS:?}"
+            ),
+        );
+        check(
+            event.status.is_some() || event.identity_field.is_some(),
+            format!(
+                "agent_integrations[{i}].hooks.events[{j}] needs a status or an identity_field"
+            ),
+        );
+        check(
+            event.matcher.as_deref().is_none_or(declaration_text_ok),
+            format!("agent_integrations[{i}].hooks.events[{j}].matcher must be 1..=256 printable characters"),
+        );
+        check(
+            seen.insert((event.event.as_str(), event.matcher.as_deref())),
+            format!("agent_integrations[{i}].hooks.events[{j}] repeats an event and matcher"),
+        );
+        check(
+            event.waiting_tools.len() <= AGENT_HOOK_EVENTS_MAX
+                && event.waiting_tools.iter().all(|tool| declaration_word_ok(tool) && tool.len() <= 128),
+            format!("agent_integrations[{i}].hooks.events[{j}].waiting_tools must be at most 32 plain tool names"),
+        );
+    }
+}
+
+fn validate_agent_trust(
+    i: usize,
+    trust: &crate::agent_integration::AgentTrustDeclaration,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{parse_trust_pointer, AgentTrustValue};
+    check(
+        declaration_rel_path_ok(&trust.file)
+            && !trust.file.contains('/')
+            && trust.file.ends_with(".json"),
+        format!("agent_integrations[{i}].trust.file must be a single `.json` file name"),
+    );
+    if let Some(var) = &trust.config_dir_env_var {
+        validate_config_dir_var(i, "trust", var, integration, check);
+    }
+    check(
+        parse_trust_pointer(&trust.pointer).is_some(),
+        format!(
+            "agent_integrations[{i}].trust.pointer must be an absolute pointer such as \
+             \"/projects/{{path}}/trusted\" with exactly one `{{path}}` segment and no empty \
+             or numeric segments"
+        ),
+    );
+    if let AgentTrustValue::String(value) = &trust.value {
+        check(
+            declaration_text_ok(value),
+            format!("agent_integrations[{i}].trust.value must be 1..=256 printable characters"),
+        );
+    }
+}
+
 fn validate_agent_declaration(
     i: usize,
     integration: &crate::agent_integration::AgentIntegrationContribution,
@@ -849,6 +1047,8 @@ fn validate_agent_declaration(
         && integration.detection.is_none()
         && integration.reply_fallback.is_none()
         && integration.session_id.is_none()
+        && integration.hooks.is_none()
+        && integration.trust.is_none()
     {
         return;
     }
@@ -859,6 +1059,24 @@ fn validate_agent_declaration(
             .is_some_and(|command| !command.trim().is_empty()),
         format!("agent_integrations[{i}] declarations require a non-blank command"),
     );
+    if let Some(hooks) = &integration.hooks {
+        validate_agent_hooks(i, hooks, integration, check);
+    }
+    if let Some(trust) = &integration.trust {
+        validate_agent_trust(i, trust, integration, check);
+    }
+    if integration.hooks.is_some() && integration.trust.is_some() {
+        check(
+            integration
+                .container_hooks_file()
+                .zip(integration.container_trust_file())
+                .is_none_or(|(hooks, trust)| !std::path::Path::new(&hooks).starts_with(trust)),
+            format!(
+                "agent_integrations[{i}].trust.file must not be, or contain, the sandbox path of \
+                 hooks.settings_rel_path"
+            ),
+        );
+    }
     if let Some(launch) = &integration.launch {
         for (j, alias) in launch.aliases.iter().enumerate() {
             check(!alias.is_empty() && alias.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_') && alias != &integration.tool && !launch.aliases[..j].contains(alias), format!("agent_integrations[{i}].launch.aliases[{j}] must be a unique lowercase agent id"));
@@ -1185,15 +1403,66 @@ impl PluginManifest {
             );
         }
 
+        let mut group_ids = std::collections::HashSet::new();
+        for (i, g) in self.command_groups.iter().enumerate() {
+            check(
+                cli_verb_ok(&g.id),
+                format!(
+                    "command_groups[{i}].id {:?} must be one bare lowercase CLI verb",
+                    g.id
+                ),
+            );
+            check(
+                g.id != "help",
+                format!("command_groups[{i}].id \"help\" is clap's own subcommand"),
+            );
+            check(
+                group_ids.insert(g.id.as_str()),
+                format!("command_groups must not repeat id {:?}", g.id),
+            );
+        }
+
         let has_browser_open = self
             .capabilities
             .iter()
             .any(|c| c.as_str() == "browser_open");
+        let mut command_ids = std::collections::HashSet::new();
         for (i, c) in self.commands.iter().enumerate() {
             check(
                 !c.id.is_empty(),
                 format!("commands[{i}].id must not be empty"),
             );
+            // The command id alone names the command for the palette, keybinds
+            // and dispatch, so two groups cannot both publish `refresh`.
+            check(
+                command_ids.insert(c.id.as_str()),
+                format!("commands must not repeat id {:?}", c.id),
+            );
+            if let Some(group) = &c.group {
+                check(
+                    self.api_version >= 27,
+                    format!("commands[{i}].group requires api_version >= 27"),
+                );
+                check(
+                    c.id != "help",
+                    format!(
+                        "commands[{i}].id \"help\" is the group's own help subcommand and cannot be a grouped command id"
+                    ),
+                );
+                check(
+                    cli_verb_ok(&c.id),
+                    format!(
+                        "commands[{i}].id {:?} must be one bare lowercase CLI verb when it names a group",
+                        c.id
+                    ),
+                );
+                check(
+                    group_ids.contains(group.as_str()),
+                    format!(
+                        "commands[{i}].group {group:?} does not match any declared command_groups id"
+                    ),
+                );
+            }
             if let Some(ClientAction::OpenUiLink { slot, id }) = &c.action {
                 check(
                     self.api_version >= 6,
@@ -1341,7 +1610,9 @@ impl PluginManifest {
                     || (integration.launch.is_none()
                         && integration.detection.is_none()
                         && integration.reply_fallback.is_none()
-                        && integration.session_id.is_none()),
+                        && integration.session_id.is_none()
+                        && integration.hooks.is_none()
+                        && integration.trust.is_none()),
                 format!("agent_integrations[{i}] declarations require api_version >= 21"),
             );
             check(
@@ -1349,7 +1620,7 @@ impl PluginManifest {
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
             check(
-                self.api_version >= 25
+                self.api_version >= 28
                     || integration
                         .launch
                         .as_ref()
@@ -1359,9 +1630,18 @@ impl PluginManifest {
                                 != crate::agent_integration::AgentCaptureBackend::ExtensionSidecar
                         }),
                 format!(
-                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 25"
+                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 28"
                 ),
             );
+            for (table, declared) in [
+                ("hooks", integration.hooks.is_some()),
+                ("trust", integration.trust.is_some()),
+            ] {
+                check(
+                    self.api_version >= 28 || !declared,
+                    format!("agent_integrations[{i}].{table} requires api_version >= 28"),
+                );
+            }
             if let Some(delay) = integration
                 .launch
                 .as_ref()
@@ -1518,6 +1798,12 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::ComposerStatus),
                 "composer-status UI slots require api_version >= 25".into(),
+            );
+        }
+        if self.api_version < 27 {
+            check(
+                self.command_groups.is_empty(),
+                "command_groups require api_version >= 27".into(),
             );
         }
         if self.api_version < 9 {
@@ -1679,6 +1965,20 @@ impl PluginManifest {
                 format!("hooks.mcp_rewrite.timeout_ms must be 1..={MCP_REWRITE_MAX_TIMEOUT_MS}"),
             );
         }
+        if self
+            .capabilities
+            .iter()
+            .any(|c| c.as_str() == MCP_SERVE_CAPABILITY)
+        {
+            check(
+                self.api_version >= 26,
+                "the mcp.serve capability requires api_version >= 26".into(),
+            );
+            check(
+                self.runtime.is_some(),
+                "the mcp.serve capability requires a runtime worker".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1745,7 +2045,7 @@ mod tests {
     const HEAD: &str = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = ";
 
     #[test]
-    fn extension_sidecar_capture_requires_api_25() {
+    fn extension_sidecar_capture_requires_api_28() {
         let manifest = |api_version: u32| {
             format!(
                 "id = \"acme.sidecar\"\nname = \"Sidecar\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
@@ -1754,11 +2054,15 @@ mod tests {
                  [agent_integrations.launch.capture]\nbackend = \"extension_sidecar\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n"
             )
         };
-        let error = PluginManifest::from_toml_str(&manifest(24))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("requires api_version >= 25"), "{error}");
-        assert!(PluginManifest::from_toml_str(&manifest(25)).is_ok());
+        // The base's own versions cannot read this backend, so the gate moves
+        // past them instead of sharing one.
+        for version in [25, 26, 27] {
+            let error = PluginManifest::from_toml_str(&manifest(version))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("requires api_version >= 28"), "{error}");
+        }
+        assert!(PluginManifest::from_toml_str(&manifest(28)).is_ok());
     }
 
     fn object_list_toml(api_version: u32) -> String {
@@ -1979,6 +2283,33 @@ mod tests {
         };
         rejects(&[("session.message below v15", toml(14), "api_version >= 15")]);
         PluginManifest::from_toml_str(&toml(15)).expect("v15 parses");
+    }
+
+    #[test]
+    fn mcp_serve_capability_is_validated() {
+        let toml = |v: u32, runtime: bool| {
+            let rt = if runtime {
+                "\n[runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]\n"
+            } else {
+                ""
+            };
+            format!(
+                "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = {v}\ncapabilities = [\"runtime.worker\", \"mcp.serve\"]\n{rt}"
+            )
+        };
+        rejects(&[
+            (
+                "mcp.serve below v26",
+                toml(25, true),
+                "mcp.serve capability requires api_version >= 26",
+            ),
+            (
+                "mcp.serve without runtime",
+                toml(26, false),
+                "mcp.serve capability requires a runtime worker",
+            ),
+        ]);
+        PluginManifest::from_toml_str(&toml(26, true)).expect("v26 mcp.serve parses");
     }
 
     #[test]
@@ -2257,6 +2588,115 @@ mod tests {
                  [[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n[[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n\
                  [[commands]]\nid = \"open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"row-column\"\nid = \"link\"\n".to_string(),
                 "exactly one ui slot",
+            ),
+        ]);
+    }
+
+    fn grouped_commands_toml(api_version: u32, groups: &str, commands: &str) -> String {
+        format!("{HEAD}{api_version}\n\n{groups}{commands}")
+    }
+
+    #[test]
+    fn command_groups_parse_from_api_27_and_leave_flat_commands_unchanged() {
+        let m = PluginManifest::from_toml_str(&grouped_commands_toml(
+            27,
+            "[[command_groups]]\nid = \"linear\"\nabout = \"Linear issue commands\"\n\n",
+            "[[commands]]\nid = \"refresh\"\ntitle = \"Refresh Linear issues\"\ngroup = \"linear\"\n\n\
+             [[commands]]\nid = \"linear_sync\"\n",
+        ))
+        .expect("v27 grouped manifest parses");
+        assert_eq!(m.command_groups[0].id, "linear");
+        assert_eq!(m.command_groups[0].about, "Linear issue commands");
+        assert_eq!(m.commands[0].group.as_deref(), Some("linear"));
+        assert_eq!(m.commands[1].group, None);
+
+        let round_tripped =
+            PluginManifest::from_toml_str(&toml::to_string(&m).unwrap()).expect("round-trips");
+        assert_eq!(round_tripped.commands[0].group.as_deref(), Some("linear"));
+        assert_eq!(round_tripped.command_groups.len(), 1);
+
+        // A manifest written before command groups still parses flat, and one
+        // that does not use them does not grow the section on re-serialization.
+        for version in [2, 12, 26, 27] {
+            let flat = PluginManifest::from_toml_str(&grouped_commands_toml(
+                version,
+                "",
+                "[[commands]]\nid = \"linear_status\"\ntitle = \"Status\"\n",
+            ))
+            .expect("flat manifest parses");
+            assert!(flat.command_groups.is_empty(), "v{version}");
+            assert_eq!(flat.commands[0].id, "linear_status");
+            assert_eq!(flat.commands[0].group, None);
+            assert!(!toml::to_string(&flat).unwrap().contains("command_groups"));
+        }
+    }
+
+    #[test]
+    fn command_groups_require_api_27_and_a_declared_id() {
+        let group = "[[command_groups]]\nid = \"linear\"\n\n";
+        let nested = "[[commands]]\nid = \"refresh\"\ngroup = \"linear\"\n";
+        rejects(&[
+            (
+                "a group before api_version 27",
+                grouped_commands_toml(26, group, ""),
+                "command_groups require api_version >= 27",
+            ),
+            (
+                "a nested command before api_version 27",
+                grouped_commands_toml(26, group, nested),
+                "commands[0].group requires api_version >= 27",
+            ),
+            (
+                "a group id that is not a bare verb",
+                grouped_commands_toml(27, "[[command_groups]]\nid = \"Linear Issue\"\n\n", ""),
+                "bare lowercase CLI verb",
+            ),
+            (
+                "a repeated group id",
+                grouped_commands_toml(27, &format!("{group}{group}"), ""),
+                "must not repeat id",
+            ),
+            (
+                "a group named like clap's help subcommand",
+                grouped_commands_toml(27, "[[command_groups]]\nid = \"help\"\n\n", ""),
+                "is clap's own subcommand",
+            ),
+            (
+                "a command naming an undeclared group",
+                grouped_commands_toml(
+                    27,
+                    group,
+                    "[[commands]]\nid = \"refresh\"\ngroup = \"github\"\n",
+                ),
+                "does not match any declared command_groups id",
+            ),
+            (
+                "a grouped command id that is not a bare leaf",
+                grouped_commands_toml(
+                    27,
+                    group,
+                    "[[commands]]\nid = \"linear.refresh\"\ngroup = \"linear\"\n",
+                ),
+                "bare lowercase CLI verb when it names a group",
+            ),
+            (
+                "a grouped command named like clap's help subcommand",
+                grouped_commands_toml(
+                    27,
+                    group,
+                    "[[commands]]\nid = \"help\"\ngroup = \"linear\"\n",
+                ),
+                "cannot be a grouped command id",
+            ),
+            (
+                "two groups publishing the same command id",
+                grouped_commands_toml(
+                    27,
+                    &format!("{group}[[command_groups]]\nid = \"github\"\n\n"),
+                    "[[commands]]\nid = \"refresh\"\ngroup = \"linear\"\n\n\
+                     [[commands]]\nid = \"refresh\"\ngroup = \"github\"\n",
+                ),
+                "commands must not repeat id",
             ),
         ]);
     }

@@ -236,7 +236,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                         target: "acp.supervisor",
                         session = %id,
                         old_build = %record.build_version,
-                        new_build = crate::build_info::BUILD_VERSION,
+                        new_build = crate::build_info::build_version(),
                         "adopting build-stale structured view worker to drain in-flight turn before respawn"
                     );
                 }
@@ -330,7 +330,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     target: "acp.supervisor",
                     session = %id,
                     old_build = %record.build_version,
-                    new_build = crate::build_info::BUILD_VERSION,
+                    new_build = crate::build_info::build_version(),
                     "respawning idle build-stale structured view worker on current binary"
                 );
                 if worker_registry::terminate_record_and_wait(record, ())
@@ -520,17 +520,18 @@ async fn build_spawn_request(
             if let Some(blocked) = e.downcast_ref::<crate::session::SandboxLoginRequired>() {
                 tracing::warn!(target: "acp.supervisor", session = %target.id, "resume launch held: {blocked}");
                 service.sandbox_login.hold(&target.id, origin, blocked);
-                supervisor.publish_startup_error(&target.id, blocked.to_string());
+                supervisor.publish_login_required(&target.id, blocked);
                 return Err(PrepFailure::Reported);
             }
             let message = format!("sandbox container ensure failed: {e}");
             tracing::warn!(target: "acp.supervisor", session = %target.id, "reconciler container ensure failed: {message}");
-            let published = crate::server::api::publish_startup_error_if_current(
+            let published = crate::server::api::publish_startup_error_with_cause_if_current(
                 &state,
                 &target.id,
                 &target.source_profile,
                 target.lifecycle_generation,
                 message,
+                crate::session::SandboxLoginUnsupported::cause_of(&e),
             )
             .await;
             return Err(if published {
@@ -573,6 +574,7 @@ async fn build_spawn_request(
         seed_history_replay,
         prior_conversation,
         claude_store_pin,
+        proxy: None,
     })
 }
 

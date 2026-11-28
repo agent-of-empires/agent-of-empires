@@ -4,7 +4,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginPage } from "../../../lib/api";
 import type { ResolvedTheme } from "../../../lib/theme";
-import { THEME_CHANGED_EVENT } from "../../../lib/theme";
+import { setResolvedTheme } from "../../../lib/theme";
 import { useState, type ReactNode } from "react";
 import { PluginPageView } from "../PluginPageView";
 import type { SessionMenuRequest } from "../PluginSessionMenu";
@@ -272,7 +272,7 @@ describe("PluginPageView", () => {
       event: "context",
       data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1, link: null },
     });
-    act(() => window.dispatchEvent(new CustomEvent(THEME_CHANGED_EVENT, { detail: darkTheme })));
+    act(() => setResolvedTheme(darkTheme));
     expect(port.postMessage).toHaveBeenLastCalledWith({
       aoeBridge: 1,
       event: "theme",

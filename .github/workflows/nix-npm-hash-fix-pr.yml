@@ -26,12 +26,12 @@ jobs:
     if: github.event.pull_request.state == 'open'
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
 
-      - uses: ./.github/actions/install-nix
+      - uses: $/.github/actions/install-nix
 
       - name: Detect fork and pin head SHA
         id: pr
@@ -136,7 +136,7 @@ jobs:
       # Publish provenance before the PAT push can start the auto-merge check.
       - name: Record trusted hash-fix provenance
         if: steps.fix.outputs.sha != ''
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: nix-npm-hash-fix-${{ github.event.pull_request.number }}-${{ steps.fix.outputs.sha }}
           path: ${{ runner.temp }}/nix-npm-hash-fix-sha

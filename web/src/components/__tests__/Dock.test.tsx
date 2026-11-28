@@ -9,7 +9,7 @@ import { BUILTIN_PANES } from "../../lib/panes";
 
 const body = (id: string) => <div data-testid={`body-${id}`}>{id}</div>;
 const descriptorFor = (id: string) => {
-  // Tests only feed built-in tab ids; resolve "terminal:0" to the terminal pane.
+  // Tests only feed built-in tab ids; resolve "terminal:s1:0" to the terminal pane.
   const kind = id.startsWith("terminal") ? "terminal" : id;
   const d = BUILTIN_PANES.find((p) => p.id === kind)!;
   return { title: d.title, icon: d.icon };
@@ -20,8 +20,8 @@ function renderDock(props: Partial<React.ComponentProps<typeof Dock>> = {}) {
     <Dock
       location="right"
       groupIndex={0}
-      tabs={["diff", "terminal:0"]}
-      active="terminal:0"
+      tabs={["diff", "terminal:s1:0"]}
+      active="terminal:s1:0"
       descriptorFor={descriptorFor}
       renderBody={body}
       onActivate={vi.fn()}
@@ -37,9 +37,9 @@ describe("Dock", () => {
   it("renders one tab per id but only the active body", () => {
     const { getByTestId, queryByTestId } = renderDock();
     expect(getByTestId("pane-tab-diff")).toBeTruthy();
-    expect(getByTestId("pane-tab-terminal:0")).toBeTruthy();
+    expect(getByTestId("pane-tab-terminal:s1:0")).toBeTruthy();
     // Only the active tab's body is mounted.
-    expect(getByTestId("body-terminal:0")).toBeTruthy();
+    expect(getByTestId("body-terminal:s1:0")).toBeTruthy();
     expect(queryByTestId("body-diff")).toBeNull();
   });
 
@@ -54,9 +54,32 @@ describe("Dock", () => {
     fireEvent.click(getByLabelText("Close diff"));
     expect(onClose).toHaveBeenCalledWith("diff");
     fireEvent.click(getByLabelText("Move terminal to bottom dock"));
-    expect(onMove).toHaveBeenCalledWith("terminal:0", "bottom");
+    expect(onMove).toHaveBeenCalledWith("terminal:s1:0", "bottom");
     fireEvent.click(getByLabelText("New terminal"));
     expect(onNewTerminal).toHaveBeenCalled();
+  });
+
+  it("keeps terminal controls to a group of terminals and maximize to the dock's first group", () => {
+    const maximize = { maximized: false, onToggle: vi.fn() };
+    const review = renderDock({
+      tabs: ["diff"],
+      active: "diff",
+      maximize,
+      terminalSwitcher: <i data-testid="switcher" />,
+    });
+    expect([review.queryByLabelText("New terminal"), review.queryByTestId("switcher")]).toEqual([null, null]);
+    expect(review.getByTestId("dock-maximize")).toBeTruthy();
+    review.unmount();
+
+    const terminals = renderDock({
+      groupIndex: 1,
+      tabs: ["terminal:s1:0"],
+      active: "terminal:s1:0",
+      maximize,
+      terminalSwitcher: <i data-testid="switcher" />,
+    });
+    expect([!!terminals.getByLabelText("New terminal"), !!terminals.getByTestId("switcher")]).toEqual([true, true]);
+    expect(terminals.queryByTestId("dock-maximize")).toBeNull();
   });
 
   it("shows split drop zones only while a tab is being dragged", () => {
@@ -74,8 +97,8 @@ describe("Dock", () => {
         <Dock
           location="right"
           groupIndex={0}
-          tabs={["diff", "terminal:0"]}
-          active="terminal:0"
+          tabs={["diff", "terminal:s1:0"]}
+          active="terminal:s1:0"
           descriptorFor={descriptorFor}
           renderBody={body}
           onActivate={vi.fn()}

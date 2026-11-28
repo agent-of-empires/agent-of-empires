@@ -4,6 +4,9 @@ import { sessionRawFileUrl } from "../lib/api";
 import { useFilesIndex } from "./acp/useFilesIndex";
 import { FileContentViewer } from "./diff/FileContentViewer";
 import { FileContextMenu, type PathMenuState } from "./diff/FileContextMenu";
+import { Centered } from "./diff/viewerChrome";
+import { INPUT } from "../lib/surfaces";
+import { BUTTON_SECONDARY_SM } from "../lib/surfaces";
 
 interface Props {
   sessionId: string | null;
@@ -35,11 +38,7 @@ export function FilesPane({ sessionId, structured }: Props) {
   };
 
   if (!sessionId) {
-    return (
-      <div className="flex-1 flex items-center justify-center bg-surface-900 text-text-dim">
-        <span className="text-sm">No active session</span>
-      </div>
-    );
+    return <Centered className="bg-surface-900 text-text-dim">No active session</Centered>;
   }
 
   if (selected) {
@@ -56,35 +55,31 @@ export function FilesPane({ sessionId, structured }: Props) {
   return (
     <div className="flex-1 flex flex-col bg-surface-900 overflow-hidden">
       <FileContextMenu menu={menu} onClose={closeMenu} />
-      <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
+      <div className="px-3 py-2 border-b border-surface-700/50 shrink-0">
         <input
           type="text"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           placeholder="Filter files..."
           aria-label="Filter files"
-          className="w-full bg-surface-950 border border-surface-700/40 rounded px-2 py-1 text-[12px] font-mono text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600"
+          className={`${INPUT} !py-1 font-mono`}
         />
       </div>
       <div className="flex-1 min-h-0 overflow-auto">
         {loading ? (
-          <div className="p-3 text-sm text-text-dim">Loading files...</div>
+          <Centered className="h-full text-text-dim">Loading files...</Centered>
         ) : error ? (
           // A failed fetch must not read as "this session has no files".
-          <div className="p-3 flex flex-col items-start gap-2">
-            <span className="text-sm text-status-error">Could not load the file list</span>
-            <button
-              type="button"
-              onClick={reload}
-              className="px-2 py-0.5 text-[11px] font-mono rounded border border-surface-700/40 text-text-dim hover:text-text-secondary cursor-pointer transition-colors"
-            >
+          <Centered className="h-full flex-col gap-2 text-status-error-text">
+            <span>Could not load the file list</span>
+            <button type="button" onClick={reload} className={BUTTON_SECONDARY_SM}>
               Retry
             </button>
-          </div>
+          </Centered>
         ) : shown.length === 0 ? (
-          <div className="p-3 text-sm text-text-dim">
+          <Centered className="h-full text-text-dim">
             {files.length === 0 ? "No files in this session" : "No matching files"}
-          </div>
+          </Centered>
         ) : (
           shown.map((f) => (
             <button
@@ -99,7 +94,7 @@ export function FilesPane({ sessionId, structured }: Props) {
                 e.preventDefault();
                 setMenu({ x: e.clientX, y: e.clientY, path: f, open: { url: sessionRawFileUrl(sessionId, f) } });
               }}
-              className="w-full text-left px-3 py-1 font-mono text-[12px] text-text-secondary hover:bg-surface-800 hover:text-text-primary truncate cursor-pointer"
+              className="w-full text-left px-3 py-1 max-md:py-2.5 font-mono text-[12px] max-md:text-[13px] text-text-secondary hover:bg-surface-800 hover:text-text-primary truncate cursor-pointer"
               title={f}
             >
               {f}

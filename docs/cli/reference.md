@@ -14,6 +14,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe log-level`↴](#aoe-log-level)
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
+* [`aoe suggest`↴](#aoe-suggest)
 * [`aoe status`↴](#aoe-status)
 * [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
@@ -80,8 +81,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe tmux`↴](#aoe-tmux)
 * [`aoe tmux status`↴](#aoe-tmux-status)
 * [`aoe sounds`↴](#aoe-sounds)
-* [`aoe sounds install`↴](#aoe-sounds-install)
-* [`aoe sounds list`↴](#aoe-sounds-list)
 * [`aoe sounds test`↴](#aoe-sounds-test)
 * [`aoe theme`↴](#aoe-theme)
 * [`aoe theme list`↴](#aoe-theme-list)
@@ -165,6 +164,7 @@ Run without arguments to launch the TUI dashboard.
 * `log-level` — Get or set the running daemon's log filter at runtime. Pass a bare level (debug/info/...) for the safe expansion, or `--filter <expr>` for raw EnvFilter syntax. `--get` prints the current filter. Changes are ephemeral and lost on daemon restart
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
+* `suggest` — Suggest a session: it shows under Suggested sessions until started or dismissed
 * `status` — Show session status summary
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
@@ -175,7 +175,7 @@ Run without arguments to launch the TUI dashboard.
 * `sandbox` — Clean up sandbox agent stores and log in sandboxed agents
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
-* `sounds` — Manage sound effects for agent state transitions
+* `sounds` — Test the built-in sound effects
 * `theme` — Manage color themes (list, export, customize)
 * `settings` — Inspect resolved settings and their provenance
 * `cityhall` — Export and apply the CityHall config bundle (settings + projects)
@@ -195,7 +195,7 @@ Run without arguments to launch the TUI dashboard.
 ###### **Options:**
 
 * `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
-* `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI.
+* `--daemon-url <DAEMON_URL>` — Select a Daemon endpoint for commands that use the Daemon API, or for the TUI.
 
    Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither. See the HTTP API reference for transport and authentication rules.
 * `--no-autostart` — Fail instead of starting a local daemon when none is running
@@ -222,7 +222,7 @@ Add a new session
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
 * `--tool <TOOL>` — Named built-in or configured custom agent to run
 * `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group, not worktree or path). Without `--worktree` or `--scratch`, opens at `<path>` (default: current directory) on its checked-out branch. `--scratch` uses a fresh directory
-* `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode, pi)
+* `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode, pi, prime-agent, omp)
 * `-l`, `--launch` — Launch the session immediately after creating
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
@@ -243,7 +243,7 @@ Add a new session
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
-* `--prompt <PROMPT>` — First turn sent to the agent once it is ready. Needs --structured-view or --agent; delivered when `aoe serve` starts the worker. If the session falls back to the terminal view, the prompt is typed only into an agent with a ready marker; otherwise nothing is typed and the session row carries `initial_prompt_error`
+* `--prompt <PROMPT>` — First turn sent to the agent once it is ready. A structured session gets it when `aoe serve` starts the worker. A terminal session keeps it until the agent starts (`--launch`, or later from the dashboard or TUI) and types it only into an agent with a ready marker, so a shell, a `--cmd-override` command and an agent without one are refused here, with nothing created. A terminal session whose agent times out or shows a dialog carries `initial_prompt_error`
 * `--prompt-file <PATH>` — Read the first turn from a file. Same rules as `--prompt`
 * `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., claude-code, codex)
 * `--model <MODEL>` — Override the model used by the ACP agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
@@ -396,6 +396,27 @@ Send a message to a running agent session
 
 
 
+## `aoe suggest`
+
+Suggest a session: it shows under Suggested sessions until started or dismissed
+
+**Usage:** `aoe suggest [OPTIONS] --prompt <PROMPT> <TITLE>`
+
+###### **Arguments:**
+
+* `<TITLE>` — Short title of the suggested session
+
+###### **Options:**
+
+* `--prompt <PROMPT>` — The first prompt the suggested session starts with
+* `--reason <REASON>` — Why this is worth doing now
+
+  Default value: ``
+* `--project <PROJECT>` — Registered Project name or path the session belongs in
+* `--id <ID>` — A stable key; suggesting the same one again replaces that suggestion
+
+
+
 ## `aoe status`
 
 Show session status summary
@@ -451,10 +472,10 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. A snoozed favorite keeps its place
 * `unfavorite` — Clear the favorite flag on a session
-* `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
-* `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
+* `archive` — Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
+* `unarchive` — Unarchive a session, returning it to its place in the list
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
 * `import` — Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
 * `list-trash` — List the sessions currently in the trash
@@ -724,7 +745,7 @@ Wake a snoozed session immediately
 
 ## `aoe session favorite`
 
-Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. A snoozed favorite keeps its place
 
 **Usage:** `aoe session favorite <IDENTIFIER>`
 
@@ -748,7 +769,7 @@ Clear the favorite flag on a session
 
 ## `aoe session archive`
 
-Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
+Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 
 **Usage:** `aoe session archive [OPTIONS] <IDENTIFIER>`
 
@@ -764,7 +785,7 @@ Archive a session: sink it in the Attention sort and tear down its tmux sessions
 
 ## `aoe session unarchive`
 
-Unarchive a session (restores it to its tier in the Attention sort)
+Unarchive a session, returning it to its place in the list
 
 **Usage:** `aoe session unarchive <IDENTIFIER>`
 
@@ -1339,43 +1360,37 @@ Add this to your ~/.tmux.conf: set -g status-right "#(aoe tmux status)"
 
 ## `aoe sounds`
 
-Manage sound effects for agent state transitions
+Test the built-in sound effects
 
 **Usage:** `aoe sounds <COMMAND>`
 
 ###### **Subcommands:**
 
-* `install` — Install bundled sound effects
-* `list` — List currently installed sounds
-* `test` — Test a sound by playing it
-
-
-
-## `aoe sounds install`
-
-Install bundled sound effects
-
-**Usage:** `aoe sounds install`
-
-
-
-## `aoe sounds list`
-
-List currently installed sounds
-
-**Usage:** `aoe sounds list`
+* `test` — Play a built-in sound on this machine to check that audio works
 
 
 
 ## `aoe sounds test`
 
-Test a sound by playing it
+Play a built-in sound on this machine to check that audio works
 
-**Usage:** `aoe sounds test <NAME>`
+**Usage:** `aoe sounds test [EVENT]`
 
 ###### **Arguments:**
 
-* `<NAME>` — Sound file name (without extension)
+* `<EVENT>` — The sound to play
+
+  Default value: `idle`
+
+  Possible values:
+  - `start`
+  - `running`
+  - `waiting`
+  - `idle`
+  - `error`
+  - `approval`:
+    A Structured view Session asks for permission or a question; browser only
+
 
 
 
@@ -1914,7 +1929,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`, or `AOE_DAEMON_PASSPHRASE` against a `--auth=passphrase` daemon) to attach across machines without going through the home session list
 * `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
-* `switch-account` — Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt; otherwise it gets the usual restart wake message. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
+* `switch-account` — Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
 * `switch-provider` — Re-route a Claude session to a different LLM provider, keeping the transcript. Refused mid-turn; once idle the worker restarts and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The model resets to the new provider's default, because model ids differ between providers
 
 
@@ -2189,7 +2204,7 @@ Switch an agent session to a different ACP agent, keeping the transcript. Valid 
 
 ## `aoe acp switch-account`
 
-Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt; otherwise it gets the usual restart wake message. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
+Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
 
 **Usage:** `aoe acp switch-account <SESSION> <TOOL>`
 

@@ -222,6 +222,7 @@ mod preview_links;
 mod profile_duplicate_reconciliation;
 mod render_and_save;
 mod right_click_context_menu;
+mod sandbox_login_dialog;
 mod save_field_merge;
 mod scroll_pane_isolation;
 mod search;
@@ -233,6 +234,7 @@ mod split_terminal;
 mod stacked_divider_drag;
 mod stacked_single_seam;
 mod status_rows_menu;
+mod suggested_group;
 
 fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())
@@ -348,7 +350,7 @@ fn seeded_env(
     seed_profile("test", instances);
     let mut view = test_view(Some("test"));
     if manual {
-        view.group_by = GroupByMode::Manual;
+        view.group_by = GroupByMode::Group;
         view.flat_items = view.build_flat_items();
         view.update_selected();
     }
@@ -378,7 +380,7 @@ fn create_test_env_empty() -> TestEnv {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = GroupByMode::Manual;
+    view.group_by = GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv {
@@ -476,7 +478,7 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = GroupByMode::Manual;
+    view.group_by = GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv {
@@ -542,7 +544,7 @@ fn create_test_env_with_groups() -> TestEnv {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = GroupByMode::Manual;
+    view.group_by = GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv {
@@ -591,7 +593,7 @@ fn create_test_env_with_mixed_sessions() -> TestEnv {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv {
@@ -612,7 +614,7 @@ fn earn_tip(env: &mut TestEnv) {
     let config = crate::session::config::load_config()
         .unwrap()
         .unwrap_or_default();
-    env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
+    env.view.tips_unseen = env.view.tips_unseen_count(&config);
 }
 
 // Group deletion tests
@@ -672,7 +674,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv {
@@ -686,8 +688,8 @@ fn create_test_env_with_group_sessions() -> TestEnv {
 /// Returns the env plus the flat index of each so callers can park the cursor.
 /// Statuses are seeded in storage before construction so `instances` and
 /// what `get_instance`/`jump_to_next_waiting` read agree.
-fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
-    use crate::session::config::{GroupByMode, SortOrder};
+fn env_running_then_waiting() -> (TestEnv, usize, usize) {
+    use crate::session::config::GroupByMode;
     use crate::session::Status;
 
     let temp = TempDir::new().unwrap();
@@ -715,8 +717,7 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
     )
     .unwrap();
     view.strict_hotkeys = false;
-    view.group_by = GroupByMode::Manual;
-    view.sort_order = SortOrder::Attention;
+    view.group_by = GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     let env = TestEnv {
@@ -738,8 +739,8 @@ fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
     (env, running, waiting)
 }
 
-fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
-    use crate::session::config::{GroupByMode, SortOrder};
+fn env_running_then_idle() -> (TestEnv, usize, usize) {
+    use crate::session::config::GroupByMode;
     use crate::session::Status;
 
     let temp = TempDir::new().unwrap();
@@ -767,8 +768,7 @@ fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
     )
     .unwrap();
     view.strict_hotkeys = false;
-    view.group_by = GroupByMode::Manual;
-    view.sort_order = SortOrder::Attention;
+    view.group_by = GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
     let env = TestEnv {
@@ -822,7 +822,7 @@ fn rendered_single_session_text(
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view =
         HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.row_tag_mode = row_tag_mode;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -879,7 +879,7 @@ fn setup_creation_test_env() -> CreationTestEnv {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -917,6 +917,8 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         scratch: false,
         fork_seed: None,
         structured: false,
+        initial_prompt: None,
+        suggestion: None,
     }
 }
 
@@ -947,8 +949,7 @@ fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String
 }
 
 /// Build a HomeView seeded with two distinct projects, each containing
-/// sessions with different attention statuses. Helper for the Project +
-/// Attention combination tests below.
+/// sessions with different statuses. Helper for the Project grouping tests.
 fn create_test_env_two_projects_mixed_attention() -> TestEnv {
     use crate::session::Status;
     let temp = TempDir::new().unwrap();
@@ -966,114 +967,6 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
     beta_error.status = Status::Error;
 
     let instances = vec![alpha_waiting, alpha_running, beta_running, beta_error];
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    TestEnv {
-        view,
-        _guard,
-        _temp: temp,
-    }
-}
-
-/// Build a HomeView seeded with three sessions: two live in real git repos
-/// with distinct hosted `origin` remotes on different hosts entirely
-/// (GitHub, GitLab) to prove owner resolution isn't GitHub-specific, and one
-/// live in a real git repo with no `origin` remote at all. Helper for
-/// `build_flat_items_by_org` grouping tests, which (unlike project mode)
-/// need an actual `.git` directory since `get_remote_owner` reads the
-/// on-disk remote configuration rather than parsing the path string.
-fn create_test_env_two_orgs() -> TestEnv {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let repo_a = temp.path().join("repo-a");
-    std::fs::create_dir_all(&repo_a).unwrap();
-    git2::Repository::init(&repo_a)
-        .unwrap()
-        .remote("origin", "git@github.com:org-a/repo-a.git")
-        .unwrap();
-
-    let repo_b = temp.path().join("repo-b");
-    std::fs::create_dir_all(&repo_b).unwrap();
-    git2::Repository::init(&repo_b)
-        .unwrap()
-        .remote("origin", "git@gitlab.com:org-b/repo-b.git")
-        .unwrap();
-
-    let repo_no_remote = temp.path().join("repo-no-remote");
-    std::fs::create_dir_all(&repo_no_remote).unwrap();
-    git2::Repository::init(&repo_no_remote).unwrap();
-
-    let inst_a = Instance::new("a-session", repo_a.to_str().unwrap());
-    let inst_b = Instance::new("b-session", repo_b.to_str().unwrap());
-    let inst_no_remote = Instance::new("no-remote-session", repo_no_remote.to_str().unwrap());
-
-    let instances = vec![inst_a, inst_b, inst_no_remote];
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    TestEnv {
-        view,
-        _guard,
-        _temp: temp,
-    }
-}
-
-/// Build a HomeView seeded with two sessions whose repos share the same
-/// owner login ("acme") but live on different hosts (GitHub, GitLab).
-/// Regression fixture for the Required #1 review fix: before it,
-/// `org_group_key` returned the bare owner, so these two repos merged into
-/// one org bucket and one bulk-archive scope despite having nothing to do
-/// with each other.
-fn create_test_env_same_owner_two_hosts() -> TestEnv {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let repo_gh = temp.path().join("repo-gh");
-    std::fs::create_dir_all(&repo_gh).unwrap();
-    git2::Repository::init(&repo_gh)
-        .unwrap()
-        .remote("origin", "git@github.com:acme/repo-gh.git")
-        .unwrap();
-
-    let repo_gl = temp.path().join("repo-gl");
-    std::fs::create_dir_all(&repo_gl).unwrap();
-    git2::Repository::init(&repo_gl)
-        .unwrap()
-        .remote("origin", "git@gitlab.com:acme/repo-gl.git")
-        .unwrap();
-
-    let inst_gh = Instance::new("gh-session", repo_gh.to_str().unwrap());
-    let inst_gl = Instance::new("gl-session", repo_gl.to_str().unwrap());
-
-    let instances = vec![inst_gh, inst_gl];
     storage
         .update(|i, g| {
             *i = instances.to_vec();
@@ -1154,8 +1047,7 @@ fn publish_canonical_rows(env: &mut TestEnv, stamps: &[(String, bool)], revision
         .view
         .instances()
         .map(|instance| {
-            let mut row =
-                crate::server::api::sessions::session_response_from_instance(instance, false);
+            let mut row = crate::server::api::sessions::session_response_from_instance(instance);
             if let Some((_, archived)) = stamps.iter().find(|(id, _)| id == &instance.id) {
                 row.archived_at = archived.then(|| now.clone());
             }

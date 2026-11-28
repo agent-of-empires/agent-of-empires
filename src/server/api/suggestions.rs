@@ -1,0 +1,1577 @@
+//! `/api/suggestions`: snapshot and user-owned actions on plugin suggestions.
+//!
+//! Nothing here creates a session; `prepare` only resolves the wizard prefill.
+use std::sync::Arc;
+
+use axum::{
+    extract::{Query, State},
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
+use serde_json::json;
+
+mod auto;
+
+use super::{api_error, AppState};
+use crate::plugin::suggestions::{self, PrepareRefusal, Preset, Provider};
+use axum::http::StatusCode;
+
+pub(crate) use auto::spawn as spawn_auto_start;
+#[cfg(test)]
+pub(crate) use auto::sweep as sweep_auto_start;
+
+/// Optional body of the routes that take none: the profile the caller selected
+/// its target under.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileGuard {
+    expected_profile: Option<String>,
+}
+
+/// The `expected_profile` of an optional JSON body. An empty body, which a
+/// client sends with a JSON content type, names none.
+fn body_expected_profile(body: &[u8]) -> Result<Option<String>, axum::response::Response> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice::<Option<ProfileGuard>>(body)
+        .map(|guard| guard.and_then(|guard| guard.expected_profile))
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                error.to_string(),
+            )
+        })
+}
+
+/// 409 `profile_mismatch` when the caller chose its target under a profile this
+/// Daemon does not serve, so a switch between selecting and sending cannot land
+/// the action on the new profile.
+fn wrong_profile(
+    host: &crate::plugin::host::PluginHost,
+    expected: Option<&str>,
+) -> Option<axum::response::Response> {
+    let served = host.suggestions_profile();
+    expected.filter(|expected| *expected != served).map(|_| {
+        super::api_error_with_code_header(
+            crate::daemon::ApiErrorCode::ProfileMismatch,
+            format!(
+                "This Daemon serves profile {served}, not the one you selected; nothing changed"
+            ),
+        )
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemRef {
+    expected_profile: Option<String>,
+    provider_id: String,
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceBody {
+    expected_profile: Option<String>,
+    provider_id: String,
+    criterion: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoStartBody {
+    expected_profile: Option<String>,
+    provider_id: String,
+    criterion: String,
+    enabled: bool,
+    /// Items one refresh may start; the default when omitted.
+    cap: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresetKey {
+    expected_profile: Option<String>,
+    provider_id: String,
+    criterion: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresetBody {
+    expected_profile: Option<String>,
+    provider_id: String,
+    criterion: String,
+    preset: Preset,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MappingBody {
+    expected_profile: Option<String>,
+    provider_id: String,
+    mapping_key: String,
+    projects: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MappingRef {
+    expected_profile: Option<String>,
+    provider_id: String,
+    mapping_key: String,
+}
+
+fn unavailable() -> axum::response::Response {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "Plugin host is unavailable",
+    )
+}
+
+fn internal(error: impl std::fmt::Display) -> axum::response::Response {
+    api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        error.to_string(),
+    )
+}
+
+fn unknown_provider() -> axum::response::Response {
+    api_error(
+        StatusCode::NOT_FOUND,
+        "unknown_provider",
+        "No active plugin provides suggestions under that id",
+    )
+}
+
+fn stale_item() -> axum::response::Response {
+    api_error(
+        StatusCode::CONFLICT,
+        "stale_suggestion",
+        "Suggestion is no longer open; refresh and retry",
+    )
+}
+
+fn find_provider(id: &str) -> Option<Provider> {
+    suggestions::providers().into_iter().find(|p| p.id == id)
+}
+
+pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(host) = state.plugin_host.clone() else {
+        return Json(json!({
+            "providers": [],
+            "items": [],
+            "prefs": suggestions::prefs_json(suggestions::DEFAULT_PREFS, &[]),
+        }))
+        .into_response();
+    };
+    let profile = host.suggestions_profile();
+    let refreshing = host.refreshing_suggestions();
+    let reported_profile = profile.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let providers = suggestions::providers();
+        // Disk reads stay off the store lock.
+        let registered = crate::session::projects::load_merged(&profile)?;
+        let (mut snapshot, mappings, links, presets) =
+            host.with_suggestions_db(|conn, profile| {
+                let mut snapshot = suggestions::snapshot(conn, profile, &providers)?;
+                suggestions::attach_auto(conn, profile, &mut snapshot)?;
+                Ok::<_, anyhow::Error>((
+                    snapshot,
+                    suggestions::load_mappings(conn, profile)?,
+                    suggestions::links(conn, profile)?,
+                    suggestions::presets(conn, profile)?,
+                ))
+            })?;
+        // Canonicalizing paths hits the filesystem: keep it off the store lock.
+        suggestions::attach_projects(&mappings, &mut snapshot, &registered);
+        suggestions::attach_presets(&profile, &presets, &registered, &mut snapshot);
+        Ok::<_, anyhow::Error>((snapshot, links))
+    })
+    .await;
+    match result {
+        Ok(Ok((mut snapshot, links))) => {
+            let started = {
+                let instances = state.instances.read().await;
+                // Same visibility as the CityHall session list: terminal sessions stay hidden.
+                suggestions::started_sessions(
+                    &links,
+                    instances
+                        .iter()
+                        .filter(|inst| !state.cityhall_mode || inst.is_structured()),
+                )
+            };
+            suggestions::attach_started(&mut snapshot, &started);
+            suggestions::attach_refreshing(&mut snapshot, &refreshing);
+            snapshot["profile"] = json!(reported_profile);
+            snapshot["setup_offered"] = json!(crate::plugin::featured::FeaturedIndex::load()
+                .is_ok_and(|index| index.offers_suggestions()));
+            Json(snapshot).into_response()
+        }
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn refresh_suggestions(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Some(host) = &state.plugin_host else {
+        return Json(json!({ "ok": true, "notified": 0 })).into_response();
+    };
+    let expected = match body_expected_profile(&body) {
+        Ok(expected) => expected,
+        Err(refused) => return refused,
+    };
+    if let Some(refused) = wrong_profile(host, expected.as_deref()) {
+        return refused;
+    }
+    let notified = host.refresh_suggestions(None).await;
+    Json(json!({ "ok": true, "notified": notified })).into_response()
+}
+
+pub async fn run_suggestion_checks(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Some(host) = &state.plugin_host else {
+        return Json(json!({ "ok": true, "notified": 0 })).into_response();
+    };
+    let expected = match body_expected_profile(&body) {
+        Ok(expected) => expected,
+        Err(refused) => return refused,
+    };
+    if let Some(refused) = wrong_profile(host, expected.as_deref()) {
+        return refused;
+    }
+    let notified = host.run_suggestion_checks().await;
+    Json(json!({ "ok": true, "notified": notified })).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRef {
+    expected_profile: Option<String>,
+    provider_id: String,
+}
+
+pub async fn run_suggestion_fix(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ProviderRef>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = &state.plugin_host else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    if find_provider(&body.provider_id).is_none() {
+        return unknown_provider();
+    }
+    match host.run_suggestion_fix(&body.provider_id).await {
+        Ok(Some(notified)) => {
+            Json(json!({ "ok": true, "notified": usize::from(notified) })).into_response()
+        }
+        Ok(None) => api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "The provider has no fix for its current error",
+        ),
+        Err(error) => internal(error),
+    }
+}
+
+async fn set_dismissed(
+    state: Arc<AppState>,
+    item: ItemRef,
+    dismissed: bool,
+) -> axum::response::Response {
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, item.expected_profile.as_deref()) {
+        return refused;
+    }
+    let Some(provider) = find_provider(&item.provider_id) else {
+        return unknown_provider();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::set_dismissed(conn, profile, &provider, &item.id, dismissed)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(true)) => {
+            use crate::telemetry::feature_use::{record, FeatureUse};
+            record(if dismissed {
+                FeatureUse::SuggestDismiss
+            } else {
+                FeatureUse::SuggestRestore
+            });
+            Json(json!({ "ok": true })).into_response()
+        }
+        Ok(Ok(false)) => stale_item(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushBody {
+    expected_profile: Option<String>,
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    reason: String,
+    prompt: String,
+    project: Option<String>,
+    /// Shown as the item's source reference; defaults to "Agent".
+    pushed_by: Option<String>,
+}
+
+/// Adds or replaces one built-in agent suggestion; the HTTP route and the
+/// `suggest_session` MCP tool both call it.
+pub(crate) async fn push_agent_suggestion(
+    state: &Arc<AppState>,
+    input: suggestions::AgentPush,
+) -> Result<String, (StatusCode, &'static str, String)> {
+    let Some(host) = state.plugin_host.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "Plugin host is unavailable".into(),
+        ));
+    };
+    let notify = host.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| suggestions::push_agent(conn, profile, input))
+    })
+    .await;
+    if matches!(result, Ok(Ok(_))) {
+        notify.notify_suggestions_published();
+    }
+    match result {
+        Ok(Ok(value)) => Ok(value["id"].as_str().unwrap_or_default().to_string()),
+        Ok(Err(error)) if error.code == crate::plugin::protocol::codes::INVALID_PARAMS => {
+            Err((StatusCode::BAD_REQUEST, "validation_failed", error.message))
+        }
+        Ok(Err(error)) => Err((StatusCode::INTERNAL_SERVER_ERROR, "internal", error.message)),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            error.to_string(),
+        )),
+    }
+}
+
+pub async fn push_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<PushBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if let Some(host) = &state.plugin_host {
+        if let Some(refused) = wrong_profile(host, body.expected_profile.as_deref()) {
+            return refused;
+        }
+    }
+    let input = suggestions::AgentPush {
+        id: body.id,
+        title: body.title,
+        reason: body.reason,
+        prompt: body.prompt,
+        project: body.project,
+        pushed_by: body.pushed_by.unwrap_or_else(|| "Agent".into()),
+    };
+    match push_agent_suggestion(&state, input).await {
+        Ok(id) => Json(json!({ "ok": true, "id": id })).into_response(),
+        Err((status, code, message)) => api_error(status, code, message),
+    }
+}
+
+pub async fn dismiss_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ItemRef>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(item) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    set_dismissed(state, item, true).await
+}
+
+pub async fn undismiss_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ItemRef>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(item) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    set_dismissed(state, item, false).await
+}
+
+pub async fn update_suggestion_source(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<SourceBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    let Some(provider) = find_provider(&body.provider_id) else {
+        return unknown_provider();
+    };
+    if !provider
+        .spec
+        .sources
+        .iter()
+        .any(|s| s.criterion == body.criterion)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "The provider does not declare that criterion",
+        );
+    }
+    let stored = {
+        let (host, provider_id, criterion) = (
+            host.clone(),
+            body.provider_id.clone(),
+            body.criterion.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            host.with_suggestions_db(|conn, profile| {
+                suggestions::set_source(conn, profile, &provider_id, &criterion, body.enabled)
+            })
+        })
+        .await
+    };
+    match stored {
+        Ok(Ok(())) => {
+            if !body.enabled {
+                crate::telemetry::feature_use::record(
+                    crate::telemetry::feature_use::FeatureUse::SuggestStopKind,
+                );
+            }
+        }
+        Ok(Err(error)) => return internal(error),
+        Err(error) => return internal(error),
+    }
+    host.refresh_suggestions(Some(&body.provider_id)).await;
+    Json(json!({
+        "provider_id": body.provider_id,
+        "criterion": body.criterion,
+        "enabled": body.enabled,
+    }))
+    .into_response()
+}
+
+/// Turns auto start on or off for one kind. It acts from the next refresh on.
+pub async fn put_suggestion_auto_start(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<AutoStartBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    // A kind a plugin no longer declares stays switchable off.
+    if body.enabled {
+        if body.provider_id == suggestions::AGENT_PROVIDER_ID {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "Auto start is not available for agent suggestions",
+            );
+        }
+        if let Err(response) = check_declared(find_provider(&body.provider_id), &body.criterion) {
+            return response;
+        }
+    }
+    let cap = body.cap.unwrap_or(suggestions::DEFAULT_CAP);
+    if !(1..=suggestions::MAX_CAP).contains(&cap) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("cap must be between 1 and {}", suggestions::MAX_CAP),
+        );
+    }
+    let stored = {
+        let (host, provider_id, criterion) = (
+            host.clone(),
+            body.provider_id.clone(),
+            body.criterion.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            host.with_suggestions_db(|conn, profile| {
+                suggestions::set_auto_start(
+                    conn,
+                    profile,
+                    &provider_id,
+                    &criterion,
+                    body.enabled.then_some(cap),
+                )
+            })
+        })
+        .await
+    };
+    match stored {
+        Ok(Ok(())) => Json(json!({
+            "provider_id": body.provider_id,
+            "criterion": body.criterion,
+            "auto_start": body.enabled.then(|| json!({ "cap": cap })),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn patch_suggestion_prefs(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<suggestions::PrefsPatch>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(patch) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, patch.expected_profile.as_deref()) {
+        return refused;
+    }
+    let result = tokio::task::spawn_blocking({
+        let host = host.clone();
+        move || {
+            let known: Vec<String> = suggestions::providers().into_iter().map(|p| p.id).collect();
+            host.with_suggestions_db(|conn, profile| {
+                suggestions::apply_prefs(conn, profile, &known, &patch)
+            })
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(refresh_changed))) => {
+            if refresh_changed {
+                host.refresh_suggestions(None).await;
+            }
+            Json(json!({ "ok": true })).into_response()
+        }
+        Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+/// The prefill of item `id`: `None` when it is no longer published.
+fn prefill_for(
+    host: &crate::plugin::host::PluginHost,
+    provider: &Provider,
+    id: &str,
+) -> anyhow::Result<Option<Result<serde_json::Value, PrepareRefusal>>> {
+    let (profile, found, preset) = host.with_suggestions_db(|conn, profile| {
+        let found = suggestions::find_item_with_mapping(conn, profile, provider, id)?;
+        let preset = match &found {
+            Some((found, _)) => suggestions::preset(conn, profile, &provider.id, &found.criterion)?,
+            None => None,
+        };
+        Ok::<_, anyhow::Error>((profile.to_string(), found, preset))
+    })?;
+    // Config and project resolution touch disk, so they run off the lock.
+    Ok(found.map(|(found, mapped)| {
+        suggestions::prepare(&profile, &found, preset.as_ref(), mapped.as_deref())
+    }))
+}
+
+fn refusal_response(refusal: PrepareRefusal) -> axum::response::Response {
+    match refusal {
+        PrepareRefusal::Stale => stale_item(),
+        PrepareRefusal::PromptTooLong => api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "The expanded prompt exceeds {} bytes",
+                crate::session::MAX_INITIAL_PROMPT_BYTES
+            ),
+        ),
+        PrepareRefusal::Registry(error) => internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartProject {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBody {
+    expected_profile: Option<String>,
+    provider_id: String,
+    id: String,
+    /// Link the item's repo to this Project first, then start.
+    #[serde(default)]
+    project: Option<StartProject>,
+    #[serde(default)]
+    approve_hooks: bool,
+    /// The fingerprint of the `hooks_need_trust` answer being approved.
+    #[serde(default)]
+    review_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
+}
+
+fn start_failed(reason: impl Into<String>, hint: &str) -> axum::response::Response {
+    let reason = reason.into();
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "start_failed",
+            "message": reason,
+            "reason": reason,
+            "hint": hint,
+            "retryable": true,
+        })),
+    )
+        .into_response()
+}
+
+/// Saves `path` as the Project of the item's repo. `Err` is a user-facing refusal.
+fn link_project(
+    host: &crate::plugin::host::PluginHost,
+    provider: &Provider,
+    id: &str,
+    path: &str,
+) -> anyhow::Result<Result<(), String>> {
+    let registered = crate::session::projects::load_merged(&host.suggestions_profile())?;
+    host.with_suggestions_db(|conn, profile| {
+        let Some((item, existing)) =
+            suggestions::find_item_with_mapping(conn, profile, provider, id)?
+        else {
+            return Ok(Err("That suggestion is no longer published".to_string()));
+        };
+        let Some(key) = item.mapping_key else {
+            return Ok(Err("This suggestion names no repo to link".to_string()));
+        };
+        // The chosen Project moves to the front; the others stay, minus any
+        // that are no longer registered, up to MAX_MAPPING_PROJECTS.
+        let mut projects =
+            match suggestions::normalize_mapping(&key, &[path.to_string()], &registered) {
+                Ok(projects) => projects,
+                Err(message) => return Ok(Err(message)),
+            };
+        for extra in existing.unwrap_or_default() {
+            if let Ok(kept) = suggestions::normalize_mapping(&key, &[extra], &registered) {
+                if !projects.contains(&kept[0])
+                    && projects.len() < suggestions::MAX_MAPPING_PROJECTS
+                {
+                    projects.extend(kept);
+                }
+            }
+        }
+        suggestions::put_mapping(conn, profile, &provider.id, &key, &projects)?;
+        Ok(Ok(()))
+    })
+}
+
+/// 409 asking the caller to approve what the repo's hooks and MCP servers will run.
+fn hooks_need_trust(review: &super::sessions::StartTrust) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "hooks_need_trust",
+            "message": "Repository hooks require approval before this Session starts",
+            "commands": {
+                "on_create": review.merged_hooks.on_create,
+                "on_launch": review.merged_hooks.on_launch,
+                "on_destroy": review.merged_hooks.on_destroy,
+            },
+            "needs_mcp_trust": review.mcp_need_trust,
+            "mcp_summaries": review.mcp_summaries,
+            "review_fingerprint": review.fingerprint,
+        })),
+    )
+        .into_response()
+}
+
+/// Turns the answer of the create into Start's contract. `profile` and `path`
+/// re-read the review when the repo's trust moved under the create.
+async fn start_outcome(
+    response: axum::response::Response,
+    profile: String,
+    path: String,
+) -> axum::response::Response {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let code = body["error"].as_str().unwrap_or_default();
+    if status == StatusCode::CREATED {
+        return (
+            StatusCode::CREATED,
+            Json(json!({ "session_id": body["id"], "title": body["title"] })),
+        )
+            .into_response();
+    }
+    if status == StatusCode::CONFLICT && matches!(code, "already_started" | "stale_suggestion") {
+        return (status, Json(body)).into_response();
+    }
+    {
+        use crate::telemetry::feature_use::{record, FeatureUse};
+        record(match code {
+            "creation_trust_changed" | "hooks_need_trust" | "agent_hooks_not_approved" => {
+                FeatureUse::SuggestFailHooks
+            }
+            "sandbox_unavailable" => FeatureUse::SuggestFailSandbox,
+            _ => FeatureUse::SuggestFailOther,
+        });
+    }
+    if code == "creation_trust_changed" {
+        return api_error(
+            StatusCode::CONFLICT,
+            "trust_changed",
+            "The repository's hooks changed after you reviewed them; review them again",
+        );
+    }
+    if code == "hooks_need_trust" {
+        let review = tokio::task::spawn_blocking(move || {
+            super::sessions::review_start_trust(&profile, std::path::Path::new(&path))
+        })
+        .await;
+        return match review {
+            Ok(Ok(review)) => hooks_need_trust(&review),
+            Ok(Err(error)) => start_failed(
+                error.to_string(),
+                "Check the Project's folder, then try again.",
+            ),
+            Err(error) => internal(error),
+        };
+    }
+    let hint = match code {
+        "acp_adapter_missing" | "agent_not_allowed" => {
+            "Choose another agent in the preset, then try again.".to_string()
+        }
+        "agent_hooks_not_approved" => {
+            "Approve agent hooks with `aoe hooks approve` in a terminal, then try again."
+                .to_string()
+        }
+        "sandbox_unavailable" => format!(
+            "Start {} and try again, or use Start with changes to run without the sandbox.",
+            crate::containers::get_container_runtime().display_name()
+        ),
+        _ => "Try again, or use Start with changes to see the full error.".to_string(),
+    };
+    let mut reason = body["message"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| format!("The Session could not be created ({status})"));
+    if code == "sandbox_unavailable" {
+        // The hint repeats the create reason's own "Start {runtime}, then try again."
+        let runtime = crate::containers::get_container_runtime().display_name();
+        if let Some(cause) = reason.strip_suffix(&format!(" Start {runtime}, then try again.")) {
+            reason = cause.to_string();
+        }
+    }
+    start_failed(reason, &hint)
+}
+
+/// The create a Start asks for. A worktree preset makes its own branch, as the
+/// new-session form does, so a fresh Start never looks for one that does not exist.
+fn create_body(
+    prefill: &serde_json::Value,
+    path: &str,
+    (provider_id, id): (&str, &str),
+    prompt: Option<&str>,
+    (trust_hooks, trust_review): (
+        Option<bool>,
+        Option<crate::daemon::CreationTrustFingerprint>,
+    ),
+) -> serde_json::Result<crate::daemon::CreateSessionBody> {
+    serde_json::from_value(json!({
+        "title": prefill["title"],
+        "path": path,
+        "tool": prefill["tool"],
+        "view": prefill["view"],
+        "yolo_mode": prefill["yolo"],
+        "worktree_enabled": prefill["worktree"],
+        "create_new_branch": prefill["worktree"],
+        "sandbox": prefill["sandbox"],
+        "initial_prompt": prompt,
+        "suggestion": { "provider_id": provider_id, "id": id },
+        "trust_hooks": trust_hooks,
+        "trust_review": trust_review,
+    }))
+}
+
+/// Most items one batch start takes: each create can run for minutes.
+const MAX_START_BATCH: usize = 25;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBatchBody {
+    expected_profile: Option<String>,
+    items: Vec<StartBatchItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBatchItem {
+    provider_id: String,
+    id: String,
+}
+
+/// A handler's answer as its status and JSON body.
+pub(super) async fn response_json(
+    response: axum::response::Response,
+) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// Starts each item as `start_suggestion` would, one after another, without
+/// approving any hooks. The answer is 200 with each item's own status and body,
+/// so a failure or a hooks review in one never stops the rest.
+pub async fn start_suggestions(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<StartBatchBody>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    if body.items.is_empty() || body.items.len() > MAX_START_BATCH {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("items must hold 1 to {MAX_START_BATCH} suggestions"),
+        );
+    }
+    let mut results = Vec::with_capacity(body.items.len());
+    for StartBatchItem { provider_id, id } in body.items {
+        let response = start_suggestion(
+            State(state.clone()),
+            Ok(Json(StartBody {
+                expected_profile: None,
+                provider_id: provider_id.clone(),
+                id: id.clone(),
+                project: None,
+                approve_hooks: false,
+                review_fingerprint: None,
+            })),
+        )
+        .await;
+        let (status, answer) = response_json(response).await;
+        results.push(json!({
+            "provider_id": provider_id,
+            "id": id,
+            "status": status.as_u16(),
+            "body": answer,
+        }));
+    }
+    Json(json!({ "results": results })).into_response()
+}
+
+pub async fn start_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<StartBody>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    let Some(provider) = find_provider(&body.provider_id) else {
+        return unknown_provider();
+    };
+    let start_in = body.project.is_some();
+    let StartBody {
+        provider_id,
+        id,
+        project,
+        approve_hooks,
+        review_fingerprint,
+        expected_profile: _,
+    } = body;
+
+    let prefill = {
+        let (host, id) = (host.clone(), id.clone());
+        tokio::task::spawn_blocking(move || {
+            if let Some(project) = project {
+                if let Err(message) = link_project(&host, &provider, &id, &project.path)? {
+                    return Ok(Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "validation_failed",
+                        message,
+                    )));
+                }
+            }
+            prefill_for(&host, &provider, &id).map(Ok)
+        })
+        .await
+    };
+    let prefill = match prefill {
+        Ok(Ok(Ok(Some(Ok(prefill))))) => prefill,
+        Ok(Ok(Ok(Some(Err(refusal))))) => return refusal_response(refusal),
+        Ok(Ok(Ok(None))) => return stale_item(),
+        Ok(Ok(Err(response))) => return response,
+        Ok(Err(error)) => return internal(error),
+        Err(error) => return internal(error),
+    };
+    let Some(path) = prefill["project"]["path"].as_str().map(String::from) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "no_project",
+                "message": "This suggestion's repo is not linked to a Project",
+                "hint": "link_project",
+            })),
+        )
+            .into_response();
+    };
+
+    // The create gate still refuses unapproved hooks; this tells the caller what to approve.
+    let profile = state.served_profile().to_string();
+    let (review_profile, review_path) = (profile.clone(), path.clone());
+    let review = tokio::task::spawn_blocking(move || {
+        super::sessions::review_start_trust(&review_profile, std::path::Path::new(&review_path))
+    })
+    .await;
+    let review = match review {
+        Ok(Ok(review)) => review,
+        Ok(Err(error)) => {
+            return start_failed(
+                error.to_string(),
+                "Check the Project's folder, then try again.",
+            )
+        }
+        Err(error) => return internal(error),
+    };
+    let (mut trust_hooks, mut trust_review) = (None, None);
+    if review.hooks_need_trust || review.mcp_need_trust {
+        if !approve_hooks {
+            return hooks_need_trust(&review);
+        }
+        let Some(fingerprint) = review_fingerprint else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "approve_hooks needs the review_fingerprint of the hooks it approves",
+            );
+        };
+        (trust_hooks, trust_review) = (Some(true), Some(fingerprint));
+    }
+
+    let prompt = prefill["initial_prompt"]
+        .as_str()
+        .filter(|prompt| !prompt.is_empty());
+    let sent = prompt.map(String::from);
+    let create = create_body(
+        &prefill,
+        &path,
+        (&provider_id, &id),
+        prompt,
+        (trust_hooks, trust_review),
+    );
+    let create = match create {
+        Ok(create) => create,
+        Err(error) => return internal(error),
+    };
+    let reference = uuid::Uuid::new_v4().to_string();
+    let response = super::sessions::create_session_with(
+        state,
+        false,
+        &reference,
+        false,
+        create,
+        super::sessions::CreateOrigin {
+            initial_turn: None,
+            prompt_origin: crate::daemon::PromptOrigin::Unknown,
+            via: crate::plugin::suggestions::StartedVia::Start(sent),
+        },
+    )
+    .await;
+    let outcome = start_outcome(response, profile, path).await;
+    if start_in && outcome.status() == StatusCode::CREATED {
+        crate::telemetry::feature_use::record(
+            crate::telemetry::feature_use::FeatureUse::SuggestStartIn,
+        );
+    }
+    outcome
+}
+
+pub async fn prepare_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<ItemRef>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let Json(item) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, item.expected_profile.as_deref()) {
+        return refused;
+    }
+    let Some(provider) = find_provider(&item.provider_id) else {
+        return unknown_provider();
+    };
+    let result = tokio::task::spawn_blocking(move || prefill_for(&host, &provider, &item.id)).await;
+    match result {
+        Ok(Ok(Some(Ok(prefill)))) => Json(prefill).into_response(),
+        Ok(Ok(Some(Err(refusal)))) => refusal_response(refusal),
+        Ok(Ok(None)) => stale_item(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+fn check_declared(
+    provider: Option<Provider>,
+    criterion: &str,
+) -> Result<Provider, axum::response::Response> {
+    let provider = provider.ok_or_else(unknown_provider)?;
+    if provider
+        .spec
+        .sources
+        .iter()
+        .any(|s| s.criterion == criterion)
+    {
+        Ok(provider)
+    } else {
+        Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "The provider does not declare that criterion",
+        ))
+    }
+}
+
+/// What a PUT must satisfy before anything is stored.
+fn check_preset_put(
+    provider: Option<Provider>,
+    criterion: &str,
+    config: &crate::session::config::Config,
+    preset: &Preset,
+) -> Result<(), axum::response::Response> {
+    check_declared(provider, criterion)?;
+    let invalid =
+        |message: String| api_error(StatusCode::BAD_REQUEST, "validation_failed", message);
+    let known_agent = crate::agents::get_agent(&preset.agent).is_some()
+        || config
+            .session
+            .custom_agents
+            .get(&preset.agent)
+            .is_some_and(|command| !command.trim().is_empty());
+    if !known_agent {
+        return Err(invalid(format!("Unknown agent {:?}", preset.agent)));
+    }
+    if preset
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| prompt.len() > crate::session::MAX_INITIAL_PROMPT_BYTES)
+    {
+        return Err(invalid(format!(
+            "Prompt is limited to {} bytes",
+            crate::session::MAX_INITIAL_PROMPT_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn preset_json(
+    provider_id: &str,
+    criterion: &str,
+    stored: Option<Preset>,
+    defaults: &Preset,
+    overridden: &[&str],
+) -> serde_json::Value {
+    json!({
+        "provider_id": provider_id,
+        "criterion": criterion,
+        "customized": stored.is_some(),
+        "preset": stored.as_ref().unwrap_or(defaults),
+        "defaults": defaults,
+        "project_overrides": overridden,
+    })
+}
+
+/// The preset of every declared kind, resolved against the new-Session defaults.
+pub async fn get_suggestion_presets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(host) = state.plugin_host.clone() else {
+        return Json(json!({ "presets": [] })).into_response();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let profile = host.suggestions_profile();
+        let defaults = suggestions::default_preset(
+            &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+        );
+        let overridden = suggestions::project_default_overrides(
+            &profile,
+            &crate::session::projects::load_merged(&profile)?,
+            &defaults,
+        );
+        let mut stored: std::collections::HashMap<(String, String), Preset> = host
+            .with_suggestions_db(suggestions::presets)?
+            .into_iter()
+            .map(|(provider_id, criterion, preset)| ((provider_id, criterion), preset))
+            .collect();
+        let presets: Vec<_> = suggestions::providers()
+            .into_iter()
+            .flat_map(|provider| {
+                provider
+                    .spec
+                    .sources
+                    .iter()
+                    .map(|source| (provider.id.clone(), source.criterion.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .map(|key| {
+                let preset = stored.remove(&key);
+                preset_json(&key.0, &key.1, preset, &defaults, &overridden)
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(json!({ "presets": presets }))
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn put_suggestion_preset(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<PresetBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    let provider = find_provider(&body.provider_id);
+    let result = tokio::task::spawn_blocking(move || {
+        // The profile config is a disk read: keep it off the executor.
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &host.suggestions_profile(),
+        );
+        if let Err(response) = check_preset_put(provider, &body.criterion, &config, &body.preset) {
+            return Ok(Err(response));
+        }
+        let defaults = suggestions::default_preset(&config);
+        let overridden = suggestions::project_default_overrides(
+            &host.suggestions_profile(),
+            &crate::session::projects::load_merged(&host.suggestions_profile())?,
+            &defaults,
+        );
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::set_preset(
+                conn,
+                profile,
+                &body.provider_id,
+                &body.criterion,
+                &body.preset,
+            )
+        })?;
+        Ok::<_, anyhow::Error>(Ok(preset_json(
+            &body.provider_id,
+            &body.criterion,
+            Some(body.preset),
+            &defaults,
+            &overridden,
+        )))
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(body))) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestPresetEdit,
+            );
+            Json(body).into_response()
+        }
+        Ok(Ok(Err(response))) => response,
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn delete_suggestion_preset(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<PresetKey>, axum::extract::rejection::QueryRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Query(key) = match query {
+        Ok(query) => query,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, key.expected_profile.as_deref()) {
+        return refused;
+    }
+    // No provider or criterion check: a stored preset must stay resettable
+    // after its plugin is disabled or drops the criterion.
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::delete_preset(conn, profile, &key.provider_id, &key.criterion)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestPresetReset,
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn list_suggestion_mappings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    let result =
+        tokio::task::spawn_blocking(move || host.with_suggestions_db(suggestions::list_mappings))
+            .await;
+    match result {
+        Ok(Ok(mappings)) => Json(mappings).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+/// The Projects a mapping may name, each with the `owner/repo` of its git
+/// `origin` (or `null`), so a client can propose mappings. Mutates nothing.
+pub async fn list_suggestion_projects(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let registered = crate::session::projects::load_merged(&host.suggestions_profile())?;
+        let projects: Vec<_> = registered
+            .into_iter()
+            .map(|p| {
+                let origin = crate::git::get_remote_slug(std::path::Path::new(&p.path));
+                json!({ "name": p.name, "path": p.path, "origin": origin })
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(json!({ "projects": projects }))
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn put_suggestion_mapping(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MappingBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    if find_provider(&body.provider_id).is_none() {
+        return unknown_provider();
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let profile = host.suggestions_profile();
+        let registered = crate::session::projects::load_merged(&profile)?;
+        let projects =
+            match suggestions::normalize_mapping(&body.mapping_key, &body.projects, &registered) {
+                Ok(projects) => projects,
+                Err(message) => return Ok(Err(message)),
+            };
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::put_mapping(
+                conn,
+                profile,
+                &body.provider_id,
+                &body.mapping_key,
+                &projects,
+            )
+        })?;
+        Ok::<_, anyhow::Error>(Ok(json!({
+            "provider_id": body.provider_id,
+            "mapping_key": body.mapping_key,
+            "projects": projects,
+        })))
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(stored))) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestMappingAdd,
+            );
+            Json(stored).into_response()
+        }
+        Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn delete_suggestion_mapping(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<MappingRef>, axum::extract::rejection::QueryRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Query(target) = match query {
+        Ok(query) => query,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, target.expected_profile.as_deref()) {
+        return refused;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            suggestions::delete_mapping(conn, profile, &target.provider_id, &target.mapping_key)
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(deleted)) => Json(json!({ "ok": true, "deleted": deleted })).into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aoe_plugin_api::{SuggestionSource, SuggestionsSpec};
+
+    fn provider() -> Provider {
+        Provider {
+            id: "acme.github".into(),
+            name: "GitHub".into(),
+            spec: SuggestionsSpec {
+                sources: vec![SuggestionSource {
+                    criterion: "assigned".into(),
+                    label: "Assigned".into(),
+                    description: String::new(),
+                    variables: vec![],
+                    default_enabled: true,
+                }],
+                uses_agent: false,
+            },
+        }
+    }
+
+    #[test]
+    fn preset_put_is_bounded_and_needs_a_declared_source_and_known_agent() {
+        let max = crate::session::MAX_INITIAL_PROMPT_BYTES;
+        let preset = |agent: &str, len: usize| Preset {
+            agent: agent.into(),
+            view: suggestions::PresetView::Structured,
+            worktree: true,
+            sandbox: false,
+            yolo: false,
+            prompt: Some("x".repeat(len)),
+        };
+        let status = |provider: Option<Provider>, criterion: &str, preset: &Preset| {
+            check_preset_put(
+                provider,
+                criterion,
+                &crate::session::config::Config::default(),
+                preset,
+            )
+            .err()
+            .map(|r| r.status())
+        };
+        assert_eq!(
+            status(Some(provider()), "assigned", &preset("claude", 0)),
+            None
+        );
+        assert_eq!(
+            status(Some(provider()), "assigned", &preset("claude", max)),
+            None
+        );
+        for (provider, criterion, preset, expected) in [
+            (
+                Some(provider()),
+                "assigned",
+                preset("claude", max + 1),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some(provider()),
+                "undeclared",
+                preset("claude", 1),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some(provider()),
+                "assigned",
+                preset("no-such-agent", 1),
+                StatusCode::BAD_REQUEST,
+            ),
+            (None, "assigned", preset("claude", 1), StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(status(provider, criterion, &preset), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_worktree_preset_creates_its_branch() {
+        for (worktree, expected) in [(true, true), (false, false)] {
+            let prefill = json!({ "title": "t", "tool": "claude", "view": "terminal",
+                "yolo": false, "worktree": worktree, "sandbox": false });
+            let body = create_body(&prefill, "/repo", ("p", "1"), None, (None, None)).unwrap();
+            assert_eq!(body.worktree_enabled, expected);
+            assert_eq!(body.create_new_branch, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_start_says_how_to_get_past_it() {
+        for (code, needle) in [
+            ("agent_hooks_not_approved", "aoe hooks approve"),
+            (
+                "sandbox_unavailable",
+                "use Start with changes to run without the sandbox",
+            ),
+        ] {
+            let refused = api_error(StatusCode::from_u16(422).unwrap(), code, "refused");
+            let response = start_outcome(refused, "default".into(), "/repo".into()).await;
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["hint"].as_str().unwrap().contains(needle), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_docker_down_start_gives_the_instruction_once() {
+        let runtime = crate::containers::get_container_runtime().display_name();
+        let create_reason = format!(
+            "{runtime} isn't running, so the Sandbox can't start. Start {runtime}, then try again."
+        );
+        let refused = api_error(
+            StatusCode::from_u16(422).unwrap(),
+            "sandbox_unavailable",
+            &create_reason,
+        );
+        let response = start_outcome(refused, "default".into(), "/repo".into()).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["reason"],
+            format!("{runtime} isn't running, so the Sandbox can't start.")
+        );
+        assert_eq!(
+            body["hint"],
+            format!("Start {runtime} and try again, or use Start with changes to run without the sandbox.")
+        );
+    }
+}

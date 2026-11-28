@@ -117,7 +117,7 @@ When a launch requests resume, AoE preserves an unknown stored ID and attempts i
 
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
 
-On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
+On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends may then reach the new conversation.
 
 AoE reports this fresh result only after the new association, or the cleared association for an agent that publishes its own ID later, is durably committed. A publication failure refuses the launch instead of reporting fresh success with the old association still stored.
 
@@ -165,7 +165,7 @@ Structured-view conversations remain managed by ACP. For a Claude terminal hando
 A fork starts a new, independent session from an existing session's conversation, so you can take the same history in a different direction. Only the fork is new: the original session and its transcript are untouched.
 
 - **TUI**: the command palette's **Fork session (resume context, diverge)**, or **Fork session** on a session row's right-click menu. The dialog inherits the source working directory, group, and title. A rejected launch preserves the pending fork instead of silently starting fresh.
-- **Web**: **Fork session** on the sidebar context menu of a forkable session.
+- **Web**: **Fork session** on the sidebar context menu of a structured session that can fork.
 - **CLI**: `aoe add --fork-from <session-id-or-title>`.
 
 The fork inherits the parent tool, group, working directory, and conversation binding. A qualified binding has already established the native agent and store through a qualified publication, import, or explicit recovery assertion. A raw or preallocated ID is insufficient; status detection and matching tool labels grant no authority. A raw ID that migration left unqualified is not a reason to refuse: a fork of it launches against the store current configuration resolves, under the same agent the parent row resolves to, because nothing recorded the store or the tool its parent used. A child asked for under another agent is refused before dispatch, whatever it is asked for by name. A Claude child whose tool resolves to a different store than the parent's (for example a custom agent with its own `agent_config_dir`) gets the parent's transcript copied into that store, and its binding records that store; the fork is refused if the transcript cannot be copied. A conflicting native command or user-supplied resume/fork selector is refused before dispatch whatever the binding, and for a qualified binding so is a different tool, without clearing the pending fork. `--fork-from` cannot be combined with `--worktree` / `--new-branch` or `--sandbox` / `--sandbox-image`.
@@ -179,9 +179,11 @@ Launch success requires confirmation that the adopted child is durably published
 A returned parent, missing child, or unsupported route preserves the pending fork.
 Automatic recovery still depends on the agent's capture capability and supported execution context; dispatching a native fork adds no new child-ID discovery path.
 
-Forking needs an agent that can branch a conversation: claude, codex, opencode, pi, and prime-agent in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot, cursor, hermes, kimi) and agents without resume in AoE (droid, kiro, qwen, antigravity, settl) hide or refuse the action.
+Forking needs an agent that can branch a conversation: claude, codex, opencode, pi, prime-agent, and omp in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot, cursor, hermes, kimi) and agents without resume in AoE (droid, kiro, qwen, antigravity, settl) hide or refuse the action.
 
 Pi terminal forks require the same working directory and an attested host `pi` on `PATH` that supports both `--fork` and `--session-id`. AoE assigns the child id before launch. A sandboxed Pi, an unattestable wrapper, or a Pi without either flag refuses the fork rather than creating an untracked conversation. The child copies the parent's saved transcript, starting from the last persisted message. Stopping the child saves its launch-scoped transcript before clearing publication evidence; later starts resume that exact child rather than forking the parent again. Forking into a new worktree is not supported for Pi.
+
+OMP terminal forks launch `omp --fork <parent-id>` with `--session-dir` pinned to the directory of the parent's bound transcript, so the ID resolves to that one file and the child is written beside it. The parent needs a bound host transcript recorded for the child's working directory. OMP forks run only on the host: a sandboxed OMP session, including one whose store is mounted from the host, is refused before the fork is created and does not offer **Fork session**. OMP mints the child ID, and AoE captures it from the pane once OMP publishes it. Later starts resume that child rather than forking the parent again.
 
 ## Swapping the engine on a restart
 
@@ -191,7 +193,7 @@ Two tool names can also point at the same agent on different accounts, through `
 
 The carry applies only when the new tool resolves to the same built-in agent, the session has a conversation to carry, and AoE knows the agent's transcript layout (Claude Code today). Anything else takes the parking swap above.
 
-The CLI reaches this swap with `aoe session restart <session> --tool <tool>`, and for a structured session `aoe acp switch-account <session> <tool>` does the same but refuses instead of parking when the carry does not apply. A structured session parked on a rate limit continues with the interrupted prompt instead of the restart wake message; see [Switching accounts manually](../structured-view/troubleshooting.md#switching-accounts-manually).
+The CLI reaches this swap with `aoe session restart <session> --tool <tool>`, and for a structured session `aoe acp switch-account <session> <tool>` does the same but refuses instead of parking when the carry does not apply. A structured session parked on a rate limit continues with the interrupted prompt; see [Switching accounts manually](../structured-view/troubleshooting.md#switching-accounts-manually).
 
 The outgoing account keeps its own copy, so swapping accounts back and forth stays continuous: the account you swap away from is the one that was just running, so on the way back its transcript replaces the older copy the earlier swap left behind. A copy the incoming account wrote more recently than the outgoing one is left alone.
 
@@ -204,8 +206,6 @@ Rebinding the record with `aoe session set-session-id --store` copies nothing, s
 ## Picking up an upgraded agent CLI
 
 Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` to restart every eligible session in the profile; from an agent session, the caller is skipped so the command can finish). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
-
-AoE also notices when the agent binary was replaced after a session launched. While the session is idle, the web sidebar menu offers **Restart to update** (it keeps the conversation) and the TUI row shows an `[update]` badge, with the same restart under the context menu.
 
 ## Importing an existing conversation
 

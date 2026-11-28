@@ -500,19 +500,12 @@ fn unread_dot_suppressed_on_archived_snoozed_and_ignored() {
         "an idle unread row should paint the unread dot"
     );
 
-    env.view.sort_order = SortOrder::Newest;
+    env.view.sort_order = SortOrder::Custom;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     env.view.flat_items = env.view.build_flat_items();
     assert!(
         !render(&mut env).contains('●'),
-        "a snoozed unread row must not paint the unread dot outside Attention sort"
-    );
-
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    assert!(
-        !render(&mut env).contains('●'),
-        "a snoozed unread row must not paint the unread dot in Attention sort"
+        "a snoozed unread row must not paint the unread dot"
     );
 
     env.view.mutate_instance(&id, |inst| {
@@ -741,7 +734,6 @@ fn native_unread_respects_visits_and_canonical_feedback() {
             .map(|(id, unread)| {
                 let mut row = crate::server::api::sessions::session_response_from_instance(
                     env.view.get_instance(id).unwrap(),
-                    false,
                 );
                 row.status = "Idle".into();
                 row.view = crate::session::View::Terminal;
@@ -1275,15 +1267,15 @@ fn test_g_key_opens_group_picker() {
     use crate::session::config::GroupByMode;
 
     let mut env = create_test_env_with_sessions(3);
-    env.view.group_by = GroupByMode::Manual;
+    env.view.group_by = GroupByMode::Group;
 
     // 'g' opens the picker without changing the current mode.
     env.view.handle_key(key(KeyCode::Char('g')), None);
     assert!(env.view.group_picker_dialog.is_some());
-    assert_eq!(env.view.group_by, GroupByMode::Manual);
+    assert_eq!(env.view.group_by, GroupByMode::Group);
 
-    // Down + Enter selects the next option (Project).
-    env.view.handle_key(key(KeyCode::Down), None);
+    // Up + Enter selects the other option (Repository).
+    env.view.handle_key(key(KeyCode::Up), None);
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
@@ -1295,19 +1287,12 @@ fn test_g_key_opens_group_picker() {
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
 
-    // 'g' again, Down + Enter advances Project -> Org.
+    // 'g' again, Down + Enter goes back to Groups.
     env.view.handle_key(key(KeyCode::Char('g')), None);
     env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.group_picker_dialog.is_none());
-    assert_eq!(env.view.group_by, GroupByMode::Org);
-
-    // 'g' again, Down + Enter advances Org -> Status (#4867).
-    env.view.handle_key(key(KeyCode::Char('g')), None);
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env.view.group_picker_dialog.is_none());
-    assert_eq!(env.view.group_by, GroupByMode::Status);
+    assert_eq!(env.view.group_by, GroupByMode::Group);
 }
 
 #[test]
@@ -1542,4 +1527,84 @@ fn restore_on_a_live_row_explains_itself() {
         env.view.status_flash_text(),
         Some("Select a session under Trash to restore it")
     );
+}
+
+#[test]
+#[serial]
+fn s_focuses_the_suggestions_pane_which_owns_keys_until_esc() {
+    let mut env = create_test_env_empty();
+    env.view.handle_key(key(KeyCode::Char('S')), None);
+    assert!(env.view.suggestions_focused);
+    assert!(env.view.suggestions_pane_shown());
+
+    env.view.handle_key(key(KeyCode::Char('n')), None);
+    assert!(
+        env.view.new_dialog.is_none(),
+        "keys go to the pane, not the list beside it"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(!env.view.suggestions_focused);
+    assert!(!env.view.suggestions_pane_shown());
+}
+
+fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
+    crate::tui::suggestions::Start {
+        provider: "GitHub".to_string(),
+        source_ref: "#7".to_string(),
+        reason: "review requested".to_string(),
+        source_text: None,
+        path: Some(path.to_string()),
+        extra_paths: Vec::new(),
+        title: "Review PR 7".to_string(),
+        initial_prompt: "Inspect the diff".to_string(),
+        tool: "claude".to_string(),
+        preset: Default::default(),
+        suggestion: None,
+    }
+}
+
+#[test]
+#[serial]
+fn a_started_suggestion_opens_the_prefilled_dialog_and_leaves_the_pane() {
+    let mut env = create_test_env_empty();
+    // A structured default would make Enter check for the ACP adapter on the host.
+    crate::session::config::update_config(|config| {
+        config.acp.structured_view = crate::session::config::StructuredView::Terminal;
+    })
+    .unwrap();
+    env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
+    env.view.suggestions_focused = true;
+    env.view.start_suggestion(start_for_test("/tmp"));
+    assert!(!env.view.suggestions_focused);
+    let data = match env
+        .view
+        .new_dialog
+        .as_mut()
+        .unwrap()
+        .handle_key(key(KeyCode::Enter))
+    {
+        crate::tui::dialogs::DialogResult::Submit(data) => data,
+        _ => panic!("expected Submit"),
+    };
+    assert_eq!(data.path, "/tmp");
+    assert_eq!(data.tool, "claude");
+    assert_eq!(data.title, "Review PR 7");
+    assert_eq!(data.initial_prompt.as_deref(), Some("Inspect the diff"));
+}
+
+#[test]
+#[serial]
+fn a_blocked_suggestion_start_keeps_the_view_open_with_the_reason() {
+    let mut env = create_test_env_empty();
+    env.view.creating_stub_id = Some("pending".to_string());
+    env.view.suggestions_view = Some(crate::tui::suggestions::SuggestionsView::idle_for_test());
+    env.view.start_suggestion(start_for_test("/tmp"));
+    assert!(env.view.new_dialog.is_none());
+    let view = env.view.suggestions_view.as_ref().expect("view stays open");
+    assert!(view
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("already being created"));
 }

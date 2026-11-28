@@ -20,9 +20,20 @@ export function PluginInstallConsentModal({ consent, busy, error, onApprove, onC
       closeTestId="plugin-install-consent-close"
       busy={busy}
       onClose={onClose}
+      actions={
+        <ModalActions
+          busy={busy}
+          cancelLabel="Cancel"
+          cancelTestId="plugin-install-cancel"
+          onCancel={onClose}
+          confirmLabel={busy ? "Starting…" : "Approve and install"}
+          confirmTestId="plugin-install-approve"
+          onConfirm={onApprove}
+        />
+      }
       header={
         <div>
-          <h2 className="font-semibold">Install {consent.id}?</h2>
+          <h2 className="text-[16px] md:text-[15px] font-semibold text-text-primary">Install {consent.id}?</h2>
           <p className="text-xs text-text-dim">
             v{consent.version} ·{" "}
             <span className={consent.validation === "featured" ? "font-medium text-accent-500" : undefined}>
@@ -55,7 +66,7 @@ export function PluginInstallConsentModal({ consent, busy, error, onApprove, onC
                 <div>
                   {displayAgentText(agent.tool)}: {displayAgentText(agent.command ?? "No launch command declared")}
                 </div>
-                {agentIntegrationDetails(agent).map((detail, index) => (
+                {agentIntegrationDetails(agent, consent.sandbox_report_dir).map((detail, index) => (
                   <div key={index} className="pl-4">
                     {detail}
                   </div>
@@ -81,16 +92,6 @@ export function PluginInstallConsentModal({ consent, busy, error, onApprove, onC
           {error}
         </p>
       )}
-
-      <ModalActions
-        busy={busy}
-        cancelLabel="Cancel"
-        cancelTestId="plugin-install-cancel"
-        onCancel={onClose}
-        confirmLabel={busy ? "Starting…" : "Approve and install"}
-        confirmTestId="plugin-install-approve"
-        onConfirm={onApprove}
-      />
     </PluginModal>
   );
 }

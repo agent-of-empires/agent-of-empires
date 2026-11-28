@@ -18,7 +18,11 @@ import {
   toneClasses,
   toneTextClass,
 } from "../../lib/pluginUi";
+import { CARD } from "../../lib/surfaces";
 import { PluginPaneBody } from "./PluginPane";
+
+// A plugin's tone tints the card, so it keeps CARD's shape and edge without its fill.
+const TONED_CARD = "rounded-xl max-md:rounded-2xl border border-surface-700/50 shadow-md px-4 py-3";
 import { BadgeChip, BadgeItems, Spinner } from "./SlotChrome";
 import { objectList, renderIcon } from "./slotPayload";
 
@@ -109,11 +113,7 @@ export function PluginCards() {
       {entries.map((e) => {
         const body = payloadStr(e, "body");
         return (
-          <div
-            key={entryKey(e)}
-            className={`rounded-lg p-3 ring-1 ring-surface-700/60 ${toneClasses(entryTone(e))}`}
-            data-plugin-id={e.plugin_id}
-          >
+          <div key={entryKey(e)} className={`${TONED_CARD} ${toneClasses(entryTone(e))}`} data-plugin-id={e.plugin_id}>
             <div className="font-semibold text-sm">{payloadStr(e, "title")}</div>
             {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
           </div>
@@ -132,8 +132,12 @@ export function PluginHomePanes() {
       {entries.map((e) => {
         const title = payloadStr(e, "title");
         return (
-          <div key={entryKey(e)} className="rounded-lg ring-1 ring-surface-700/60" data-plugin-id={e.plugin_id}>
-            {title && <div className="border-b border-surface-700/60 px-3 py-2 font-semibold text-sm">{title}</div>}
+          <div key={entryKey(e)} className={`${CARD} !px-0 overflow-hidden`} data-plugin-id={e.plugin_id}>
+            {title && (
+              <div className="border-b border-surface-700/40 px-4 py-2.5 font-semibold text-sm text-text-primary">
+                {title}
+              </div>
+            )}
             <PluginPaneBody entry={e} titleInChrome />
           </div>
         );

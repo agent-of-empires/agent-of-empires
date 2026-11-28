@@ -216,6 +216,14 @@ pub(super) fn build_sandbox_docker_argv(
         }
     }
 
+    // Minted MCP credentials: the key alone goes in the argv, which other local users can
+    // read, and the value reaches docker through the runner's environment.
+    for (key, value) in &config.mcp_credentials {
+        docker_args.push("-e".into());
+        docker_args.push(key.clone());
+        inherit_env.push((key.clone(), value.clone()));
+    }
+
     docker_args.push(
         sandbox
             .container_id
@@ -391,6 +399,38 @@ mod tests {
         }
     }
 
+    /// A proxy wraps the whole `docker exec` line, so the container still
+    /// receives the adapter argv with spaces and quotes intact.
+    #[test]
+    fn proxy_wraps_the_docker_exec_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = sandbox("aoe-sandbox-abc12345", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.spec.args = vec!["a b".into(), "it's \"x\"".into()];
+        let sandbox_argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+        let proxy = crate::acp::acp_client::ProxySpec {
+            plugin_id: "p".into(),
+            command: "/opt/proxy".into(),
+            args: vec!["--x".into()],
+            failure_policy: crate::acp::acp_client::ProxyFailurePolicy::Refuse,
+            display_name: "P".into(),
+            compat: Default::default(),
+        };
+
+        let argv = super::super::runner::agent_argv(
+            Some(&proxy),
+            &sandbox_argv.docker_binary,
+            &sandbox_argv.docker_args,
+        );
+
+        assert_eq!(
+            argv[..3],
+            ["/opt/proxy", "--x", sandbox_argv.docker_binary.as_str()]
+        );
+        assert_eq!(argv[3..], sandbox_argv.docker_args[..]);
+        assert_eq!(argv[argv.len() - 2..], ["a b", "it's \"x\""]);
+    }
+
     /// The agent command is wrapped as `docker exec -i -w <workdir> ... <container>
     /// <argv>`, with a literal env entry delivered only through the env-file.
     #[test]
@@ -499,6 +539,42 @@ mod tests {
             "{key} must not cross the container boundary, got {:?}",
             argv.docker_args
         );
+    }
+
+    /// Minted MCP credentials cross as `-e KEY` with the value on the runner's environment,
+    /// never in the `docker exec` argv, which other local users can read.
+    #[test]
+    fn build_sandbox_docker_argv_keeps_mcp_credentials_off_the_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = sandbox("aoe-sandbox-mcpcred", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.agent_key = "claude-code".into();
+        config.mcp_credentials = vec![
+            (
+                "AOE_PLUGIN_MCP_CRED_0a".to_string(),
+                "fake-credential-a".to_string(),
+            ),
+            (
+                "AOE_PLUGIN_MCP_CRED_0b".to_string(),
+                "fake-credential-b".to_string(),
+            ),
+        ]
+        .into();
+
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
+        for (key, value) in &config.mcp_credentials {
+            assert_named_without_value(&argv, key, value);
+            assert!(
+                argv.inherit_env.contains(&(key.clone(), value.clone())),
+                "{key}"
+            );
+            assert!(
+                argv.docker_args.iter().all(|a| !a.contains(value.as_str())),
+                "the value must not appear anywhere in argv: {:?}",
+                argv.docker_args
+            );
+        }
     }
 
     /// #3238: the per-adapter `env_allowlist` must cross the boundary, but a

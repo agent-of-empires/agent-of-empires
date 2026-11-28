@@ -217,13 +217,17 @@ impl HomeView {
         let Some((dialog_title, state, verb)) = shelved else {
             return false;
         };
-        let key = if self.strict_hotkeys { "Z" } else { "z" };
-        self.info_dialog = Some(InfoDialog::new(
-            dialog_title,
-            &format!(
+        let key = self.key_label(super::bindings::ActionId::ToggleArchive);
+        let body = if key.is_empty() {
+            let mut verb = verb.to_string();
+            verb[..1].make_ascii_uppercase();
+            format!("This session is {state}; its agent stays stopped. {verb} it first.")
+        } else {
+            format!(
                 "This session is {state}; its agent stays stopped. Press {key} to {verb} it first."
-            ),
-        ));
+            )
+        };
+        self.info_dialog = Some(InfoDialog::new(dialog_title, &body));
         true
     }
 
@@ -266,67 +270,6 @@ impl HomeView {
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.restart_selected_session_with_wake(
-            new_profile,
-            new_tool,
-            new_extra_args,
-            new_command_override,
-            false,
-        )
-    }
-
-    /// Whether the session runs an agent binary replaced since launch and may be restarted for
-    /// it now. Structured rows are left to the web dashboard: this restart path cannot respawn a
-    /// structured worker.
-    pub(super) fn update_restart_offered(&self, id: &str) -> bool {
-        self.get_instance(id).is_some_and(|inst| {
-            crate::session::update_restart::offer_pending(
-                inst,
-                match inst.terminal_context_resume_cached() {
-                    crate::session::TerminalContextResume::Available => true,
-                    crate::session::TerminalContextResume::RuntimeCheckRequired => {
-                        inst.agent_session_id.is_some()
-                    }
-                    _ => false,
-                },
-                false,
-            )
-        })
-    }
-
-    /// Restart the selected session onto the updated agent, with no wake-up message. The restart
-    /// resumes through `auto_resume_on_restart`, so the offer's "conversation kept" promise only
-    /// holds while that is on.
-    pub(super) fn restart_selected_for_update(&mut self) -> anyhow::Result<()> {
-        let Some(id) = self.selected_session.clone() else {
-            return Ok(());
-        };
-        let Some(profile) = self
-            .get_instance(&id)
-            .filter(|_| self.update_restart_offered(&id))
-            .map(|inst| inst.effective_profile())
-        else {
-            return Ok(());
-        };
-        let auto_resume = crate::session::resolve_config(&profile)
-            .map(|c| c.session.auto_resume_on_restart)
-            .unwrap_or(true);
-        if !auto_resume {
-            anyhow::bail!("auto_resume_on_restart is off, so a restart would start a new conversation. Restart with 'e' if that is intended");
-        }
-        self.restart_selected_session_with_wake(None, None, None, None, true)
-    }
-
-    /// `for_update` sends no wake-up message and has the daemon refuse a session that is no longer
-    /// idle.
-    fn restart_selected_session_with_wake(
-        &mut self,
-        new_profile: Option<&str>,
-        new_tool: Option<&str>,
-        new_extra_args: Option<&str>,
-        new_command_override: Option<&str>,
-        for_update: bool,
-    ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
             None => return Ok(()),
@@ -345,17 +288,12 @@ impl HomeView {
             return Ok(());
         }
 
-        // Skip transient rows. Snoozed rows only skip when the user is
-        // in Attention sort; see method doc.
-        let in_attention = self.sort_order == crate::session::config::SortOrder::Attention;
+        // Skip transient rows; starting a snoozed row wakes it.
         let (skip, wake_snooze) = match self.get_instance(&id) {
-            Some(inst) => {
-                let snoozed = inst.is_snoozed();
-                let skip = matches!(inst.status, Status::Creating | Status::Deleting)
-                    || (snoozed && in_attention);
-                let wake_snooze = snoozed && !in_attention;
-                (skip, wake_snooze)
-            }
+            Some(inst) => (
+                matches!(inst.status, Status::Creating | Status::Deleting),
+                inst.is_snoozed(),
+            ),
             None => return Ok(()),
         };
         if skip {
@@ -382,8 +320,6 @@ impl HomeView {
             extra_args: new_extra_args.map(str::to_owned),
             command_override: new_command_override.map(str::to_owned),
             unsnooze: wake_snooze,
-            wake_message: for_update.then(String::new),
-            only_if_idle: for_update,
             ..Default::default()
         };
         if let Err(error) = self
@@ -691,9 +627,6 @@ impl HomeView {
                 minutes: Some(minutes),
             }),
         )?;
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            self.select_top_attention(Some(id));
-        }
         Ok(())
     }
 
@@ -708,7 +641,7 @@ impl HomeView {
         };
         self.session_feed.submit(
             id,
-            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody {
+            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody::Unscoped {
                 favorited: !is_fav,
             }),
         )?;
@@ -810,11 +743,8 @@ impl HomeView {
         }
 
         // Decide where the cursor lands BEFORE the row sinks, against the
-        // pre-archive list the user is actually looking at. Only the
-        // non-Attention branch consumes it; Attention re-picks from the top.
-        let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
-            .then(|| self.archive_successor_session(&id))
-            .flatten();
+        // pre-archive list the user is actually looking at.
+        let successor = self.archive_successor_session(&id);
 
         // The daemon tears the panes down (#1868) and stamps `archived_at`; the
         // row, the section counts and the cursor placement follow from the
@@ -834,20 +764,26 @@ impl HomeView {
         Ok(())
     }
     /// Preserve the shelf's collapsed state; teardown and relocation remain daemon-owned.
-    pub(super) fn trash_session_by_id(&mut self, id: &str) {
+    /// True when the runtime queued the Trash request.
+    pub(super) fn trash_session_by_id(&mut self, id: &str) -> bool {
         let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
             self.flash_status("Runtime unavailable; reopen Trash controls");
-            return;
+            return false;
         };
-        self.trash_session_by_id_at_epoch(id, epoch);
+        self.trash_session_by_id_at_epoch(id, epoch)
     }
 
-    pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, expected_epoch: String) {
+    /// True when the runtime queued the Trash request.
+    pub(super) fn trash_session_by_id_at_epoch(
+        &mut self,
+        id: &str,
+        expected_epoch: String,
+    ) -> bool {
         let Some(instance) = self
             .get_instance(id)
             .filter(|instance| !instance.is_trashed())
         else {
-            return;
+            return false;
         };
         let generation = instance.lifecycle_generation;
         let profile = instance.source_profile.clone();
@@ -866,7 +802,9 @@ impl HomeView {
                 "Could Not Trash Session",
                 &error.to_string(),
             ));
+            return false;
         }
+        true
     }
 
     pub(super) fn retry_selected_trash(&mut self) {
@@ -1038,53 +976,31 @@ impl HomeView {
             return Vec::new();
         };
         match self.group_by {
-            // Project headers are derived from each session's repo name and unified
+            // Repository headers are derived from each session's repo name and unified
             // across profiles, narrowed only by the active profile filter, exactly as
-            // `build_flat_items_by_project` builds them.
-            crate::session::config::GroupByMode::Project => self
-                .instances
-                .values()
-                .filter(|i| !i.is_archived() && !i.is_trashed())
-                .filter(|i| {
-                    self.active_profile
-                        .as_ref()
-                        .is_none_or(|p| &i.source_profile == p)
-                })
-                .filter(|i| super::project_group_key(i) == group_path)
-                .map(|i| i.id.clone())
-                .collect(),
-            // Org headers key on the host-scoped owner so same-named owners on
-            // different hosts stay separate; same cross-profile unification as Project.
-            crate::session::config::GroupByMode::Org => self
-                .instances
-                .values()
-                .filter(|i| !i.is_archived() && !i.is_trashed())
-                .filter(|i| {
-                    self.active_profile
-                        .as_ref()
-                        .is_none_or(|p| &i.source_profile == p)
-                })
-                .filter(|i| self.org_group_key(i) == group_path)
-                .map(|i| i.id.clone())
-                .collect(),
-            // Status headers key on the status's API spelling, the same key
-            // `build_flat_items_by_status` rewrites `group_path` to.
-            crate::session::config::GroupByMode::Status => self
-                .instances
-                .values()
-                .filter(|i| !i.is_archived() && !i.is_trashed())
-                .filter(|i| {
-                    self.active_profile
-                        .as_ref()
-                        .is_none_or(|p| &i.source_profile == p)
-                })
-                .filter(|i| super::rows::status_group_key(i) == group_path)
-                .map(|i| i.id.clone())
-                .collect(),
+            // `build_flat_items_by_project` builds them. A nested Group header holds the
+            // sessions at or beneath its `repo/group` path.
+            crate::session::config::GroupByMode::Project => {
+                let prefix = format!("{group_path}/");
+                self.instances
+                    .values()
+                    .filter(|i| !i.is_archived() && !i.is_trashed())
+                    .filter(|i| {
+                        self.active_profile
+                            .as_ref()
+                            .is_none_or(|p| &i.source_profile == p)
+                    })
+                    .filter(|i| {
+                        let path = super::rows::project_view_path(i);
+                        path == group_path || path.starts_with(&prefix)
+                    })
+                    .map(|i| i.id.clone())
+                    .collect()
+            }
             // Manual groups nest, so a session belongs when its path matches exactly or
             // sits beneath the group; scoped to the owning profile the same way
             // `delete_selected_group` does.
-            crate::session::config::GroupByMode::Manual => {
+            crate::session::config::GroupByMode::Group => {
                 let prefix = format!("{}/", group_path);
                 let is_member =
                     group_membership(group_path, &prefix, self.selected_group_profile.as_deref());

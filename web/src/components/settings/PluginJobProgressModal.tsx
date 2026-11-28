@@ -1,12 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { fetchPluginJob, type PluginJob } from "../../lib/api";
+import { BUTTON_PRIMARY } from "../../lib/surfaces";
+import { PluginModal } from "./PluginModal";
 
 interface PluginJobProgressModalProps {
   jobId: string;
   title: string;
-  /** Closing mid-run only stops polling; the job keeps running. */
-  onClose: () => void;
+  /** Closing mid-run only stops polling; the job keeps running. `succeeded` is false for a failed or vanished job. */
+  onClose: (succeeded: boolean) => void;
 }
 
 /// Polls a plugin lifecycle job and its log tail until it finishes.
@@ -53,6 +55,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
   const state = job?.job.status.state ?? "running";
   const done = state === "succeeded" || state === "failed" || gone;
   const failedError = job?.job.status.state === "failed" ? job.job.status.error : null;
+  const close = useCallback(() => onClose(!gone && state === "succeeded"), [onClose, gone, state]);
 
   useEffect(() => {
     if (!done) return;
@@ -62,75 +65,60 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
         .composedPath()
         .find((node) => node instanceof HTMLElement && node.getAttribute("aria-modal") === "true");
       if (dialog && dialog !== dialogRef.current) return;
-      onClose();
+      close();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [done, onClose]);
+  }, [done, close]);
 
   return (
-    <div
-      ref={dialogRef}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
-      data-testid="plugin-job-modal"
-    >
-      <div className="max-h-[80vh] w-full max-w-2xl overflow-auto rounded border border-surface-700 bg-surface-900 p-4 text-sm">
-        <div className="mb-3 flex items-start justify-between gap-3">
-          <div>
-            <h2 className="font-semibold">{title}</h2>
-            <p className="text-xs text-text-dim" data-testid="plugin-job-status">
-              {gone ? "Job no longer available." : state === "running" && "Running…"}
-              {!gone && state === "succeeded" && "Done."}
-              {!gone && state === "failed" && "Failed."}
-            </p>
-          </div>
-          <button
-            type="button"
-            className="rounded border border-surface-700 px-2 py-0.5 text-xs hover:bg-surface-800 disabled:opacity-50"
-            disabled={!done}
-            onClick={onClose}
-            data-testid="plugin-job-close"
-          >
-            {done ? "Close" : "Running…"}
+    <PluginModal
+      testId="plugin-job-modal"
+      ariaLabel={title}
+      rootRef={dialogRef}
+      closeTestId="plugin-job-close"
+      closeLabel={done ? "Close" : "Running…"}
+      busy={!done}
+      closeOnEscape={false}
+      onClose={close}
+      panelClassName="md:w-[42rem] md:max-h-[80vh]"
+      header={
+        <>
+          <h2 className="text-[16px] md:text-[15px] font-semibold text-text-primary">{title}</h2>
+          <p className="text-xs text-text-dim" data-testid="plugin-job-status">
+            {gone ? "Job no longer available." : state === "running" && "Running…"}
+            {!gone && state === "succeeded" && "Done."}
+            {!gone && state === "failed" && "Failed."}
+          </p>
+        </>
+      }
+      actions={
+        done && (
+          <button type="button" className={BUTTON_PRIMARY} onClick={close} data-testid="plugin-job-done">
+            Close
           </button>
-        </div>
+        )
+      }
+    >
+      {failedError && (
+        <p className="mb-2 text-xs text-status-error" data-testid="plugin-job-error">
+          {failedError}
+        </p>
+      )}
+      {error && !done && <p className="mb-2 text-xs text-text-dim">Reconnecting… ({error})</p>}
 
-        {failedError && (
-          <p className="mb-2 text-xs text-status-error" data-testid="plugin-job-error">
-            {failedError}
-          </p>
-        )}
-        {error && !done && <p className="mb-2 text-xs text-text-dim">Reconnecting… ({error})</p>}
-
-        <pre
-          ref={logRef}
-          className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words rounded border border-surface-700 bg-surface-950 p-2 font-mono text-[11px] text-text-dim"
-          data-testid="plugin-job-log"
-        >
-          {job?.log.tail || (state === "running" ? "Starting…" : "")}
-        </pre>
-        {job?.log.path && (
-          <p className="mt-2 break-all font-mono text-xs text-text-dim" data-testid="plugin-job-host-path">
-            Full log on Daemon host: {job.log.path}
-          </p>
-        )}
-
-        {done && (
-          <div className="mt-3 flex justify-end">
-            <button
-              type="button"
-              className="rounded bg-brand-600 px-3 py-1 text-xs font-medium text-white hover:bg-brand-500"
-              onClick={onClose}
-              data-testid="plugin-job-done"
-            >
-              Close
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
+      <pre
+        ref={logRef}
+        className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-surface-700/60 bg-surface-950 p-2 font-mono text-[11px] text-text-dim"
+        data-testid="plugin-job-log"
+      >
+        {job?.log.tail || (state === "running" ? "Starting…" : "")}
+      </pre>
+      {job?.log.path && (
+        <p className="mt-2 break-all font-mono text-xs text-text-dim" data-testid="plugin-job-host-path">
+          Full log on Daemon host: {job.log.path}
+        </p>
+      )}
+    </PluginModal>
   );
 }
