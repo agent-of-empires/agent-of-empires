@@ -340,6 +340,20 @@ describe("tool ownership across profile loads", () => {
     expect(reducer(loaded, { type: "SEED_PROJECT_OVERRIDES", overrides: undefined }).data.tool).toBe("claude");
   });
 
+  it("keeps the fallback in step with a late profile default under a dirty profile", () => {
+    const state = run(
+      makeState({ path: "/repo" }),
+      defaults({ tool: "opencode" }),
+      { type: "SEED_PROJECT_OVERRIDES", overrides: { default_tool: "codex" } },
+      set("yoloMode", true),
+    );
+    expect(state.data).toMatchObject({ tool: "codex", baseTool: "opencode", profileDirty: true });
+    const late = reducer(state, defaults({ tool: "claude" }));
+    expect(late.data).toMatchObject({ tool: "codex", baseTool: "claude", profileDirty: true });
+    // Scratch restores the profile's agent, not the one the project left behind.
+    expect(reducer(late, set("scratch", true)).data.tool).toBe("claude");
+  });
+
   it("drops the manual choice with the profile reset that replaces it", () => {
     const picked = run(makeState({ tool: "opencode", baseTool: "opencode" }), set("tool", "opencode"));
     expect(picked.data.toolDirty).toBe(true);
@@ -514,6 +528,28 @@ describe("SEED_PROJECT_OVERRIDES agent", () => {
     // A hand-picked agent is not the project's to drop.
     const picked = reducer(project, set("tool", "opencode"));
     expect(reducer(picked, set("scratch", true)).data.tool).toBe("opencode");
+  });
+
+  it("clears the leaving agent's model and effort when scratch restores the fallback", () => {
+    const project = run(
+      makeState({ path: "/repo" }),
+      defaults({ tool: "claude" }),
+      seed("codex"),
+      set("agentModel", "codex-max"),
+      set("agentEffort", "high"),
+    );
+    expect(reducer(project, set("scratch", true)).data).toMatchObject({
+      tool: "claude",
+      agentModel: "",
+      agentEffort: "",
+    });
+    // The agent stays for a hand-picked one, so its model and effort do too.
+    const picked = run(project, set("tool", "opencode"), set("agentModel", "oc-model"), set("agentEffort", "low"));
+    expect(reducer(picked, set("scratch", true)).data).toMatchObject({
+      tool: "opencode",
+      agentModel: "oc-model",
+      agentEffort: "low",
+    });
   });
 });
 

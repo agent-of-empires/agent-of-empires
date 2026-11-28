@@ -217,7 +217,10 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
     });
     if (!data.sandboxDirty) next.sandboxEnabled = data.profileSandboxDefault;
     // The project's agent leaves with it; a hand-picked one stays.
-    if (!data.toolDirty) next.tool = data.baseTool || data.tool;
+    const scratchTool = data.baseTool || data.tool;
+    if (!data.toolDirty && scratchTool !== data.tool) {
+      Object.assign(next, { tool: scratchTool, agentModel: "", agentEffort: "" });
+    }
   }
   if (
     (field === "path" && typeof value === "string" && value.length > 0) ||
@@ -432,6 +435,8 @@ function reduce(state: WizardState, action: Action): WizardState {
             profileWorktreeDefault: action.worktreeEnabled,
             profileSandboxDefault: action.sandboxEnabled,
             profileToolDefault: action.tool,
+            // The fallback scratch restores follows the new default unless the user chose.
+            baseTool: state.data.toolDirty ? state.data.tool : action.tool || state.data.baseTool,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
             useWorkspace: state.data.workspaceDirty ? state.data.useWorkspace : action.workspaceByDefault,
             sandboxEnabled: state.data.sandboxDirty ? state.data.sandboxEnabled : resolvedSandbox,
