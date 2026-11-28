@@ -288,13 +288,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
+        self.publish_if_seq(
+            session_id,
+            &Event::Stopped {
+                reason: reason.to_string(),
+            },
+            expected_seq,
+        )
+    }
+
+    /// Publish any event conditionally, reporting success only after it is stored.
+    pub fn publish_if_seq(&self, session_id: &str, event: &Event, expected_seq: u64) -> bool {
         self.sink
             .queue_persisted(
                 session_id,
                 Arc::clone(&self.next_seqs),
-                AcpEventData::from_host(Event::Stopped {
-                    reason: reason.to_owned(),
-                }),
+                AcpEventData::from_host(event.clone()),
                 Some(expected_seq),
             )
             .wait()
@@ -418,7 +427,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             classified_as,
         } = prompt;
         // Before any await or store, so an idle stop cannot claim the worker in between.
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         let profile = match classified_as {
             Some(profile) => profile,
             None => self.profile_for_session(session_id, &text).await,
@@ -490,7 +499,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<crate::acp::state::DiffComment>,
         assembled_markdown: String,
     ) {
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
             Event::UserDiffCommentsPrompt {
@@ -1000,6 +1009,20 @@ mod tests {
             store.rate_limit_redelivery_streak("s-1").unwrap(),
             crate::acp::event_store::ControlKnowledge::Known(0)
         );
+    }
+
+    #[tokio::test]
+    async fn publish_if_seq_is_false_when_the_save_fails() {
+        struct FailingSink;
+        impl BroadcastSink for FailingSink {
+            fn publish(&self, _: &str, _: u64, _: &AcpEventData) {}
+            fn publish_persisted(&self, _: &str, _: u64, _: &AcpEventData) -> bool {
+                false
+            }
+        }
+        let sup = Supervisor::new(std::sync::Arc::new(FailingSink));
+        sup.hydrate_seqs([("s-1".to_string(), 7)]);
+        assert!(!sup.publish_stopped_if_seq("s-1", "rate_limited", 7));
     }
 
     #[tokio::test]

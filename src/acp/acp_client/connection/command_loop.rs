@@ -640,8 +640,8 @@ impl Session {
                         continue;
                     }
                     _ = idle_tick.tick() => {
-                        if self.pending_reset.is_none() {
-                            self.between_prompt_idle_tick().await;
+                        if self.pending_reset.is_none() && self.between_prompt_idle_tick().await {
+                            break;
                         }
                         continue;
                     }
@@ -864,13 +864,13 @@ impl Session {
         .unwrap_or(false)
     }
 
-    async fn between_prompt_idle_tick(&self) {
+    async fn between_prompt_idle_tick(&self) -> bool {
         if self.control.is_some() {
-            return;
+            return false;
         }
         let shared = &self.shared;
         if shared.connection_state.loss().is_some() {
-            return;
+            return false;
         }
         shared.expire_silent_subagents(now_ms()).await;
         let Some(cost_seen) = shared.between_prompt.take_idle_fire(
@@ -878,16 +878,24 @@ impl Session {
             shared.aoe.leases.working(now_ms()),
             shared.subagent_working(now_ms()),
         ) else {
-            return;
+            return false;
         };
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
+        // The limit arrives as agent text with no prompt error; park like the
+        // prompt path so the reaper can resume after the reset (#4373).
+        let lone_text_limit = shared
+            .agent_turn_text
+            .lock()
+            .expect("agent turn text mutex poisoned")
+            .take_rate_limit();
         let captured = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
             crate::time::Timestamp::now(),
-        );
+        )
+        .or(lone_text_limit);
         if let Some(info) = captured {
             if !shared.terminal_claim.claim_failed() {
-                return;
+                return false;
             }
             shared
                 .emit_while_available([
@@ -897,10 +905,10 @@ impl Session {
                     },
                 ])
                 .await;
-            return;
+            return true;
         }
         if !shared.terminal_claim.claim() {
-            return;
+            return false;
         }
         let reason = between_prompt_stop_reason(adopted, cost_seen);
         info!(
@@ -914,6 +922,7 @@ impl Session {
                 reason: reason.into(),
             }])
             .await;
+        false
     }
 
     /// The SDK owns original settlement even after the caller deadline.

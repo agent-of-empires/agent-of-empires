@@ -72,7 +72,14 @@ export async function launch(page: Page) {
     .click();
 }
 
-export const CLAUDE_AGENT = { name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" };
+export const CLAUDE_AGENT = {
+  name: "claude",
+  binary: "claude",
+  host_only: false,
+  installed: true,
+  install_hint: "",
+  acp_capable: true,
+};
 
 export const CREATION_TRUST_FINGERPRINT = {
   project_path: "/tmp/example",

@@ -20,9 +20,9 @@ use super::HookInstallTarget;
 fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<String> {
     let identity = event
         .identity_field
-        .map(|field| hook_command_session_id(target, field, event.publisher));
+        .map(|field| hook_command_session_id(target, field, event.publisher.as_deref()));
     let status = event.status.map(|status| {
-        let bound = event.publisher == Some("claude");
+        let bound = event.publisher.as_deref() == Some("claude");
         status_command_for_event(status, &event.waiting_tools, target, bound)
     });
     identity.into_iter().chain(status).collect()
@@ -87,55 +87,97 @@ pub fn install_hooks(
     events: impl AsRef<[ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
+    install_hooks_with(settings_path, events, target, false)
+}
+
+/// As [`install_hooks`], for a plugin-declared file: content that is not a JSON
+/// object is an error and the file is left as it was, where a built-in agent's
+/// torn file reads as empty.
+pub fn install_declared_hooks(
+    settings_path: &Path,
+    events: impl AsRef<[ResolvedHookEvent]>,
+    target: HookInstallTarget,
+) -> Result<()> {
+    install_hooks_with(settings_path, events, target, true)
+}
+
+fn install_hooks_with(
+    settings_path: &Path,
+    events: impl AsRef<[ResolvedHookEvent]>,
+    target: HookInstallTarget,
+    strict: bool,
+) -> Result<()> {
     if events.as_ref().is_empty() && !settings_path.exists() {
         return Ok(());
     }
     let policy = SymlinkPolicy::for_target(target);
-    with_config_lock_policy(settings_path, "json.lock", policy, || {
-        let content = policy.read(settings_path)?;
-        let mut settings = parse_json_or_empty(content, settings_path);
-        let before = settings.clone();
-
-        let root = settings
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
-        if !root.get("hooks").is_some_and(Value::is_object) {
-            root.insert("hooks".to_string(), serde_json::json!({}));
-        }
-        let settings_hooks = root
-            .get_mut("hooks")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| anyhow::anyhow!("hooks key is not a JSON object"))?;
-
-        for groups in settings_hooks.values_mut().filter_map(Value::as_array_mut) {
-            remove_aoe_entries(groups);
-        }
-        remove_empty_events(settings_hooks);
-        for (event_name, aoe_groups) in build_aoe_hooks(events.as_ref(), target) {
-            match settings_hooks
-                .get_mut(&event_name)
-                .and_then(Value::as_array_mut)
-            {
-                Some(existing) => {
-                    existing.extend(aoe_groups.as_array().into_iter().flatten().cloned())
+    // Locked on the file the write lands in, as the trust writers do, so two
+    // writers reaching one JSON file through different names still exclude each other.
+    with_config_lock_policy(
+        &policy.lock_path(settings_path)?,
+        "json.lock",
+        policy,
+        || {
+            let content = policy.read(settings_path)?;
+            let mut settings = if strict {
+                match content {
+                    None => serde_json::json!({}),
+                    Some(content) => serde_json::from_str(&content).with_context(|| {
+                        format!("{} is not valid JSON", settings_path.display())
+                    })?,
                 }
-                None => {
-                    settings_hooks.insert(event_name, aoe_groups);
+            } else {
+                parse_json_or_empty(content, settings_path)
+            };
+            let before = settings.clone();
+
+            let root = settings
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
+            if strict && root.get("hooks").is_some_and(|hooks| !hooks.is_object()) {
+                anyhow::bail!(
+                    "hooks key in {} is not a JSON object",
+                    settings_path.display()
+                );
+            }
+            if !root.get("hooks").is_some_and(Value::is_object) {
+                root.insert("hooks".to_string(), serde_json::json!({}));
+            }
+            let settings_hooks = root
+                .get_mut("hooks")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| anyhow::anyhow!("hooks key is not a JSON object"))?;
+
+            for groups in settings_hooks.values_mut().filter_map(Value::as_array_mut) {
+                remove_aoe_entries(groups);
+            }
+            remove_empty_events(settings_hooks);
+            for (event_name, aoe_groups) in build_aoe_hooks(events.as_ref(), target) {
+                match settings_hooks
+                    .get_mut(&event_name)
+                    .and_then(Value::as_array_mut)
+                {
+                    Some(existing) => {
+                        existing.extend(aoe_groups.as_array().into_iter().flatten().cloned())
+                    }
+                    None => {
+                        settings_hooks.insert(event_name, aoe_groups);
+                    }
                 }
             }
-        }
 
-        if settings == before {
-            log_unchanged(settings_path);
-            return Ok(());
-        }
-        policy.write(
-            settings_path,
-            serde_json::to_string_pretty(&settings)?.as_bytes(),
-        )?;
-        log_installed(settings_path);
-        Ok(())
-    })
+            if settings == before {
+                log_unchanged(settings_path);
+                return Ok(());
+            }
+            policy.write(
+                settings_path,
+                serde_json::to_string_pretty(&settings)?.as_bytes(),
+            )?;
+            log_installed(settings_path);
+            Ok(())
+        },
+    )
 }
 
 /// Remove AoE hooks from `settings.json`, dropping emptied events and an
@@ -144,39 +186,43 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
     if !settings_path.exists() {
         return Ok(false);
     }
-    with_config_lock(settings_path, "json.lock", || {
-        let content = std::fs::read_to_string(settings_path)?;
-        let mut settings: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+    with_config_lock(
+        &SymlinkPolicy::Follow.lock_path(settings_path)?,
+        "json.lock",
+        || {
+            let content = std::fs::read_to_string(settings_path)?;
+            let mut settings: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
             tracing::warn!(target: "hooks.uninstall", "Failed to parse {}: {}", settings_path.display(), e);
             serde_json::json!({})
         });
-        let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
-            return Ok(false);
-        };
+            let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+                return Ok(false);
+            };
 
-        let mut modified = false;
-        for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
-            let before = groups.len();
-            remove_aoe_entries(groups);
-            modified |= groups.len() != before;
-        }
-        if !modified {
-            return Ok(false);
-        }
-        remove_empty_events(hooks);
-        if hooks.is_empty() {
-            if let Some(obj) = settings.as_object_mut() {
-                obj.remove("hooks");
+            let mut modified = false;
+            for groups in hooks.values_mut().filter_map(Value::as_array_mut) {
+                let before = groups.len();
+                remove_aoe_entries(groups);
+                modified |= groups.len() != before;
             }
-        }
+            if !modified {
+                return Ok(false);
+            }
+            remove_empty_events(hooks);
+            if hooks.is_empty() {
+                if let Some(obj) = settings.as_object_mut() {
+                    obj.remove("hooks");
+                }
+            }
 
-        crate::session::atomic_write(
-            settings_path,
-            serde_json::to_string_pretty(&settings)?.as_bytes(),
-        )?;
-        log_removed(settings_path);
-        Ok(true)
-    })
+            crate::session::atomic_write(
+                settings_path,
+                serde_json::to_string_pretty(&settings)?.as_bytes(),
+            )?;
+            log_removed(settings_path);
+            Ok(true)
+        },
+    )
 }
 
 /// Drops AoE entries from flat `hooks.<event>[].command` arrays; returns whether any were removed.
@@ -485,7 +531,7 @@ mod tests {
             status: Some(HookStatus::Running),
             identity_field: Some(HookIdentityField::ConversationIdOrSessionId),
             waiting_tools: Vec::new(),
-            publisher: Some("agent"),
+            publisher: Some("agent".into()),
         }];
 
         install_cursor_hooks_with_events(&path, HookInstallTarget::Host, &events).unwrap();
@@ -508,5 +554,66 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn declared_install_fails_closed_where_the_built_in_one_resets() {
+        let tmp = TempDir::new().unwrap();
+        let events = agent_events("claude", &[]);
+        for (content, label) in [
+            ("{not json", "malformed"),
+            ("export PATH=/bin\n", "shell script"),
+            ("[]", "array root"),
+            (r#"{"hooks":[]}"#, "hooks not an object"),
+        ] {
+            let path = tmp.path().join(format!("{}.json", label.replace(' ', "-")));
+            std::fs::write(&path, content).unwrap();
+            assert!(
+                install_declared_hooks(&path, &events, HookInstallTarget::Host).is_err(),
+                "{label}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content, "{label}");
+        }
+        // The built-in installer keeps treating a torn file as empty.
+        let torn = tmp.path().join("torn.json");
+        std::fs::write(&torn, "{not json").unwrap();
+        install_hooks(&torn, &events, HookInstallTarget::Host).unwrap();
+        assert!(read_json(&torn)["hooks"].is_object());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_locks_the_file_a_symlink_resolves_to() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("dotfiles/settings.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "{}").unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        install_hooks(&link, agent_events("claude", &[]), HookInstallTarget::Host).unwrap();
+
+        assert!(read_json(&target)["hooks"].is_object());
+        assert!(target.with_extension("json.lock").exists());
+        assert!(!link.with_extension("json.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_locks_the_same_file_as_install() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("dotfiles/settings.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "{}").unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        install_hooks(&link, agent_events("claude", &[]), HookInstallTarget::Host).unwrap();
+        let lock = target.with_extension("json.lock");
+        std::fs::remove_file(&lock).unwrap();
+
+        assert!(uninstall_hooks(&link).unwrap());
+
+        assert!(lock.exists(), "uninstall locks what install locks");
+        assert!(!link.with_extension("json.lock").exists());
     }
 }

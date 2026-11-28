@@ -236,6 +236,7 @@ struct RetiringConstruction {
 /// Original connections and their publisher stay owned across request cancellation.
 pub(crate) struct RetirementResources {
     gate: Arc<tokio::sync::Mutex<()>>,
+    proxy_retry_gate: std::sync::OnceLock<tokio::sync::Mutex<()>>,
     clients: std::sync::Mutex<[Option<Arc<RetiringClient>>; 2]>,
     drain: std::sync::Mutex<Option<RetiringDrain>>,
     identity_scope: std::sync::Mutex<Option<Arc<RetiringIdentityScope>>>,
@@ -246,7 +247,7 @@ pub(crate) struct RetirementResources {
     retiring_construction: std::sync::Mutex<Option<RetiringConstruction>>,
     deferred_claimed: std::sync::atomic::AtomicBool,
     deferred_cancel: std::sync::OnceLock<tokio_util::sync::CancellationToken>,
-    projection: std::sync::OnceLock<Arc<crate::acp::event_sender::ProjectionState>>,
+    projection: std::sync::Mutex<Option<Arc<crate::acp::event_sender::ProjectionState>>>,
     #[cfg(test)]
     test_receive: std::sync::Mutex<Option<Arc<TestDrainReceiveControl>>>,
 }
@@ -255,6 +256,7 @@ impl Default for RetirementResources {
     fn default() -> Self {
         Self {
             gate: Arc::new(tokio::sync::Mutex::new(())),
+            proxy_retry_gate: std::sync::OnceLock::new(),
             clients: std::sync::Mutex::new([None, None]),
             drain: std::sync::Mutex::new(None),
             identity_scope: std::sync::Mutex::new(None),
@@ -265,7 +267,7 @@ impl Default for RetirementResources {
             retiring_construction: std::sync::Mutex::new(None),
             deferred_claimed: std::sync::atomic::AtomicBool::new(false),
             deferred_cancel: std::sync::OnceLock::new(),
-            projection: std::sync::OnceLock::new(),
+            projection: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_receive: std::sync::Mutex::new(None),
         }
@@ -273,6 +275,19 @@ impl Default for RetirementResources {
 }
 
 impl RetirementResources {
+    pub(super) fn prepare_proxy_retry(&self, config: &crate::acp::acp_client::SpawnConfig) {
+        if config.proxy.as_ref().is_some_and(|proxy| {
+            proxy.failure_policy == crate::acp::acp_client::ProxyFailurePolicy::NeutralBoot
+        }) {
+            self.proxy_retry_gate
+                .get_or_init(|| tokio::sync::Mutex::new(()));
+        }
+    }
+
+    pub(super) fn proxy_retry_gate(&self) -> Option<&tokio::sync::Mutex<()>> {
+        self.proxy_retry_gate.get()
+    }
+
     #[cfg(test)]
     pub(super) fn begin_test_receive(&self) -> TestDrainReceiveOwner {
         let control = Arc::new(TestDrainReceiveControl::default());
@@ -482,14 +497,27 @@ impl RetirementResources {
     pub(crate) fn establishment_projection(
         &self,
     ) -> Option<Arc<crate::acp::event_sender::ProjectionState>> {
-        self.projection.get().cloned()
+        lock_recover(&self.projection).clone()
     }
 
     pub(crate) fn retain_establishment_projection(
         &self,
         projection: Arc<crate::acp::event_sender::ProjectionState>,
     ) {
-        let _ = self.projection.set(projection);
+        lock_recover(&self.projection).get_or_insert(projection);
+    }
+
+    /// Called only after the exact failed runner has been retired and reaped.
+    pub(super) fn release_pre_rpc_projection(&self) -> bool {
+        let mut projection = lock_recover(&self.projection);
+        if projection
+            .as_ref()
+            .is_some_and(|projection| !projection.seal_unissued_proxy_failure())
+        {
+            return false;
+        }
+        *projection = None;
+        true
     }
 
     pub(super) fn record_client(&self, client: &Arc<AcpClient>, close: bool) {
@@ -765,6 +793,13 @@ pub(crate) struct RetirementTarget {
     pub(crate) journalled: bool,
 }
 impl RetirementTarget {
+    fn targets_retired_proxy(&self) -> bool {
+        self.lease
+            .as_ref()
+            .zip(self.identity)
+            .is_some_and(|(lease, identity)| lease.captured_retired_proxy(identity))
+    }
+
     pub(crate) fn claim_journal_ack(&mut self) {
         self.journalled = true;
         if let Some(lease) = &self.lease {
@@ -1496,6 +1531,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         fence: StopFence<'_>,
         cancel_pending: bool,
     ) -> Result<(), SupervisorError> {
+        // Serialize captured-stop cancellation with release of a failed proxy
+        // birth. A Stop on the constructor before birth still follows the lease.
+        let retry_gate = expected
+            .filter(|target| target.identity.is_some())
+            .and_then(|target| target.lease.as_ref())
+            .and_then(|lease| lease.retirement().proxy_retry_gate());
+        let captured_gate = match retry_gate {
+            Some(gate) => Some(gate.lock().await),
+            None => None,
+        };
+        if expected.is_some_and(RetirementTarget::targets_retired_proxy) {
+            return Err(SupervisorError::Superseded(session_id.into()));
+        }
         let _stop_request = if fence.observed.is_some() {
             None
         } else if cancel_pending {
@@ -1517,6 +1565,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .await,
             )
         };
+        drop(captured_gate);
         if let Some(lease) = self
             .accept_stop(
                 session_id,
@@ -1678,7 +1727,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         fence: &StopFence<'_>,
     ) -> Result<Option<Lease>, SupervisorError> {
         // Native revision/reload happens before either global map is acquired.
-        let _native = if let Some(observed) = fence.observed {
+        // Only idle reclamation depends on a persisted dormancy stamp.
+        let _native = if let (Some(observed), Some(stamp)) = (fence.observed, fence.dormancy_stamp)
+        {
             let scope = observed
                 .native_scope()
                 .ok()
@@ -1688,8 +1739,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 scope
                     .fence
                     .try_lock_observation_matching(|row| {
-                        row.idle_dormant_since == fence.dormancy_stamp
-                            && row.idle_dormant_since.is_some()
+                        row.idle_dormant_since == Some(stamp)
                             && row.queued_prompts.is_empty()
                             && row.ensure_startable().is_ok()
                             && row.is_structured()
@@ -1712,6 +1762,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return Err(SupervisorError::RegistryBusy),
         };
+        if expected.is_some_and(RetirementTarget::targets_retired_proxy) {
+            return Err(SupervisorError::Superseded(session_id.into()));
+        }
         let registry = worker_registry::try_registry_lock(session_id)
             .map_err(super::launch::registry_error)?
             .ok_or(SupervisorError::RegistryBusy)?;
@@ -1740,10 +1793,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         if let Some(observed) = fence.observed {
             let current = lifecycle.running(session_id).map(|(lease, _)| lease);
-            let activity = super::try_activity_seq(&self.next_seqs, session_id)
-                .ok_or(SupervisorError::RegistryBusy)?;
+            let activity_changed = if let Some(seq) = fence.activity_seq {
+                super::try_activity_seq(&self.next_seqs, session_id)
+                    .ok_or(SupervisorError::RegistryBusy)?
+                    != seq
+            } else {
+                false
+            };
             if current.as_ref() != Some(observed)
-                || fence.activity_seq != Some(activity)
+                || activity_changed
                 || fence.admissions != Some(observed.admissions())
                 || registry
                     .stop()
@@ -2255,6 +2313,27 @@ impl<S: BroadcastSink> Supervisor<S> {
             expected,
             fence,
             true,
+        )
+        .await
+    }
+
+    /// Stop the observed epoch of a worker whose turn ended on a usage limit;
+    /// its closing `Stopped` is `rate_limited`, so the park stands.
+    pub(crate) async fn shutdown_rate_limited(
+        &self,
+        session_id: &str,
+        observed: (&Lease, u64),
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(
+            session_id,
+            "rate_limited",
+            false,
+            None,
+            StopFence {
+                observed: Some(observed.0),
+                admissions: Some(observed.1),
+                ..StopFence::default()
+            },
         )
         .await
     }

@@ -11,6 +11,7 @@ import {
 } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
+import { IntegrationLostBanner } from "./IntegrationLostBanner";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
 import { BUTTON_SECONDARY_SM, BUTTON_WARNING_SM } from "../../lib/surfaces";
 import { Spinner } from "../Dialog";
@@ -81,7 +82,7 @@ export function SessionBanners({
         workerStopping: acpWorkerState === "stopping",
       });
   const healthy =
-    !reason &&
+     !reason && !state.integrationLost &&
     !state.workerStopped &&
     !state.workerRestarting &&
     !state.connectionUnavailable &&
@@ -140,6 +141,7 @@ export function SessionBanners({
             Native input readiness is unconfirmed. The transcript remains available.
           </div>
         )}
+      {state.integrationLost && <IntegrationLostBanner reason={state.integrationLost} />}
       {variant === "trashed" && <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />}
       {variant === "archived" && <ArchivedWorkerStoppedBanner sessionId={sessionId} />}
       {variant === "snoozed" && snoozedUntil && (

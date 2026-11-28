@@ -354,7 +354,10 @@ impl ControlProjection {
         }
         if row.effect == ControlEffect::Indeterminate {
             match row.kind {
-                ControlKind::Quota => self.park = Indeterminate,
+                ControlKind::Quota => {
+                    self.park = Indeterminate;
+                    self.interrupted_agent = Indeterminate;
+                }
                 ControlKind::Diagnostic | ControlKind::Stopped(_) => {
                     self.park = Indeterminate;
                     self.main_open = Indeterminate;
@@ -425,6 +428,13 @@ impl ControlProjection {
                     cap_reached: false,
                     last_resume_attempt_ms: None,
                 }));
+                // A qualified quota may be the last durable frame before a crash.
+                // It describes the work that was interrupted, not a completed stop.
+                self.interrupted_agent = match (self.main_open, self.operation_prompt) {
+                    (Known(true), Known(None)) => Known(self.agent_work),
+                    (Known(false), _) | (_, Known(Some(_))) => Known(false),
+                    _ => Indeterminate,
+                };
             }
             ControlKind::Diagnostic => {
                 if row.effect == ControlEffect::Refusal
@@ -471,6 +481,9 @@ impl ControlProjection {
                     self.park = Known(None);
                     self.interrupted_prompt = Known(None);
                     self.interrupted_agent = Known(false);
+                    if self.latest_prompt == self.operation_prompt {
+                        self.latest_prompt = Known(None);
+                    }
                 }
                 self.main_open = Known(false);
                 self.agent_open = Known(false);

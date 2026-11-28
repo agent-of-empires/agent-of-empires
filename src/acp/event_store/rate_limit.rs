@@ -472,6 +472,34 @@ mod tests {
     }
 
     #[test]
+    fn qualified_quota_can_identify_unprompted_work_before_the_stop() {
+        let (_tmp, store) = open_store(0);
+        record_projection(
+            &store,
+            "s",
+            1,
+            [
+                user_prompt("completed"),
+                Event::ThinkingStarted,
+                stopped("end_turn"),
+                Event::ThinkingStarted,
+                agent_chunk("working"),
+                rate_limit_event(60),
+            ],
+        );
+        assert_eq!(
+            store.rate_limit_interrupted_agent_turn("s").unwrap(),
+            Known(true)
+        );
+        assert_eq!(store.has_in_flight_turn("s").unwrap(), Known(true));
+        record_projection(&store, "s", 7, [stopped("end_turn")]);
+        assert_eq!(
+            store.rate_limit_interrupted_agent_turn("s").unwrap(),
+            Known(false)
+        );
+    }
+
+    #[test]
     fn latest_quota_is_result_option_and_preserves_recording_time() {
         let (_tmp, store) = open_store(0);
         let before = Timestamp::now().as_millis();

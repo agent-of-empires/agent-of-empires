@@ -242,6 +242,14 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
 /// Symlink-safe via `dir_guard::remove_instance_dir` (`unlinkat` walk).
 pub fn cleanup_hook_status_dir(instance_id: &str) {
+    if let Ok(staged) = super::declared_sandbox_dir(instance_id) {
+        if let Err(e) = std::fs::remove_dir_all(&staged) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(target: "hooks.status",
+                    "Failed to remove staged sandbox config {}: {}", staged.display(), e);
+            }
+        }
+    }
     if let Err(e) = dir_guard::remove_instance_dir(instance_id) {
         tracing::warn!(target: "hooks.status",
             "Failed to cleanup hook status dir for {}: {}", instance_id, e);

@@ -77,6 +77,10 @@ pub(super) struct IngressAuth {
     pub(super) current_scope: Option<Arc<NativeRequestContext>>,
 }
 
+// Shares the adapter stream: a forged marker only misorders that adapter's own
+// transcript, within the adapter's trust domain.
+pub(super) const ADAPTER_FRAMES_SHED_METHOD: &str = "_aoe/adapter_frames_shed";
+
 /// Every agent-side notification the connection admits, on one handler.
 ///
 /// The SDK renders its whole handler chain per inbound message
@@ -100,6 +104,9 @@ pub(super) enum SessionIngressNotification {
     AutonomousSnapshot(serde_json::Value),
     /// Raw params retain trusted frame metadata until transport-aware decode.
     AuthStatus(serde_json::Value),
+    /// Runner-shed adapter frames, injected where they were dropped so their
+    /// numbers credit in stream order.
+    AdapterFramesShed(u64),
 }
 
 /// Params of `_auth/status_update`. Unknown fields, including the upstream
@@ -119,6 +126,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             || method == AUTH_STATUS_UPDATE_METHOD
             || crate::acp::control_protocol::NativeAutonomousPhase::from_method(method).is_some()
             || method == crate::acp::control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
+            || method == ADAPTER_FRAMES_SHED_METHOD
     }
 
     fn method(&self) -> &str {
@@ -132,6 +140,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::AutonomousSnapshot(_) => {
                 crate::acp::control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
             }
+            Self::AdapterFramesShed(_) => ADAPTER_FRAMES_SHED_METHOD,
         }
     }
 
@@ -144,6 +153,9 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::AuthStatus(params) => UntypedMessage::new(self.method(), params),
             Self::Autonomous(_, params) => UntypedMessage::new(self.method(), params),
             Self::AutonomousSnapshot(params) => UntypedMessage::new(self.method(), params),
+            Self::AdapterFramesShed(count) => {
+                UntypedMessage::new(self.method(), serde_json::json!({ "count": count }))
+            }
         }
     }
 
@@ -176,6 +188,12 @@ impl JsonRpcMessage for SessionIngressNotification {
             crate::acp::control_protocol::NativeAutonomousPhase::from_method(method)
         {
             return Ok(Self::Autonomous(phase, params.clone()));
+        }
+        if method == ADAPTER_FRAMES_SHED_METHOD {
+            let count = params["count"]
+                .as_u64()
+                .ok_or_else(agent_client_protocol::Error::invalid_params)?;
+            return Ok(Self::AdapterFramesShed(count));
         }
         if !SessionNotification::matches_method(method) {
             return Err(agent_client_protocol::Error::method_not_found());
@@ -704,6 +722,7 @@ pub(super) enum PendingIngress {
     PromptCompleted(Box<AdoptedPromptCompletion>),
     NativeLost,
     Replayed(SessionReplayed),
+    AdapterFramesShed(u64),
 }
 
 /// Count encoded pending payload without retaining a second copy.
@@ -1265,7 +1284,6 @@ impl SessionIngress {
         };
         // Wire order: an announcement admits the child frames after it.
         let mut updates = pending;
-        let mut discarded = 0;
         updates.retain_mut(|entry| match entry {
             PendingIngress::Update(update) => {
                 let captured_source = update.original_source;
@@ -1306,10 +1324,10 @@ impl SessionIngress {
                 }
                 if routed || update.evidence.physical_source.is_some() {
                     true
+                } else if is_adapter_frame(&update.notification) {
+                    *entry = PendingIngress::AdapterFramesShed(1);
+                    true
                 } else {
-                    if is_adapter_frame(&update.notification) {
-                        discarded += 1;
-                    }
                     false
                 }
             }
@@ -1317,9 +1335,9 @@ impl SessionIngress {
             | PendingIngress::NativeLost
             | PendingIngress::Replayed(_)
             | PendingIngress::Autonomous { .. }
-            | PendingIngress::Auth(_) => true,
+            | PendingIngress::Auth(_)
+            | PendingIngress::AdapterFramesShed(_) => true,
         });
-        state.discarded_adapter_frames += discarded;
         state.current = id;
         state.children = children;
         drop(state);
@@ -1346,6 +1364,7 @@ impl SessionIngress {
             PendingIngress::NativeLost => MAX_NATIVE_LOSS_FRAME_BYTES,
             PendingIngress::Replayed(_) => MAX_NATIVE_LOSS_FRAME_BYTES,
             PendingIngress::Auth(_) => MAX_PENDING_BYTES,
+            PendingIngress::AdapterFramesShed(_) => MAX_NATIVE_LOSS_FRAME_BYTES,
             PendingIngress::Autonomous { .. } => MAX_PENDING_BYTES,
             PendingIngress::Update(_) => unreachable!("updates use scoped admission"),
         };
@@ -1648,10 +1667,17 @@ impl SessionIngress {
             Ok(Some(notification))
         } else {
             if is_adapter_frame(&notification.notification) {
-                state.discarded_adapter_frames += 1;
+                state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(1);
             }
             Ok(None)
         }
+    }
+
+    /// Frames the runner numbered before this connection received any: they
+    /// count like frames dropped here, ahead of every frame that follows.
+    pub(super) fn skip_adapter_frames(&self, n: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(n);
     }
 
     pub(super) fn take_discarded_adapter_frames(&self) -> u64 {
@@ -2230,18 +2256,48 @@ mod tests {
             chunk.meta = anchored.as_object().cloned();
         }
         assert!(ingress.route(tailer, None).unwrap().is_none());
-        ingress
-            .finish(Some(SessionId::from("new".to_string())))
-            .unwrap();
-        assert_eq!(
-            ingress.take_discarded_adapter_frames(),
-            1,
-            "tailer frames take no number"
-        );
+        let replay = ingress.finish(Some(SessionId::from("new"))).unwrap();
+        assert!(matches!(
+            replay.as_slice(),
+            [PendingIngress::AdapterFramesShed(1)]
+        ));
+        assert_eq!(ingress.take_discarded_adapter_frames(), 0);
         // A late old-session frame is dropped as well.
         assert!(ingress.route(notif("old"), None).unwrap().is_none());
         assert_eq!(ingress.take_discarded_adapter_frames(), 1);
         assert_eq!(ingress.take_discarded_adapter_frames(), 0, "drained");
+    }
+
+    #[test]
+    fn runner_reported_adapter_frames_add_to_dropped_ones() {
+        let ingress = SessionIngress::new(Some(SessionId::from("cur".to_string())));
+        ingress.skip_adapter_frames(2);
+        assert!(ingress.route(notif("other"), None).unwrap().is_none());
+        assert_eq!(ingress.take_discarded_adapter_frames(), 3);
+    }
+
+    #[test]
+    fn shed_marker_keeps_its_position_in_bootstrap_replay() {
+        let ingress = SessionIngress::default();
+        ingress.begin();
+        assert!(ingress.route(notif("s"), None).unwrap().is_none());
+        assert!(ingress
+            .marker(PendingIngress::AdapterFramesShed(3))
+            .unwrap()
+            .is_none());
+        assert!(ingress.route(notif("s"), None).unwrap().is_none());
+        ingress.skip_adapter_frames(2);
+
+        assert_eq!(ingress.take_discarded_adapter_frames(), 2);
+        let replay = ingress.finish(Some(SessionId::from("s"))).unwrap();
+        assert!(matches!(
+            replay.as_slice(),
+            [
+                PendingIngress::Update(_),
+                PendingIngress::AdapterFramesShed(3),
+                PendingIngress::Update(_),
+            ]
+        ));
     }
 
     #[test]
@@ -2629,11 +2685,12 @@ mod tests {
         let replay = ingress.finish(Some(root.clone())).unwrap();
         let ids: Vec<_> = replay
             .iter()
-            .map(|entry| match entry {
+            .filter_map(|entry| match entry {
                 PendingIngress::Update(notification) => {
-                    notification.notification.session_id.0.to_string()
+                    Some(notification.notification.session_id.0.to_string())
                 }
-                _ => panic!("child replay contains only session updates"),
+                PendingIngress::AdapterFramesShed(1) => None,
+                _ => panic!("unexpected child replay marker"),
             })
             .collect();
         assert_eq!(ids, ["root", "c2", "c1"]);

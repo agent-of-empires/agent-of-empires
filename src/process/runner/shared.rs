@@ -4,6 +4,7 @@
 use super::jsonrpc::{
     parse_agent_call_outcome, parse_native_message, parse_prompt_outcome, NativeMessage,
 };
+use crate::acp::aoe_meta;
 use crate::acp::control_protocol::{
     self, ControlBody, HandshakeFailure, HandshakeFailureOrigin, NativeChannelAvailability,
     NativeChannelLossCause, NativeChannelLostMarker, NativeReplayDelivery, PromptCompletedMarker,
@@ -431,6 +432,8 @@ impl NativeSessionCache {
                 original_delivery,
                 delivery: NativeReplayDelivery::original(self.receipt.replay),
                 local_failure: self.local_failure.clone(),
+                // Filled in under the queue lock at admission.
+                adapter_frames: 0,
             },
             outcome => ControlBody::EstablishmentFailed {
                 receipt: Arc::clone(&self.receipt),
@@ -463,6 +466,8 @@ pub(super) enum QueuedKind {
     AgentReply,
     // Not `Notify`: shedding it would leave the daemon's session/load waiting.
     SessionReplayed,
+    /// Stands for adapter frames shed from the queue; never itself shed.
+    AdapterFramesShed,
     NativeLoss,
     AutonomousLifecycle,
 }
@@ -481,6 +486,9 @@ pub(super) struct QueuedControl {
     pub(super) kind: QueuedKind,
     pub(super) wire: Arc<[u8]>,
     replay: Option<control_protocol::NativeReplayFrame>,
+    /// Adapter frames the daemon numbers on receiving this entry: 1 for an
+    /// unanchored `session/update`, the shed count for a marker.
+    pub(super) adapter_frames: u64,
 }
 
 #[derive(Default)]
@@ -494,6 +502,10 @@ pub(super) struct ControlChannel {
     pub(super) next_entry_id: u64,
     pub(super) in_flight: Option<u64>,
     pub(super) last_prompt_completion: Option<Arc<[u8]>>,
+    /// Every adapter frame observed, including those represented by shed markers.
+    pub(super) adapter_frames: u64,
+    /// Updates and shed counts already written to the current attachment.
+    attachment_adapter_frames: u64,
     prompt_head: Option<control_protocol::NativePromptHead>,
     native_loss: Option<QueuedControl>,
     native_loss_delivered: Option<u64>,
@@ -508,6 +520,10 @@ struct NativeReplayAccount {
     open: bool,
     lost: bool,
 }
+
+// Leave room for a tail marker if a full queue cannot accept an adapter update.
+const MAX_SHED_MARKER_BYTES: usize =
+    4 + br#"{"kind":"adapter_frames_shed","count":18446744073709551615}"#.len();
 
 impl ControlChannel {
     fn replay_delivery(&self, receipt: &NativeEstablishmentReceipt) -> NativeReplayDelivery {
@@ -545,6 +561,33 @@ impl ControlChannel {
         delivery
     }
 
+    fn refresh_handshake_accounting(&self, body: &mut ControlBody) -> bool {
+        let (receipt, delivery, baseline_changed) = match body {
+            ControlBody::SessionReady {
+                receipt,
+                delivery,
+                adapter_frames,
+                ..
+            } => {
+                let baseline = self.unreplayed_adapter_frames();
+                let changed = *adapter_frames != baseline;
+                *adapter_frames = baseline;
+                (receipt, delivery, changed)
+            }
+            ControlBody::EstablishmentFailed {
+                receipt, delivery, ..
+            } => (receipt, delivery, false),
+            _ => return false,
+        };
+        if !receipt.replay.closed {
+            return baseline_changed;
+        }
+        let replay = self.replay_delivery(receipt);
+        let changed = *delivery != replay;
+        *delivery = replay;
+        changed || baseline_changed
+    }
+
     pub(super) fn remove_at(&mut self, index: usize) -> QueuedControl {
         let frame = self.queue.remove(index).expect("queue index exists");
         self.queued_bytes = self.queued_bytes.saturating_sub(frame.wire.len());
@@ -553,12 +596,13 @@ impl ControlChannel {
 
     pub(super) fn make_room(&mut self, kind: QueuedKind, incoming_bytes: usize) -> bool {
         let management = matches!(kind, QueuedKind::Handshake | QueuedKind::SessionReplayed);
-        let frame_limit = control_protocol::MAX_CONTROL_QUEUE_FRAMES
+        let frame_limit = control_protocol::MAX_CONTROL_QUEUE_FRAMES - 1
             + if management {
                 control_protocol::CONTROL_BOOTSTRAP_RESERVED_FRAMES
             } else {
                 0
             };
+        let mut scan_from = 0;
         loop {
             let frames_full = self.queue.len() >= frame_limit;
             let bytes_full = self
@@ -571,7 +615,8 @@ impl ControlChannel {
                 )
                 .saturating_add(self.autonomous_bytes)
                 > control_protocol::MAX_CONTROL_QUEUE_BYTES
-                    - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES;
+                    - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
+                    - MAX_SHED_MARKER_BYTES;
             if !frames_full && !bytes_full {
                 return true;
             }
@@ -582,11 +627,13 @@ impl ControlChannel {
             if management && frames_full && !bytes_full {
                 return false;
             }
-            let Some(index) = self.queue.iter().position(|frame| {
+            let Some(relative) = self.queue.iter().skip(scan_from).position(|frame| {
                 frame.kind == QueuedKind::Notify && self.in_flight != Some(frame.id)
             }) else {
                 return false;
             };
+            let index = scan_from + relative;
+            scan_from = index;
             let removed = self.remove_at(index);
             if let Some(frame) = removed.replay {
                 if let Some(replay) = self
@@ -597,11 +644,77 @@ impl ControlChannel {
                     replay.lost = true;
                 }
             }
+            if removed.adapter_frames != 0 {
+                self.record_shed(index, removed.scope, removed.adapter_frames);
+            }
         }
     }
 
+    /// Credit shed adapter frames to a marker at `index`, where they sat, so
+    /// the daemon counts them in order.
+    fn record_shed(&mut self, index: usize, scope: DeliveryScope, count: u64) {
+        let mergeable = |this: &Self, i: usize| {
+            this.queue.get(i).is_some_and(|f| {
+                f.kind == QueuedKind::AdapterFramesShed
+                    && f.scope == scope
+                    && this.in_flight != Some(f.id)
+            })
+        };
+        let Some(target) = index
+            .checked_sub(1)
+            .filter(|&i| mergeable(self, i))
+            .or_else(|| mergeable(self, index).then_some(index))
+        else {
+            let id = self.next_entry_id;
+            self.next_entry_id = self.next_entry_id.wrapping_add(1);
+            let wire = shed_marker_wire(count);
+            self.queued_bytes += wire.len();
+            self.queue.insert(
+                index,
+                QueuedControl {
+                    id,
+                    scope,
+                    kind: QueuedKind::AdapterFramesShed,
+                    replay: None,
+                    wire,
+                    adapter_frames: count,
+                },
+            );
+            return;
+        };
+        let marker = &mut self.queue[target];
+        marker.adapter_frames += count;
+        let wire = shed_marker_wire(marker.adapter_frames);
+        self.queued_bytes = self.queued_bytes - marker.wire.len() + wire.len();
+        marker.wire = wire;
+    }
+
+    fn count_adapter_frame(&mut self) {
+        self.adapter_frames += 1;
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("AOE_E2E_ADAPTER_FRAMES_FILE") {
+            let staged = std::path::Path::new(&path).with_extension("staged");
+            std::fs::write(&staged, self.adapter_frames.to_string())
+                .and_then(|()| std::fs::rename(&staged, &path))
+                .expect("publish e2e adapter frame count");
+        }
+    }
+
+    /// Credit an adapter frame dropped before admission, after the tail.
+    fn record_dropped_adapter_frame(&mut self, scope: DeliveryScope) {
+        self.count_adapter_frame();
+        self.record_shed(self.queue.len(), scope, 1);
+    }
+
+    /// Adapter frames absent from this attachment's stream: exclude queued
+    /// entries and anything it has already read before SessionReady.
+    pub(super) fn unreplayed_adapter_frames(&self) -> u64 {
+        let queued: u64 = self.queue.iter().map(|f| f.adapter_frames).sum();
+        self.adapter_frames - queued - self.attachment_adapter_frames
+    }
+
     pub(super) fn push(&mut self, scope: DeliveryScope, kind: QueuedKind, wire: Arc<[u8]>) {
-        self.push_projected(scope, kind, wire, None);
+        self.push_projected(scope, kind, wire, None, 0);
     }
 
     fn push_projected(
@@ -610,6 +723,7 @@ impl ControlChannel {
         kind: QueuedKind,
         wire: Arc<[u8]>,
         replay: Option<control_protocol::NativeReplayFrame>,
+        adapter_frames: u64,
     ) {
         let id = self.next_entry_id;
         self.next_entry_id = self.next_entry_id.wrapping_add(1);
@@ -620,6 +734,7 @@ impl ControlChannel {
             kind,
             wire,
             replay,
+            adapter_frames,
         });
     }
 
@@ -634,9 +749,16 @@ impl ControlChannel {
         }
         if self.active_attachment == Some(attachment_id) {
             self.active_attachment = None;
+            self.attachment_adapter_frames = 0;
         }
         self.in_flight = None;
     }
+}
+
+fn shed_marker_wire(count: u64) -> Arc<[u8]> {
+    control_protocol::encode_frame(&ControlBody::AdapterFramesShed { count })
+        .expect("a count encodes")
+        .into()
 }
 
 /// Gets a semantic `cancelled` outcome on disconnect; other methods get a JSON-RPC error.
@@ -1344,6 +1466,7 @@ impl RunnerShared {
             if SessionReplayed::matches_method(&method)
                 || PromptCompletedMarker::matches_method(&method)
                 || NativeChannelLostMarker::matches_method(&method)
+                || method == "_aoe/adapter_frames_shed"
                 || method == control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
             {
                 return;
@@ -1731,24 +1854,55 @@ impl RunnerShared {
         mut body: ControlBody,
         publication: NativePublication,
     ) -> bool {
+        self.enqueue_native_body(scope, kind, &mut body, publication)
+            .await
+    }
+
+    async fn enqueue_native_body(
+        &self,
+        scope: DeliveryScope,
+        kind: QueuedKind,
+        body: &mut ControlBody,
+        publication: NativePublication,
+    ) -> bool {
         if publication == NativePublication::Work && self.native_loss().is_some() {
             return false;
         }
-        let announces_session = matches!(&body,
+        let announces_session = matches!(&*body,
             ControlBody::SessionReady { receipt, .. }
             | ControlBody::EstablishmentFailed { receipt, .. } if receipt.replay.closed);
-        let replay = match &body {
+        let replay = match &*body {
             ControlBody::Notify { replay, .. } => *replay,
             _ => None,
         };
-        let mut wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
+        let adapter_frame = matches!(&*body, ControlBody::Notify { method, params, .. }
+            if method == "session/update"
+                && aoe_meta::session_update_of(params).is_some_and(|u| !aoe_meta::is_anchored(u)));
+        if matches!(
+            body,
+            ControlBody::SessionReady { .. } | ControlBody::EstablishmentFailed { .. }
+        ) {
+            self.control.lock().await.refresh_handshake_accounting(body);
+        }
+        let mut wire: Arc<[u8]> = match control_protocol::encode_frame(body) {
             Ok(frame) => frame.into(),
             Err(error) => {
                 warn!(target: "acp.runner", %error, "dropping unrepresentable control frame");
+                if adapter_frame {
+                    let mut channel = self.control.lock().await;
+                    if matches!(scope, DeliveryScope::Persistent)
+                        || channel
+                            .active_attachment
+                            .is_some_and(|id| scope == DeliveryScope::Attachment(id))
+                    {
+                        channel.record_dropped_adapter_frame(scope);
+                        self.control_wake.notify_one();
+                    }
+                }
                 return false;
             }
         };
-        let lifecycle = match &body {
+        let lifecycle = match &*body {
             ControlBody::Notify {
                 params, evidence, ..
             } if kind == QueuedKind::AutonomousLifecycle => {
@@ -1779,6 +1933,7 @@ impl RunnerShared {
                     if bytes.saturating_add(wire.len())
                         > control_protocol::MAX_CONTROL_QUEUE_BYTES
                             - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
+                            - MAX_SHED_MARKER_BYTES
                     {
                         self.observe_native_loss(NativeChannelLossCause::ProtocolEnded);
                         return false;
@@ -1805,26 +1960,8 @@ impl RunnerShared {
                     }
                 }
                 let native = self.native_channel.lock().expect("native channel lock");
-                if let Some(cause) = native.loss {
-                    if publication == NativePublication::Work {
-                        return false;
-                    }
-                    if let ControlBody::SessionReady { native_channel, .. } = &mut body {
-                        let unavailable = NativeChannelAvailability::Unavailable { cause };
-                        if *native_channel != unavailable {
-                            *native_channel = unavailable;
-                            drop(native);
-                            drop(channel);
-                            // Only a concurrent loss changes an already encoded
-                            // receipt. Do not serialize a large result under the
-                            // synchronous admission lock.
-                            wire = match control_protocol::encode_frame(&body) {
-                                Ok(frame) => frame.into(),
-                                Err(_) => return false,
-                            };
-                            continue;
-                        }
-                    }
+                if native.loss.is_some() && publication == NativePublication::Work {
+                    return false;
                 }
                 let retain = lifecycle.as_ref().is_some_and(|frame| {
                     native.loss.is_none()
@@ -1839,7 +1976,37 @@ impl RunnerShared {
                         bytes.saturating_sub(channel.autonomous_bytes)
                     });
                 if channel.make_room(kind, wire.len().saturating_add(retained_delta)) {
-                    channel.push_projected(scope, kind, Arc::clone(&wire), replay);
+                    // Shedding preserves the proxy baseline through ordered
+                    // markers, but can change the independently numbered native replay.
+                    let mut reencode = channel.refresh_handshake_accounting(body);
+                    if let ControlBody::SessionReady { native_channel, .. } = body {
+                        if let Some(cause) = native.loss {
+                            let unavailable = NativeChannelAvailability::Unavailable { cause };
+                            reencode |= *native_channel != unavailable;
+                            *native_channel = unavailable;
+                        }
+                    }
+                    if reencode {
+                        drop(native);
+                        drop(channel);
+                        // Queue state can change while encoding. Recheck it
+                        // before admitting the frame with the new wire length.
+                        wire = match control_protocol::encode_frame(body) {
+                            Ok(frame) => frame.into(),
+                            Err(_) => return false,
+                        };
+                        continue;
+                    }
+                    if adapter_frame {
+                        channel.count_adapter_frame();
+                    }
+                    channel.push_projected(
+                        scope,
+                        kind,
+                        Arc::clone(&wire),
+                        replay,
+                        u64::from(adapter_frame),
+                    );
                     if let Some((snapshot, bytes)) = retained.as_ref().filter(|_| retain) {
                         channel.autonomous = Some(Arc::clone(snapshot));
                         channel.autonomous_bytes = *bytes;
@@ -1852,7 +2019,7 @@ impl RunnerShared {
                     if announces_session {
                         channel.session_announced = true;
                         channel.callbacks_announced =
-                            matches!(&body, ControlBody::SessionReady { .. });
+                            matches!(body, ControlBody::SessionReady { .. });
                     }
                     drop(native);
                     #[cfg(debug_assertions)]
@@ -1878,6 +2045,10 @@ impl RunnerShared {
                         && channel.session_announced
                         && !channel.queue.is_empty())
                 {
+                    if adapter_frame {
+                        channel.record_dropped_adapter_frame(scope);
+                        self.control_wake.notify_one();
+                    }
                     return false;
                 }
             }
@@ -1890,35 +2061,9 @@ impl RunnerShared {
         &self,
         attachment_id: u64,
         mut frame: ControlBody,
-        established: bool,
         before_loss: bool,
     ) {
         let scope = DeliveryScope::Attachment(attachment_id);
-        // Freeze the outstanding original range before either awaited enqueue.
-        // In-flight entries remain in this queue until a successful socket flush.
-        let replay = match &mut frame {
-            ControlBody::SessionReady {
-                receipt, delivery, ..
-            } if established && receipt.replay.closed => {
-                *delivery = self.control.lock().await.replay_delivery(receipt);
-                Some(SessionReplayed {
-                    attempt_id: receipt.attempt.id,
-                    closure: receipt.replay,
-                    delivery: *delivery,
-                })
-            }
-            ControlBody::EstablishmentFailed {
-                receipt, delivery, ..
-            } if receipt.replay.closed => {
-                *delivery = self.control.lock().await.replay_delivery(receipt);
-                Some(SessionReplayed {
-                    attempt_id: receipt.attempt.id,
-                    closure: receipt.replay,
-                    delivery: *delivery,
-                })
-            }
-            _ => None,
-        };
         let publication = if before_loss {
             NativePublication::Dispatch
         } else if matches!(
@@ -1932,10 +2077,25 @@ impl RunnerShared {
             NativePublication::Work
         };
         if self
-            .enqueue_native(scope, QueuedKind::Handshake, frame, publication)
+            .enqueue_native_body(scope, QueuedKind::Handshake, &mut frame, publication)
             .await
         {
-            if let Some(marker) = replay {
+            // Mirror the replay range frozen at the reply's actual admission.
+            if let ControlBody::SessionReady {
+                receipt, delivery, ..
+            }
+            | ControlBody::EstablishmentFailed {
+                receipt, delivery, ..
+            } = frame
+            {
+                if !receipt.replay.closed {
+                    return;
+                }
+                let marker = SessionReplayed {
+                    attempt_id: receipt.attempt.id,
+                    closure: receipt.replay,
+                    delivery,
+                };
                 self.enqueue_native(
                     scope,
                     QueuedKind::SessionReplayed,
@@ -1962,6 +2122,7 @@ impl RunnerShared {
                 .expect("native channel lock")
                 .active_attachment = Some(attachment_id);
             channel.active_attachment = Some(attachment_id);
+            channel.attachment_adapter_frames = 0;
             channel.session_announced = false;
             channel.callbacks_announced = false;
         }
@@ -2028,6 +2189,7 @@ impl RunnerShared {
                     kind: QueuedKind::NativeLoss,
                     wire,
                     replay: None,
+                    adapter_frames: 0,
                 });
             }
             // Management replies retain their routing priority. Buffered native
@@ -2094,7 +2256,8 @@ impl RunnerShared {
                 {
                     channel.last_prompt_completion = Some(Arc::clone(&channel.queue[index].wire));
                 }
-                channel.remove_at(index);
+                let written = channel.remove_at(index);
+                channel.attachment_adapter_frames += written.adapter_frames;
             }
         }
         if channel.in_flight == Some(entry_id) {
@@ -2756,9 +2919,7 @@ impl RunnerShared {
                     )
                     .into_frame(&method)
                 };
-                let established = matches!(frame, ControlBody::SessionReady { .. });
-                self.enqueue_handshake(attachment_id, frame, established, false)
-                    .await;
+                self.enqueue_handshake(attachment_id, frame, false).await;
                 return;
             }
             if cached.result.is_none() {
@@ -2769,7 +2930,6 @@ impl RunnerShared {
                         transport_error("the original native establishment is still unresolved"),
                     )
                     .into_frame(&method),
-                    false,
                     false,
                 )
                 .await;
@@ -2784,7 +2944,6 @@ impl RunnerShared {
                     transport_error("native establishment request has no matching authority"),
                 )
                 .into_frame(&method),
-                false,
                 false,
             )
             .await;
@@ -3049,7 +3208,6 @@ impl RunnerShared {
                 )
                 .into_frame(&method),
                 false,
-                false,
             )
             .await;
             return;
@@ -3149,7 +3307,7 @@ impl RunnerShared {
                     HandshakeFailureOrigin::LocalTransport,
                 ),
             };
-            let (frame, established) = {
+            let frame = {
                 let mut handshake = shared.handshake.lock().await;
                 let cached = handshake
                     .session
@@ -3182,18 +3340,11 @@ impl RunnerShared {
                         )));
                     }
                 }
-                let frame = cached.frame(shared.native_availability(), true);
-                let established = matches!(frame, ControlBody::SessionReady { .. });
-                (frame, established)
+                cached.frame(shared.native_availability(), true)
             };
             shared.control_space.notify_waiters();
             shared
-                .enqueue_handshake(
-                    attachment_id,
-                    frame,
-                    established,
-                    dispatch_release.is_some(),
-                )
+                .enqueue_handshake(attachment_id, frame, dispatch_release.is_some())
                 .await;
             drop(dispatch_release);
             {
@@ -4816,7 +4967,8 @@ mod tests {
             wire(16),
         );
         let budget = control_protocol::MAX_CONTROL_QUEUE_BYTES
-            - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES;
+            - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
+            - MAX_SHED_MARKER_BYTES;
 
         assert!(channel.make_room(QueuedKind::AgentReply, budget - 32));
         assert_eq!(channel.queued_bytes, 32);
@@ -4829,6 +4981,356 @@ mod tests {
             !channel.make_room(QueuedKind::AgentReply, budget - 31),
             "correlation frames must apply backpressure rather than be evicted"
         );
+    }
+
+    #[test]
+    fn shed_adapter_frames_keep_position_but_do_not_replay_native_ordinals() {
+        let attempt_id = uuid::Uuid::new_v4().to_string().parse().unwrap();
+        let mut channel = ControlChannel {
+            adapter_frames: 5,
+            replay: Some(NativeReplayAccount {
+                attempt_id,
+                notifications: 2,
+                open: false,
+                lost: false,
+            }),
+            ..ControlChannel::default()
+        };
+        let scope = DeliveryScope::Persistent;
+        let wire = Arc::<[u8]>::from(vec![0; 128]);
+        channel.push_projected(
+            scope,
+            QueuedKind::Notify,
+            Arc::clone(&wire),
+            Some(control_protocol::NativeReplayFrame {
+                attempt_id,
+                ordinal: 1,
+            }),
+            1,
+        );
+        channel.push(scope, QueuedKind::Notify, Arc::clone(&wire));
+        channel.push_projected(
+            scope,
+            QueuedKind::Notify,
+            wire,
+            Some(control_protocol::NativeReplayFrame {
+                attempt_id,
+                ordinal: 2,
+            }),
+            1,
+        );
+        let budget = control_protocol::MAX_CONTROL_QUEUE_BYTES
+            - control_protocol::MAX_NATIVE_LOSS_FRAME_BYTES
+            - MAX_SHED_MARKER_BYTES;
+        assert!(channel.make_room(QueuedKind::AgentReply, budget - 256 - MAX_SHED_MARKER_BYTES));
+        assert_eq!(channel.unreplayed_adapter_frames(), 3);
+        assert_eq!(channel.queue.len(), 3);
+        let marker = &channel.queue[0];
+        assert_eq!(marker.kind, QueuedKind::AdapterFramesShed);
+        assert_eq!(marker.replay, None);
+        assert_eq!(
+            serde_json::from_slice::<ControlBody>(&marker.wire[4..]).unwrap(),
+            ControlBody::AdapterFramesShed { count: 1 },
+        );
+        assert_eq!(channel.queue[1].adapter_frames, 0);
+        assert_eq!(channel.queue[2].replay.unwrap().ordinal, 2);
+        assert!(channel.replay.unwrap().lost);
+    }
+
+    /// Every adapter frame the daemon is told about: the reply's offset, the
+    /// frames it receives, and the counts its markers carry.
+    async fn replayed_adapter_frames(shared: &RunnerShared, attachment: u64) -> (u64, bool) {
+        let mut total = 0;
+        let mut replay_barrier = false;
+        while let Some((id, wire)) = shared.next_outbound(attachment).await {
+            match serde_json::from_slice(&wire[4..]).unwrap() {
+                ControlBody::SessionReady { adapter_frames, .. } => total += adapter_frames,
+                ControlBody::AdapterFramesShed { count } => total += count,
+                ControlBody::Notify { method, params, .. }
+                    if method == "session/update"
+                        && aoe_meta::session_update_of(&params)
+                            .is_some_and(|u| !aoe_meta::is_anchored(u)) =>
+                {
+                    total += 1;
+                }
+                ControlBody::Notify { method, .. } if SessionReplayed::matches_method(&method) => {
+                    replay_barrier = true;
+                }
+                _ => {}
+            }
+            shared.commit_outbound(attachment, id).await;
+        }
+        (total, replay_barrier)
+    }
+
+    fn adapter_frame() -> ControlBody {
+        ControlBody::Notify {
+            method: "session/update".into(),
+            params: serde_json::json!({"sessionId":"s","update":{
+                "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}),
+            replay: None,
+            evidence: Default::default(),
+        }
+    }
+
+    async fn enqueue_adapter_frames(shared: &RunnerShared, count: usize) {
+        let frame = adapter_frame();
+        for _ in 0..count {
+            shared
+                .enqueue(DeliveryScope::Persistent, QueuedKind::Notify, frame.clone())
+                .await;
+        }
+    }
+
+    fn ready_frame(fixture: &super::super::test_support::OwnedNativeFixture) -> ControlBody {
+        let replay = crate::acp::establishment::NativeReplayClosure {
+            notifications: 0,
+            closed: true,
+            lost: false,
+        };
+        let receipt = Arc::new(NativeEstablishmentReceipt {
+            attempt: Arc::clone(&fixture.attempt),
+            owner: crate::acp::runner_lifecycle::RunnerIdentity::from_record(&fixture.record),
+            store: Some(fixture.store.clone()),
+            outcome: NativeEstablishmentOutcome::Succeeded {
+                session_id: "s".into(),
+            },
+            replay,
+        });
+        ControlBody::SessionReady {
+            acp_session_id: "s".into(),
+            result: Arc::new(serde_json::json!({})),
+            native_channel: NativeChannelAvailability::Available,
+            postimage: receipt
+                .postimage(fixture.attempt.context)
+                .ok()
+                .map(Arc::new),
+            receipt,
+            original_delivery: false,
+            delivery: NativeReplayDelivery::original(replay),
+            local_failure: None,
+            adapter_frames: 0,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn detached_adapter_shedding_survives_the_session_reply_and_replay_barrier() {
+        let fixture = super::super::test_support::OwnedNativeFixture::load("s");
+        let shared = &fixture.shared;
+        let cap = control_protocol::MAX_CONTROL_QUEUE_FRAMES;
+        enqueue_adapter_frames(shared, cap + 10).await;
+        let attachment = shared.begin_attachment().await;
+        shared
+            .enqueue_handshake(attachment, ready_frame(&fixture), false)
+            .await;
+
+        // Count a blocked update only when admitted, not ahead of the backlog.
+        let pending = shared.enqueue(
+            DeliveryScope::Persistent,
+            QueuedKind::Notify,
+            adapter_frame(),
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("full announced attachment must apply backpressure"),
+            _ = std::future::ready(()) => {}
+        }
+
+        let produced = shared.control.lock().await.adapter_frames;
+        assert_eq!(produced, cap as u64 + 10);
+        let (id, wire) = shared.next_outbound(attachment).await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap(),
+            ControlBody::SessionReady {
+                adapter_frames: 0,
+                ..
+            }
+        ));
+        shared.commit_outbound(attachment, id).await;
+        let (id, wire) = shared.next_outbound(attachment).await.unwrap();
+        let ControlBody::AdapterFramesShed { count } = serde_json::from_slice(&wire[4..]).unwrap()
+        else {
+            panic!("the shed prefix must precede unshed updates and the barrier");
+        };
+        shared.commit_outbound(attachment, id).await;
+        let (replayed, replay_barrier) = replayed_adapter_frames(shared, attachment).await;
+        assert!(replay_barrier);
+        assert_eq!(count + replayed, produced);
+        assert!(pending.await);
+        assert_eq!(
+            replayed_adapter_frames(shared, attachment).await,
+            (1, false)
+        );
+        assert_eq!(shared.control.lock().await.adapter_frames, produced + 1);
+    }
+
+    #[tokio::test]
+    async fn a_full_unsheddable_queue_keeps_a_bounded_tail_marker() {
+        let shared = RunnerShared::new(None);
+        let cap = control_protocol::MAX_CONTROL_QUEUE_FRAMES;
+        let scope = DeliveryScope::Persistent;
+        let wire = Arc::<[u8]>::from(&[0; 8][..]);
+        {
+            let mut channel = shared.control.lock().await;
+            for _ in 0..cap - 1 {
+                channel.push(scope, QueuedKind::AgentReply, Arc::clone(&wire));
+            }
+        }
+        enqueue_adapter_frames(&shared, 2).await;
+        let channel = shared.control.lock().await;
+        assert_eq!(channel.queue.len(), cap);
+        assert_eq!(channel.adapter_frames, 2);
+        assert_eq!(channel.unreplayed_adapter_frames(), 0);
+        let tail = channel.queue.back().unwrap();
+        assert_eq!(tail.kind, QueuedKind::AdapterFramesShed);
+        assert_eq!(
+            serde_json::from_slice::<ControlBody>(&tail.wire[4..]).unwrap(),
+            ControlBody::AdapterFramesShed { count: 2 }
+        );
+    }
+
+    /// A reattaching daemon numbers the backlog it is replayed itself, so the
+    /// reply reports only what it will not receive again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_ready_reports_adapter_frames_outside_the_backlog() {
+        let fixture = super::super::test_support::OwnedNativeFixture::load("s");
+        let (shared, stdin) = (&fixture.shared, &fixture.stdin);
+        let update = |id: &str, meta: serde_json::Value| {
+            serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","_meta":meta,"content":{"type":"text","text":id}}}})
+            .to_string()
+        };
+        let adapter = |id: &str| update(id, serde_json::json!({}));
+        let anchored = |id: &str| {
+            update(
+                id,
+                serde_json::json!({"aoe":{"v":1,"key":id,"after_adapter_sequence":1}}),
+            )
+        };
+        let first = shared.begin_attachment().await;
+        shared.control.lock().await.session_announced = true;
+        for line in [adapter("a1"), anchored("t1"), adapter("a2")] {
+            shared.deliver_line(line.as_bytes(), stdin).await;
+        }
+        while let Some((id, _)) = shared.next_outbound(first).await {
+            shared.commit_outbound(first, id).await;
+        }
+        shared.control.lock().await.purge_attachment(first);
+        for line in [adapter("a3"), anchored("t2")] {
+            shared.deliver_line(line.as_bytes(), stdin).await;
+        }
+        {
+            let mut channel = shared.control.lock().await;
+            channel.record_dropped_adapter_frame(DeliveryScope::Persistent);
+            assert_eq!(
+                channel.queue.back().unwrap().kind,
+                QueuedKind::AdapterFramesShed
+            );
+        }
+
+        let second = shared.begin_attachment().await;
+        shared
+            .enqueue_handshake(second, ready_frame(&fixture), false)
+            .await;
+        let (id, wire) = shared.next_outbound(second).await.expect("reply first");
+        let ControlBody::SessionReady { adapter_frames, .. } =
+            serde_json::from_slice(&wire[4..]).unwrap()
+        else {
+            panic!("expected SessionReady");
+        };
+        // a1 and a2 went to the first daemon; a3 and the marker are replayed.
+        assert_eq!(adapter_frames, 2);
+        shared.commit_outbound(second, id).await;
+        assert_eq!(replayed_adapter_frames(shared, second).await, (2, true));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_ready_excludes_frames_flushed_to_the_current_attachment_before_reply() {
+        let fixture = super::super::test_support::OwnedNativeFixture::load("s");
+        let shared = &fixture.shared;
+        let scope = DeliveryScope::Persistent;
+        let first = shared.begin_attachment().await;
+        shared.control.lock().await.session_announced = true;
+        enqueue_adapter_frames(shared, 1).await;
+        let (id, _) = shared.next_outbound(first).await.unwrap();
+        shared.commit_outbound(first, id).await;
+        shared.control.lock().await.purge_attachment(first);
+
+        let second = shared.begin_attachment().await;
+        enqueue_adapter_frames(shared, 1).await;
+        shared
+            .control
+            .lock()
+            .await
+            .record_dropped_adapter_frame(scope);
+        enqueue_adapter_frames(shared, 1).await;
+        assert!(shared.next_outbound(second).await.is_none());
+
+        // Native loss lifts the SessionReady gate so buffered updates can
+        // drain even when a cached result has not yet been requested.
+        shared.observe_native_loss(NativeChannelLossCause::StdoutEof);
+        let (id, wire) = shared.next_outbound(second).await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap(),
+            ControlBody::Notify { method, .. } if method == "session/update"
+        ));
+        shared.commit_outbound(second, id).await;
+        let (id, wire) = shared.next_outbound(second).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap(),
+            ControlBody::AdapterFramesShed { count: 1 }
+        );
+        shared.commit_outbound(second, id).await;
+
+        shared
+            .enqueue_handshake(second, ready_frame(&fixture), false)
+            .await;
+        let (id, wire) = shared.next_outbound(second).await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<ControlBody>(&wire[4..]).unwrap(),
+            ControlBody::SessionReady {
+                adapter_frames: 1,
+                ..
+            }
+        ));
+        shared.commit_outbound(second, id).await;
+        assert_eq!(replayed_adapter_frames(shared, second).await, (1, true));
+    }
+
+    /// The daemon decodes positional `[sessionId, update]` params too, so the
+    /// runner must number them the same way.
+    #[tokio::test]
+    async fn positional_session_updates_count_as_adapter_frames() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let positional = |meta: serde_json::Value| {
+            serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":[
+                "s",{"sessionUpdate":"agent_message_chunk","_meta":meta,"content":{"type":"text","text":"x"}}]})
+            .to_string()
+        };
+        shared.begin_attachment().await;
+        for (line, expected) in [
+            (positional(serde_json::json!({})), 1),
+            (
+                positional(serde_json::json!({"aoe":{"v":1,"key":"k","after_adapter_sequence":1}})),
+                1,
+            ),
+        ] {
+            shared.deliver_line(line.as_bytes(), &stdin).await;
+            assert_eq!(shared.control.lock().await.adapter_frames, expected);
+        }
+        shared
+            .deliver_line(
+                br#"{"jsonrpc":"2.0","method":"_aoe/adapter_frames_shed","params":{"count":999}}"#,
+                &stdin,
+            )
+            .await;
+        let channel = shared.control.lock().await;
+        assert_eq!(channel.queue.len(), 2);
+        assert_eq!(channel.adapter_frames, 1);
     }
 
     #[tokio::test]

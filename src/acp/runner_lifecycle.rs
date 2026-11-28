@@ -141,6 +141,7 @@ struct Construction {
     constructor_finished: std::sync::atomic::AtomicBool,
     owned_child_wait_pending: std::sync::atomic::AtomicBool,
     runner: Mutex<Option<RunnerIdentity>>,
+    retired_proxy_runner: std::sync::OnceLock<RunnerIdentity>,
     scopes: Mutex<Vec<crate::process::worker_registry::ScopeOwnership>>,
     admission: Mutex<Option<crate::acp::supervisor::LaunchAdmission>>,
     prime: Mutex<PrimeOwnership>,
@@ -161,6 +162,8 @@ struct Construction {
     child_wait_completed: tokio::sync::watch::Sender<Option<bool>>,
     original_constructor_obligations: std::sync::atomic::AtomicUsize,
     original_constructor_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
+    /// Admitted prompts whose publication has not settled yet.
+    unsettled_admissions: std::sync::atomic::AtomicU64,
     /// A rate limit rejecting this launch belongs to its caller, which reads it from the error.
     defers_rate_limit_rejection: std::sync::atomic::AtomicBool,
 }
@@ -173,6 +176,7 @@ impl Default for Construction {
             retirement_authorized: std::sync::atomic::AtomicBool::new(true),
             constructor_finished: std::sync::atomic::AtomicBool::new(false),
             runner: Mutex::default(),
+            retired_proxy_runner: std::sync::OnceLock::new(),
             scopes: Mutex::default(),
             admission: Mutex::default(),
             prime: Mutex::default(),
@@ -194,6 +198,7 @@ impl Default for Construction {
             admissions: std::sync::atomic::AtomicU64::new(0),
             owned_child_wait_pending: std::sync::atomic::AtomicBool::new(false),
             defers_rate_limit_rejection: std::sync::atomic::AtomicBool::new(false),
+            unsettled_admissions: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -291,6 +296,17 @@ impl Drop for OriginalConstructionObligation {
         if previous == 1 {
             self.notify.notify_waiters();
         }
+    }
+}
+
+/// Holds an admission unsettled until its prompt's publication ends.
+pub(crate) struct AdmissionGuard(Arc<Construction>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0
+            .unsettled_admissions
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -818,6 +834,60 @@ impl Lease {
         self.construction
             .defers_rate_limit_rejection
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether an admitted prompt is still being published. Read after
+    /// [`Self::admissions`]: an admission that count missed fails a stop
+    /// observed with it, and one it saw is either settled or reported here.
+    pub(crate) fn has_unsettled_admission(&self) -> bool {
+        self.construction
+            .unsettled_admissions
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
+    /// The closing `Stopped` reason a stop asked for, published or not.
+    #[cfg(test)]
+    pub(crate) fn test_stop_reason(&self) -> Option<String> {
+        self.construction
+            .stop_completion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|debt| debt.reason.clone())
+    }
+
+    /// Retire the failed proxy birth without transferring a frozen Stop to the retry.
+    pub(crate) fn release_torn_down_runner(&self) {
+        let runner = self
+            .construction
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("a proxy retry requires a retired physical runner");
+        self.construction
+            .retired_proxy_runner
+            .set(runner)
+            .expect("a constructor may retry without its proxy only once");
+        *self
+            .construction
+            .spawn_attestor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    pub(crate) fn captured_retired_proxy(&self, captured: RunnerIdentity) -> bool {
+        self.construction
+            .retired_proxy_runner
+            .get()
+            .is_some_and(|retired| {
+                captured.pid == retired.pid
+                    && captured.generation == retired.generation
+                    && captured
+                        .birth_fingerprint
+                        .is_none_or(|birth| retired.birth_fingerprint == Some(birth))
+            })
     }
 
     pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {
@@ -1909,18 +1979,22 @@ impl LifecycleTable {
 
     /// Count a prompt against the running epoch and restart its idle clock,
     /// since the prompt is not stored yet. Under the table lock so an idle
-    /// stop's check cannot interleave with it.
-    pub(crate) fn note_admission(&self, session_id: &str) {
-        if let Some((lease, _)) = self.running(session_id) {
-            lease.construction.idle_baseline_ms.fetch_max(
-                crate::time::Timestamp::now().as_millis(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            lease
-                .construction
-                .admissions
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
+    /// stop's check cannot interleave with it. Hold the guard until the
+    /// publication settles.
+    pub(crate) fn note_admission(&self, session_id: &str) -> Option<AdmissionGuard> {
+        let (lease, _) = self.running(session_id)?;
+        let construction = &lease.construction;
+        construction.idle_baseline_ms.fetch_max(
+            crate::time::Timestamp::now().as_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        construction
+            .unsettled_admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        construction
+            .admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(AdmissionGuard(Arc::clone(construction)))
     }
 
     pub fn phase(&self, session_id: &str) -> WorkerPhase {

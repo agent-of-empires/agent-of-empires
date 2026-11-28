@@ -1538,6 +1538,7 @@ pub async fn switch_acp_agent(
         seed_history_replay: false,
         prior_conversation: false,
         claude_store_pin: None,
+        proxy: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
     if let Some(response) = refuse_if_stored_row_shelved(&state, &instance).await {

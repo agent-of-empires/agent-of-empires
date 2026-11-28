@@ -200,12 +200,6 @@ pub async fn ensure_session(
 }
 
 /// Automatic input needs a running agent, not a hook left by a prior process.
-pub(crate) fn ready_agent_session_for_automatic_input(
-    instance: &Instance,
-) -> anyhow::Result<Option<String>> {
-    Ok(ready_agent_target_for_automatic_input(instance)?.map(|(name, _)| name))
-}
-
 pub(crate) fn ready_agent_target_for_automatic_input(
     instance: &Instance,
 ) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>)>> {

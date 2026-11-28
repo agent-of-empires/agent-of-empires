@@ -207,14 +207,7 @@ export function AcpRuntime({
 
   const visiblyBusy = isVisiblyBusy(acp.state);
   const messages = useMemo(
-    () =>
-      activityToThreadMessages(
-        displayActivity,
-        visiblyBusy,
-        showClearedTurns,
-        agentProfile.capabilities.todos,
-        agentProfile,
-      ),
+    () => activityToThreadMessages(displayActivity, visiblyBusy, showClearedTurns, agentProfile.todos, agentProfile),
     [displayActivity, visiblyBusy, showClearedTurns, agentProfile],
   );
   const foldGeneration = useMemo(

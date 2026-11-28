@@ -105,9 +105,10 @@ impl McpServer {
             return Json(WhoAmI { session: None });
         };
         let instances = self.state.instances.read().await;
-        let session = instances.iter().find(|inst| inst.id == id).map(|inst| {
-            session_response_from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        });
+        let session = instances
+            .iter()
+            .find(|inst| inst.id == id)
+            .map(session_response_from_instance);
         Json(WhoAmI { session })
     }
 }

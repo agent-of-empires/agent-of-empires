@@ -153,3 +153,187 @@ macro_rules! require_tmux {
     };
 }
 pub(crate) use require_tmux;
+
+static DRAFT_WATCHERS: std::sync::Mutex<Vec<(String, std::sync::mpsc::Sender<()>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Signals the first time each input-line wait reads a draft in `pane`.
+pub(crate) fn watch_drafts(pane: &str) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    DRAFT_WATCHERS.lock().unwrap().push((pane.to_string(), tx));
+    rx
+}
+
+pub(crate) fn observe_draft(pane: &str) {
+    for (watched, tx) in DRAFT_WATCHERS.lock().unwrap().iter() {
+        if watched == pane {
+            let _ = tx.send(());
+        }
+    }
+    for hook in take_hooks(&DRAFT_SEEN_HOOKS, pane) {
+        hook();
+    }
+}
+
+static DRAFT_SEEN_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, on the waiting thread, the first time an input-line wait reads a draft in
+/// `pane`, before it sleeps.
+pub(crate) fn on_draft_seen(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    DRAFT_SEEN_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+/// Claude's input box drawn by hand: `cat` on a cooked tty echoes typed keys after the `❯`,
+/// between two rules, above the footer that holds Claude's ready marker.
+pub(crate) const INPUT_BOX_SCRIPT: &str =
+    "printf '%s\\n\\n%s\\n%s\\n' ──────── ──────── '? for shortcuts'; \
+     printf '\\033[3A❯ '; exec cat";
+
+/// Splits `session`'s first window, running `script` in the new pane, and returns its `#{pane_id}`.
+pub(crate) fn split_pane(session: &str, script: &str) -> String {
+    let output = crate::tmux::tmux_command()
+        .args([
+            "split-window",
+            "-d",
+            "-t",
+            &format!("={session}:"),
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("tmux split-window");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+type InputCheckHook = Box<dyn FnOnce() + Send>;
+type HookRegistry = std::sync::Mutex<Vec<(String, InputCheckHook)>>;
+static INPUT_CHECK_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Removes and returns the hooks registered for `pane`.
+fn take_hooks(registry: &HookRegistry, pane: &str) -> Vec<InputCheckHook> {
+    let mut all = registry.lock().unwrap();
+    let (mine, rest) = std::mem::take(&mut *all)
+        .into_iter()
+        .partition::<Vec<_>, _>(|(watched, _)| watched == pane);
+    *all = rest;
+    mine.into_iter().map(|(_, hook)| hook).collect()
+}
+
+/// Runs `hook` once, between a send's input-line check of `pane` and its keys.
+pub(crate) fn on_input_checked(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    INPUT_CHECK_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_input_check(pane: &str) {
+    for hook in take_hooks(&INPUT_CHECK_HOOKS, pane) {
+        hook();
+    }
+}
+
+static INPUT_CAPTURED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, after an input-line read has captured `pane` and before it classifies it.
+pub(crate) fn on_input_captured(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    INPUT_CAPTURED_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_input_captured(pane: &str) {
+    for hook in take_hooks(&INPUT_CAPTURED_HOOKS, pane) {
+        hook();
+    }
+}
+
+static INPUT_WAIT_DEADLINES: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn record_input_wait_deadline(pane: &str, deadline: std::time::Instant) {
+    let mut all = INPUT_WAIT_DEADLINES.lock().unwrap();
+    all.retain(|(watched, _)| watched != pane);
+    all.push((pane.to_string(), deadline));
+}
+
+/// The deadline of the latest input-line wait on `pane`.
+pub(crate) fn input_wait_deadline(pane: &str) -> Option<std::time::Instant> {
+    INPUT_WAIT_DEADLINES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(watched, _)| watched == pane)
+        .map(|(_, deadline)| *deadline)
+}
+
+static SCREEN_CAPTURED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, after an automatic-input check has captured `pane` and before it reads
+/// the capture.
+pub(crate) fn on_screen_captured(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    SCREEN_CAPTURED_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_screen_captured(pane: &str) {
+    for hook in take_hooks(&SCREEN_CAPTURED_HOOKS, pane) {
+        hook();
+    }
+}
+
+static FAILED_SCREEN_CAPTURES: std::sync::Mutex<Vec<(String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the next `count` readiness captures of `pane` fail.
+pub(crate) fn fail_screen_captures(pane: &str, count: usize) {
+    FAILED_SCREEN_CAPTURES
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), count));
+}
+
+/// Whether this readiness capture of `pane` is one [`fail_screen_captures`] asked to fail.
+pub(crate) fn screen_capture_fails(pane: &str) -> bool {
+    let mut failing = FAILED_SCREEN_CAPTURES.lock().unwrap();
+    let Some(entry) = failing.iter_mut().find(|(p, n)| p == pane && *n > 0) else {
+        return false;
+    };
+    entry.1 -= 1;
+    true
+}
+
+static TEXT_TYPED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, after a checked-pane send has typed its text into `pane` and before its
+/// membership check for Enter.
+pub(crate) fn on_text_typed(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    TEXT_TYPED_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_text_typed(pane: &str) {
+    for hook in take_hooks(&TEXT_TYPED_HOOKS, pane) {
+        hook();
+    }
+}

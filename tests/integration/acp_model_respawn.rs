@@ -61,6 +61,8 @@ fn spawn_config(
         prior_conversation: false,
         generation: 0,
         artifact_dir: None,
+        proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
