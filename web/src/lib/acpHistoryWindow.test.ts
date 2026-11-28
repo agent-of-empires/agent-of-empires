@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { ActivityRow } from "./acpTypes";
 import {
   DEFAULT_HISTORY_WINDOW,
+  clearHistoryProjection,
+  lastClearIndex,
   historyWindow,
   historyWindowStart,
   initialHistoryWindow,
@@ -21,6 +23,42 @@ function transcript(turns: number, perTurn: number): ActivityRow[] {
   }
   return rows;
 }
+
+describe("certified clear history projection", () => {
+  it("folds overlapping clears by actual seq while retaining resources and local rows exactly once", () => {
+    const rows: ActivityRow[] = [
+      { ...row("message", 1), seq: 1 },
+      { ...row("message", 2), seq: 2 },
+      { ...row("tool_start", 3), seq: 3 },
+      { ...row("session_cleared", 4), seq: 4, clearAfterSeq: 1 },
+      { ...row("user_prompt", 5), seq: 5 },
+      { ...row("message", 6), seq: 6 },
+      { ...row("session_cleared", 7), seq: 7, clearAfterSeq: 4 },
+      row("user_prompt", 8),
+    ];
+    const projected = clearHistoryProjection(rows);
+    const latestClear = lastClearIndex(projected);
+    const firstClear = projected.findIndex((entry) => entry.id === "session_cleared-4");
+    expect(projected.slice(0, firstClear).map((entry) => entry.text)).toEqual(["message 1"]);
+    expect(projected.slice(firstClear + 1, latestClear).map((entry) => entry.text)).toEqual([
+      "message 2",
+      "tool_start 3",
+    ]);
+    expect(projected.slice(latestClear + 1).map((entry) => entry.text)).toEqual([
+      "user_prompt 5",
+      "message 6",
+      "user_prompt 8",
+    ]);
+    expect(new Set(projected.map((entry) => entry.id))).toEqual(new Set(rows.map((entry) => entry.id)));
+    expect(projected).toHaveLength(rows.length);
+    expect(lastClearIndex(rows)).toBe(4);
+    expect(clearHistoryProjection(projected)).toEqual(projected);
+    expect(historyWindow(rows, 4, false)).toEqual({ start: 5, canLoadEarlier: true });
+    expect(historyWindow(rows, 100, false)).toEqual({ start: 0, canLoadEarlier: false });
+    expect(historyWindow(rows, 4, true)).toEqual({ start: 5, canLoadEarlier: true });
+    expect(rows[3]!.id).toBe("session_cleared-4");
+  });
+});
 
 function toolRow(id: string, parentId?: string): ActivityRow {
   return {

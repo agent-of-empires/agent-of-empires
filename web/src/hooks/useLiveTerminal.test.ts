@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { useLayoutEffect } from "react";
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { applyPatch, frameLines, useLiveTerminal } from "./useLiveTerminal";
@@ -212,6 +213,142 @@ describe("reconnect", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each(["close", "error", "manual reconnect", "online reconnect"] as const)(
+    "retires queued binary and paste input across %s",
+    (reason) => {
+      vi.useFakeTimers();
+      try {
+        const { result, ws } = mount(false);
+        const stale = { open: ws.onopen, message: ws.onmessage, close: ws.onclose, error: ws.onerror };
+        act(() => {
+          expect(result.current.sendData("old")).toBe(true);
+          expect(result.current.sendPaste("old paste", true)).toBe(true);
+        });
+        ws.open();
+        expect(ws.bytes()).toEqual([]);
+        expect(ws.json().filter(({ type }) => type === "paste")).toEqual([]);
+
+        if (reason === "manual reconnect") {
+          act(() => result.current.manualReconnect());
+        } else if (reason === "error") {
+          act(() => ws.onerror?.(new Event("error")));
+          act(() => {
+            expect(result.current.sendData("after error")).toBe(false);
+            expect(result.current.sendPaste("after error paste", true)).toBe(false);
+          });
+        }
+        ws.readyState = FakeWS.CLOSED;
+        act(() => {
+          expect(result.current.sendData("disconnected")).toBe(false);
+          expect(result.current.sendPaste("disconnected paste", true)).toBe(false);
+        });
+        if (reason === "online reconnect") {
+          act(() => window.dispatchEvent(new Event("online")));
+        } else {
+          act(() => ws.onclose?.(new CloseEvent("close", { code: 1006 })));
+          act(() => vi.advanceTimersByTime(60_000));
+        }
+
+        const next = FakeWS.sockets[1]!;
+        act(() => {
+          expect(result.current.sendData("fresh")).toBe(true);
+          expect(result.current.sendPaste("fresh paste", false)).toBe(true);
+          stale.open?.(new Event("open"));
+          stale.message?.({ data: JSON.stringify({ type: "size_owner", is_owner: true }) } as MessageEvent);
+          stale.message?.({ data: JSON.stringify({ type: "size_owner", is_owner: false }) } as MessageEvent);
+          stale.error?.(new Event("error"));
+          stale.close?.(new CloseEvent("close", { code: 1006 }));
+        });
+        expect(result.current.state).toMatchObject({ isOwner: false, ownerKnown: false });
+        next.open();
+        expect(next.bytes()).toEqual([]);
+        expect(next.json().filter(({ type }) => type === "paste")).toEqual([]);
+        next.deliver({ type: "size_owner", is_owner: true });
+        act(() => {
+          expect(result.current.sendData("owned")).toBe(true);
+          expect(result.current.sendPaste("owned paste", true)).toBe(true);
+        });
+        const input = next.sent
+          .slice(-4)
+          .map((data) => (typeof data === "string" ? JSON.parse(data) : new TextDecoder().decode(data)));
+        expect(input).toEqual([
+          "fresh",
+          { type: "paste", text: "fresh paste", submit: false },
+          "owned",
+          { type: "paste", text: "owned paste", submit: true },
+        ]);
+        expect(ws.bytes()).toEqual([]);
+        expect(ws.json().filter(({ type }) => type === "paste")).toEqual([]);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each<[string, string | null, string]>([
+    ["session change", "s2", "live-ws"],
+    ["route change", "s1", "/other/live-ws"],
+    ["session deselection", null, "live-ws"],
+  ])("retires queued binary and paste input before %s commits", (_label, sessionId, wsPath) => {
+    const { result, rerender } = renderHook(
+      ({ sessionId, wsPath, duringScopeChange }) => {
+        const terminal = useLiveTerminal(sessionId, false, wsPath);
+        useLayoutEffect(() => duringScopeChange?.(), [duringScopeChange]);
+        return terminal;
+      },
+      {
+        initialProps: {
+          sessionId: "s1" as string | null,
+          wsPath: "live-ws",
+          duringScopeChange: undefined as (() => void) | undefined,
+        },
+      },
+    );
+    const first = FakeWS.sockets[0]!;
+    const staleOwner = first.onmessage;
+    const retained = result.current;
+    act(() => {
+      expect(retained.sendData("old")).toBe(true);
+      expect(retained.sendPaste("old paste", true)).toBe(true);
+    });
+    first.open();
+    rerender({
+      sessionId,
+      wsPath,
+      duringScopeChange: () => {
+        staleOwner?.({ data: JSON.stringify({ type: "size_owner", is_owner: true }) } as MessageEvent);
+        expect(retained.sendData("between scopes")).toBe(false);
+        expect(retained.sendPaste("between scopes paste", true)).toBe(false);
+        expect(first.bytes()).toEqual([]);
+        expect(first.json().filter(({ type }) => type === "paste")).toEqual([]);
+      },
+    });
+    if (sessionId === null) {
+      act(() => {
+        expect(retained.sendData("no target")).toBe(false);
+        expect(retained.sendPaste("no target paste", true)).toBe(false);
+      });
+      expect(FakeWS.sockets).toHaveLength(1);
+      rerender({ sessionId: "s2", wsPath, duringScopeChange: undefined });
+    }
+    const next = FakeWS.sockets[1]!;
+    act(() => {
+      expect(retained.sendData("fresh")).toBe(true);
+      expect(retained.sendPaste("fresh paste", false)).toBe(true);
+    });
+    next.open();
+    expect(next.bytes()).toEqual([]);
+    expect(next.json().filter(({ type }) => type === "paste")).toEqual([]);
+    next.deliver({ type: "size_owner", is_owner: true });
+    expect(next.bytes()).toEqual(["fresh"]);
+    expect(next.json().filter(({ type }) => type === "paste")).toEqual([
+      { type: "paste", text: "fresh paste", submit: false },
+    ]);
+    expect(first.bytes()).toEqual([]);
+    expect(first.json().filter(({ type }) => type === "paste")).toEqual([]);
+  });
 });
 
 describe("read-only policy", () => {
@@ -326,6 +463,150 @@ describe("read-only policy", () => {
     expect(next.json()).toContainEqual({ type: "window", lines: 500 });
     next.deliver(frame(1, "still observing\n"));
     expect(result.current.state.frame?.content).toBe("still observing\n");
+  });
+});
+
+describe("takeover intent retirement", () => {
+  const ownershipMessages = (socket: FakeWS) =>
+    socket.json().filter(({ type }) => type === "claim" || type === "claim_if_vacant");
+
+  it.each(["deadline", "resize"] as const)(
+    "retires a deferred takeover across read-only restoration before %s",
+    (trigger) => {
+      vi.useFakeTimers();
+      try {
+        const { result, rerender } = renderHook(({ readOnly }) => useLiveTerminal("s1", readOnly, "live-ws"), {
+          initialProps: { readOnly: false },
+        });
+        const ws = FakeWS.sockets[0]!;
+        ws.open();
+        ws.deliver({ type: "size_owner", is_owner: false });
+        act(() => result.current.claimAfterResize(1000));
+        expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }]);
+        rerender({ readOnly: true });
+        rerender({ readOnly: false });
+        expect(FakeWS.sockets).toHaveLength(1);
+        if (trigger === "deadline") {
+          act(() => vi.advanceTimersByTime(1000));
+        } else {
+          act(() => result.current.sendResize(100, 31));
+          expect(ws.json()).toContainEqual({ type: "resize", cols: 100, rows: 31 });
+        }
+        expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }]);
+        if (trigger === "resize") {
+          act(() => vi.advanceTimersByTime(1000));
+          expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }]);
+        }
+        act(() => result.current.claimAfterResize(1000));
+        if (trigger === "deadline") {
+          act(() => vi.advanceTimersByTime(1000));
+        } else {
+          act(() => result.current.sendResize(101, 33));
+        }
+        expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }, { type: "claim" }]);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("retires reconnect takeover after an observer open and a later writable redial", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, rerender } = renderHook(({ readOnly }) => useLiveTerminal("s1", readOnly, "live-ws"), {
+        initialProps: { readOnly: false },
+      });
+      const first = FakeWS.sockets[0]!;
+      first.open();
+      act(() => result.current.reconnectAndClaim());
+      rerender({ readOnly: true });
+      act(() => first.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(2);
+      const observer = FakeWS.sockets[1]!;
+      observer.open();
+      expect(ownershipMessages(observer)).toEqual([]);
+      observer.deliver(frame(1, "still observing\n"));
+      expect(result.current.state.frame?.content).toBe("still observing\n");
+      rerender({ readOnly: false });
+      observer.readyState = FakeWS.CLOSED;
+      act(() => window.dispatchEvent(new Event("online")));
+      expect(FakeWS.sockets).toHaveLength(3);
+      const writable = FakeWS.sockets[2]!;
+      writable.open();
+      expect(ownershipMessages(writable)).toEqual([{ type: "claim_if_vacant" }]);
+      act(() => result.current.reconnectAndClaim());
+      act(() => writable.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(4);
+      const explicit = FakeWS.sockets[3]!;
+      explicit.open();
+      expect(ownershipMessages(explicit)).toEqual([{ type: "claim" }]);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each<["deadline" | "resize" | "reconnect", string, string | null, string]>([
+    ["deadline", "session change", "s2", "live-ws"],
+    ["resize", "session change", "s2", "live-ws"],
+    ["reconnect", "session change", "s2", "live-ws"],
+    ["deadline", "route change", "s1", "/other/live-ws"],
+    ["resize", "route change", "s1", "/other/live-ws"],
+    ["reconnect", "route change", "s1", "/other/live-ws"],
+    ["deadline", "session deselection", null, "live-ws"],
+    ["resize", "session deselection", null, "live-ws"],
+    ["reconnect", "session deselection", null, "live-ws"],
+  ])("retires %s takeover before same-hook %s", (pending, _label, sessionId, wsPath) => {
+    vi.useFakeTimers();
+    try {
+      const { result, rerender } = renderHook(({ sessionId, wsPath }) => useLiveTerminal(sessionId, false, wsPath), {
+        initialProps: { sessionId: "s1" as string | null, wsPath: "live-ws" },
+      });
+      const first = FakeWS.sockets[0]!;
+      first.open();
+      first.deliver({ type: "size_owner", is_owner: false });
+      act(() => {
+        if (pending === "reconnect") result.current.reconnectAndClaim();
+        else result.current.claimAfterResize(1000);
+      });
+      rerender({ sessionId, wsPath });
+      if (sessionId === null) {
+        expect(FakeWS.sockets).toHaveLength(1);
+        rerender({ sessionId: "s2", wsPath });
+      }
+      expect(FakeWS.sockets).toHaveLength(2);
+      const next = FakeWS.sockets[1]!;
+      next.open();
+      expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }]);
+      if (pending === "deadline") {
+        act(() => vi.advanceTimersByTime(1000));
+      } else if (pending === "resize") {
+        act(() => result.current.sendResize(100, 31));
+        expect(next.json()).toContainEqual({ type: "resize", cols: 100, rows: 31 });
+      }
+      expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }]);
+      if (pending === "resize") {
+        act(() => vi.advanceTimersByTime(1000));
+        expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }]);
+      }
+      if (pending === "reconnect") {
+        act(() => result.current.reconnectAndClaim());
+        act(() => next.onclose?.(new CloseEvent("close")));
+        const explicit = FakeWS.sockets[2]!;
+        explicit.open();
+        expect(ownershipMessages(explicit)).toEqual([{ type: "claim" }]);
+      } else {
+        act(() => {
+          result.current.claimAfterResize(1000);
+          result.current.sendResize(101, 33);
+        });
+        expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }, { type: "claim" }]);
+      }
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -472,20 +753,27 @@ describe("size owner", () => {
 
   it("drops input once ownership is denied instead of sending it after a later takeover", () => {
     const { result, ws } = mount();
-    ws.deliver({ type: "size_owner", is_owner: false });
-    let accepted: boolean | undefined;
     act(() => {
-      accepted = result.current.sendData("x");
+      expect(result.current.sendData("queued")).toBe(true);
+      expect(result.current.sendPaste("queued paste", true)).toBe(true);
     });
-    expect(accepted).toBe(false);
+    ws.deliver({ type: "size_owner", is_owner: false });
+    act(() => {
+      expect(result.current.sendData("denied")).toBe(false);
+      expect(result.current.sendPaste("denied paste", true)).toBe(false);
+    });
 
     ws.deliver({ type: "size_owner", is_owner: true });
     expect(ws.bytes()).toEqual([]);
+    expect(ws.json().filter(({ type }) => type === "paste")).toEqual([]);
     act(() => {
-      accepted = result.current.sendData("y");
+      expect(result.current.sendData("fresh")).toBe(true);
+      expect(result.current.sendPaste("fresh paste", false)).toBe(true);
     });
-    expect(accepted).toBe(true);
-    expect(ws.bytes()).toEqual(["y"]);
+    expect(ws.bytes()).toEqual(["fresh"]);
+    expect(ws.json().filter(({ type }) => type === "paste")).toEqual([
+      { type: "paste", text: "fresh paste", submit: false },
+    ]);
   });
 
   it("queues the first typed bytes until a newly selected session owns the pane", () => {

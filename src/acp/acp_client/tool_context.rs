@@ -95,6 +95,10 @@ pub(super) fn raw_input_has_no_user_context(raw_input: &serde_json::Value) -> bo
     }
 }
 
+pub(super) struct ToolContextInput {
+    id: String,
+    raw_input: serde_json::Value,
+}
 /// The `command` a Bash call was launched with, capped to a readable length.
 pub(super) fn shell_command(cache: &ToolContextCache, tool_call_id: &str) -> Option<String> {
     const MAX_COMMAND_BYTES: usize = 16 * 1024;
@@ -116,40 +120,33 @@ pub(super) fn shell_command(cache: &ToolContextCache, tool_call_id: &str) -> Opt
 pub(super) fn update_tool_context_cache(
     cache: &ToolContextCache,
     event: &mut Event,
-    source_update: &SessionUpdate,
+    source_input: &mut Option<ToolContextInput>,
 ) {
-    match event {
-        Event::ToolCallStarted { tool_call } => {
-            if let Some(raw_input) = raw_input_for_tool_event(source_update, &tool_call.id) {
-                cache
-                    .lock()
-                    .expect("tool context cache mutex poisoned")
-                    .record(tool_call.id.clone(), raw_input);
-            }
-        }
+    let (id, prompt): (&str, Option<&mut Option<String>>) = match event {
+        Event::ToolCallStarted { tool_call } => (tool_call.id.as_str(), None),
         Event::ToolCallUpdated {
             tool_call_id,
             prompt,
             ..
-        } => {
-            if let Some(raw_input) = raw_input_for_tool_event(source_update, tool_call_id) {
-                let mut cache = cache.lock().expect("tool context cache mutex poisoned");
-                // The log already holds this prompt from an earlier frame.
-                if prompt.is_some()
-                    && cache.get(tool_call_id).as_ref().and_then(full_prompt) == *prompt
-                {
-                    *prompt = None;
-                }
-                cache.record(tool_call_id.clone(), raw_input);
-            }
-        }
+        } => (tool_call_id.as_str(), Some(prompt)),
         Event::ToolCallCompleted { tool_call_id, .. } => {
             cache
                 .lock()
                 .expect("tool context cache mutex poisoned")
                 .remove(tool_call_id);
+            return;
         }
-        _ => {}
+        _ => return,
+    };
+    if source_input.as_ref().is_some_and(|input| input.id == id) {
+        let input = source_input.take().expect("matching tool input");
+        let mut cache = cache.lock().expect("tool context cache mutex poisoned");
+        if let Some(prompt) = prompt {
+            if prompt.is_some() && cache.raw_inputs.get(id).and_then(full_prompt) == *prompt {
+                *prompt = None;
+            }
+        }
+        cache.record(input.id, input.raw_input);
     }
 }
 
@@ -188,23 +185,18 @@ pub(super) fn restore_wake_tool_title(
     }
 }
 
-pub(super) fn raw_input_for_tool_event(
-    source_update: &SessionUpdate,
-    tool_call_id: &str,
-) -> Option<serde_json::Value> {
-    match source_update {
-        SessionUpdate::ToolCall(tool_call)
-            if tool_call.tool_call_id.0.to_string() == tool_call_id =>
-        {
-            tool_call.raw_input.clone()
+pub(super) fn capture_tool_context_input(update: &SessionUpdate) -> Option<ToolContextInput> {
+    let (id, raw_input) = match update {
+        SessionUpdate::ToolCall(tool) => (&tool.tool_call_id.0, tool.raw_input.as_ref()?),
+        SessionUpdate::ToolCallUpdate(tool) => {
+            (&tool.tool_call_id.0, tool.fields.raw_input.as_ref()?)
         }
-        SessionUpdate::ToolCallUpdate(update)
-            if update.tool_call_id.0.to_string() == tool_call_id =>
-        {
-            update.fields.raw_input.clone()
-        }
-        _ => None,
-    }
+        _ => return None,
+    };
+    (!raw_input_has_no_user_context(raw_input)).then(|| ToolContextInput {
+        id: id.to_string(),
+        raw_input: raw_input.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -343,7 +335,8 @@ mod tests {
         };
         let prompt_after = |raw: serde_json::Value| {
             let mut event = updated(&raw);
-            update_tool_context_cache(&cache, &mut event, &update(raw));
+            let mut input = capture_tool_context_input(&update(raw));
+            update_tool_context_cache(&cache, &mut event, &mut input);
             let Event::ToolCallUpdated { prompt, .. } = event else {
                 unreachable!()
             };

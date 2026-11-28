@@ -151,8 +151,8 @@ mod tests {
     fn identity_tracks_content_across_connections_and_survives_empty_history() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
-        let first = EventStore::open(&path, 0).unwrap();
-        let second = EventStore::open(&path, 0).unwrap();
+        let first = EventStore::open(&path, 0, Default::default()).unwrap();
+        let second = EventStore::open(&path, 0, Default::default()).unwrap();
         let identity = |session| read(&first.conn(), session).unwrap();
         let empty = identity("selected");
         let other = identity("other");
@@ -160,13 +160,34 @@ mod tests {
             text: "original".into(),
             message_id: None,
         };
-        first.record("selected", 1, &event).unwrap();
+        first
+            .record(
+                "selected",
+                1,
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let original = identity("selected");
         assert_ne!(original, empty);
         assert_eq!(read(&second.conn(), "selected").unwrap(), original);
         first
-            .record("selected", 1, &Event::ThinkingStarted)
+            .record(
+                "selected",
+                1,
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
+        assert_eq!(identity("selected"), original);
+        assert!(first
+            .record(
+                "selected",
+                1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .is_err());
         assert_eq!(identity("selected"), original);
         second
             .conn()
@@ -189,7 +210,7 @@ mod tests {
         second
             .conn()
             .execute(
-                "UPDATE acp_events SET event_json = ?1 WHERE session_id = 'selected'",
+                "UPDATE acp_events SET event_json = ?1, discriminant = 'ThinkingStarted' WHERE session_id = 'selected'",
                 [&replacement],
             )
             .unwrap();
@@ -210,7 +231,14 @@ mod tests {
         let moved = identity("selected");
         assert_ne!(moved, replaced);
         assert_ne!(identity("other"), other);
-        second.record("selected", 1, &event).unwrap();
+        second
+            .record(
+                "selected",
+                1,
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let recreated = identity("selected");
         assert_ne!(recreated, moved);
         first.delete_session_checked("selected").unwrap();
@@ -221,13 +249,20 @@ mod tests {
             .retained_page("selected", 0, None, 1, Some(&deleted))
             .unwrap()
             .is_some());
-        first.record("other", 2, &event).unwrap();
+        first
+            .record(
+                "other",
+                2,
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         assert_eq!(identity("selected"), deleted);
         drop(second);
         drop(first);
-        let reopened = EventStore::open(&path, 0).unwrap();
+        let reopened = EventStore::open(&path, 0, Default::default()).unwrap();
         assert_eq!(read(&reopened.conn(), "selected").unwrap(), deleted);
-        let fresh = EventStore::open(&dir.path().join("fresh.db"), 0).unwrap();
+        let fresh = EventStore::open(&dir.path().join("fresh.db"), 0, Default::default()).unwrap();
         assert_ne!(read(&fresh.conn(), "selected").unwrap(), deleted);
     }
 }

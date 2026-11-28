@@ -4,7 +4,8 @@ use std::path::Path;
 
 use agent_of_empires::server::test_support::{
     attach_session_id_update_for_test, build_test_app_state, drain_session_id_updates_for_test,
-    load_instances_from_disk_for_test, seed_instances_on_disk_for_test,
+    load_instances_from_disk_for_test, refresh_canonical_metadata_for_test,
+    seed_instances_on_disk_for_test,
 };
 use agent_of_empires::session::Instance;
 use serial_test::serial;
@@ -71,6 +72,7 @@ async fn daemon_session_id_drain_updates_state_and_sessions_json() {
     attach_session_id_update_for_test(&mut target, fresh_sid);
 
     let state = build_test_app_state(vec![target, untouched]);
+    refresh_canonical_metadata_for_test(&state).await;
 
     drain_session_id_updates_for_test(&state).await;
 

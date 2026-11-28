@@ -510,54 +510,68 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_re_post_of_a_delivered_id_queues_nothing() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let mut inst = Instance::new("queue-redeliver", "/tmp/aoe-5730-redeliver");
-        inst.id = "sess-5730".to_string();
-        inst.view = crate::session::View::Structured;
-        inst.status = crate::session::Status::Idle;
-        let id = inst.id.clone();
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let service = state.session_service.clone();
-        let commands = service
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
-            .await;
-        let _live = crate::acp::supervisor::test_support::save_agent_record(&id, "claude", true);
-        service.acp_supervisor.test_publish_worker_attached(&id);
-        let post = || async {
-            queue_enqueue(
-                State(Arc::clone(&state)),
-                Path(id.clone()),
-                axum::http::HeaderMap::new(),
-                Ok(Json(EnqueueRequest {
-                    id: "q1".to_string(),
-                    text: "follow-up".to_string(),
-                    origin_device: None,
-                    attachments: Vec::new(),
-                })),
-            )
-            .await
-            .into_response()
-        };
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "queue-redeliver",
+                    "claude",
+                    None,
+                )
+                .await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let service = state.session_service.clone();
+                let post = || async {
+                    queue_enqueue(
+                        State(Arc::clone(&state)),
+                        Path(id.clone()),
+                        axum::http::HeaderMap::new(),
+                        Ok(Json(EnqueueRequest {
+                            id: "q1".to_string(),
+                            text: "follow-up".to_string(),
+                            origin_device: None,
+                            attachments: Vec::new(),
+                        })),
+                    )
+                    .await
+                    .into_response()
+                };
 
-        assert_eq!(post().await.status(), StatusCode::OK);
-        service.drain_queued_prompts_once(&id).await;
-        assert!(service.queued_prompts_snapshot(&id).await.is_empty());
-        service.acp_supervisor.test_flush_worker_commands(&id).await;
-        let delivered = commands.lock().unwrap().len();
-        assert_eq!(delivered, 1, "the drain delivered the prompt once");
+                assert_eq!(post().await.status(), StatusCode::OK);
+                service.drain_queued_prompts_once(&id).await;
+                assert!(service.queued_prompts_snapshot(&id).await.is_empty());
+                let request = live.next_prompt().await;
+                assert_eq!(request["params"]["prompt"][0]["text"], "follow-up");
+                live.finish_prompt(&request, None).await;
+                let delivered = live
+                    .native
+                    .requests()
+                    .iter()
+                    .filter(|method| method.as_str() == "session/prompt")
+                    .count();
+                assert_eq!(delivered, 1);
 
-        let response = post().await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["delivered"], true);
-        assert!(service.queued_prompts_snapshot(&id).await.is_empty());
-        service.drain_queued_prompts_once(&id).await;
-        service.acp_supervisor.test_flush_worker_commands(&id).await;
-        assert_eq!(commands.lock().unwrap().len(), delivered);
+                let response = post().await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["delivered"], true);
+                assert!(service.queued_prompts_snapshot(&id).await.is_empty());
+                service.drain_queued_prompts_once(&id).await;
+                assert_eq!(
+                    live.native
+                        .requests()
+                        .iter()
+                        .filter(|method| method.as_str() == "session/prompt")
+                        .count(),
+                    delivered
+                );
+            })
+        })
+        .await;
     }
 
     /// #4092: the resume admission orders queue rows against the rate-limit

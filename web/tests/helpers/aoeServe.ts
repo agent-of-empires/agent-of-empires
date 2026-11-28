@@ -164,6 +164,7 @@ export async function waitForView(
 export function seedSessionViaAoeAdd(opts: {
   title: string;
   tool?: string;
+  structuredView?: boolean;
   subdir?: string;
   git?: boolean;
   committed?: Record<string, string>;
@@ -183,6 +184,7 @@ export function seedSessionViaAoeAdd(opts: {
     if (opts.files) writeFiles(projectDir, opts.files);
     opts.prepare?.(projectDir, env);
     const args = ["add", projectDir, "-t", opts.title, "-c", opts.tool ?? "claude"];
+    if (opts.structuredView) args.push("--structured-view");
     if (opts.agentScript) {
       const script = join(shimBin, `${opts.title}-agent`);
       writeFileSync(script, opts.agentScript, { mode: 0o755 });

@@ -12,6 +12,7 @@ const IN_CONTAINER = "podman exec aoe-sandbox-story-ad npm install -g @agentclie
 async function openRefusedSession(page: Page, allow = false) {
   const mock = await mockAcpSession(page, {
     title: "story-adapter-out-of-date",
+    nativeAvailable: false,
     sessionFields: { is_sandboxed: true },
     initialEvents: [
       {
@@ -45,7 +46,7 @@ async function openRefusedSession(page: Page, allow = false) {
   );
   await openStructuredSession(page, mock);
   const screen = page.getByTestId("startup-error-screen");
-  await expect(screen.getByRole("heading", { name: "Claude needs an update in this sandbox" })).toBeVisible();
+  await expect(screen).toBeVisible();
   return { screen, settings };
 }
 

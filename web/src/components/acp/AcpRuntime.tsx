@@ -19,7 +19,7 @@ import {
   setDraftAttachments,
 } from "../../lib/acpDrafts";
 import { MAX_ATTACHMENTS } from "./composerInput";
-import { isVisiblyBusy } from "../../lib/acpTypes";
+import { isVisiblyBusy, nativeInputAvailable } from "../../lib/acpTypes";
 import type {
   AcpState,
   ApprovalDecision,
@@ -65,6 +65,7 @@ export interface AcpContext {
   retryRejectedPrompt: (prompt: RejectedPrompt) => Promise<void>;
   /** The composer's Stop, escalating a cancel the Agent ignores. */
   stopTurn: () => void;
+  canForceEndTurn: boolean;
   /** Staged for the next send; owned here so assistant-ui's `onNew` can send them. */
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
@@ -168,13 +169,20 @@ export function AcpRuntime({
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, queuedCount);
   const agentProfile = useAgentProfile();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
-  const onCancel = useCancelEscalation(
+  const { onCancel: cancelNativeTurn, canForceEndTurn: canForceNativeTurn } = useCancelEscalation(
     sessionId,
     acp.state.promptSeq,
     acp.state.cancelling,
     acp.cancelPrompt,
     acp.forceEndTurn,
   );
+  const hostOnly = acp.state.hostPromptIntent != null && !(acp.state.turnActive && nativeInputAvailable(acp.state));
+  const onCancel = hostOnly
+    ? async () => {
+        await acp.cancelPrompt();
+      }
+    : cancelNativeTurn;
+  const canForceEndTurn = !hostOnly && canForceNativeTurn;
   // Only the recent slice renders, so a long session does not block first paint.
   const { windowedActivity, canLoadEarlier, loadEarlier } = useHistoryWindow(
     sessionId,
@@ -249,6 +257,7 @@ export function AcpRuntime({
         sendPrompt: acp.sendPrompt,
         retryRejectedPrompt: acp.retryRejectedPrompt,
         stopTurn: () => void onCancel(),
+        canForceEndTurn,
         pendingAttachments,
         setPendingAttachments,
         forceEndTurn: acp.forceEndTurn,

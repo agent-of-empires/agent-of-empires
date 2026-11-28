@@ -38,9 +38,14 @@ mod tests {
         let path = dir.path().join("acp_events.db");
         drop(rusqlite::Connection::open(&path).unwrap());
         migrate_database(&path).unwrap();
-        let store = EventStore::open(&path, 0).unwrap();
+        let store = EventStore::open(&path, 0, Default::default()).unwrap();
         store
-            .record("retained", 1, &Event::ThinkingStarted)
+            .record(
+                "retained",
+                1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         let (_, identity) = store
             .retained_page("retained", 0, None, 10, None)
@@ -48,13 +53,18 @@ mod tests {
             .unwrap();
         drop(store);
         migrate_database(&path).unwrap();
-        let store = EventStore::open(&path, 0).unwrap();
+        let store = EventStore::open(&path, 0, Default::default()).unwrap();
         let (page, reopened) = store
             .retained_page("retained", 0, None, 10, None)
             .unwrap()
             .unwrap();
         assert_eq!(identity, reopened);
-        assert!(matches!(&page.events[..], [(1, Event::ThinkingStarted)]));
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].seq, 1);
+        assert!(matches!(
+            page.events[0].event.as_ref(),
+            Event::ThinkingStarted
+        ));
     }
 
     #[test]
@@ -89,10 +99,24 @@ mod tests {
         let initial = identity();
         migrate_database(&path).unwrap();
         assert_eq!(identity(), initial);
-        let store = EventStore::open(&path, 0).unwrap();
-        assert!(matches!(
-            &store.replay_from("retained", 0)[..],
-            [(7, Event::ThinkingStarted)]
-        ));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT seq, event_json FROM acp_events WHERE session_id = 'retained' ORDER BY seq",
+            )
+            .unwrap();
+        let retained = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0, 7);
+        assert_eq!(
+            retained[0].1,
+            serde_json::to_string(&Event::ThinkingStarted).unwrap()
+        );
     }
 }

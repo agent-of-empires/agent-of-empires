@@ -49,6 +49,7 @@ function mount(
   const utils = render(
     <SessionConfigControls
       configOptions={configOptions}
+      nativeAvailable
       pendingConfigOption={pendingConfigOption}
       onSetConfigOption={onSetConfigOption}
       provider={provider?.current ?? null}
@@ -115,7 +116,12 @@ describe("SessionConfigControls", () => {
     const { rerender, onSetConfigOption } = mount([FAST]);
     expect(screen.queryByRole("switch")).not.toBeNull();
     rerender(
-      <SessionConfigControls configOptions={[]} pendingConfigOption={null} onSetConfigOption={onSetConfigOption} />,
+      <SessionConfigControls
+        configOptions={[]}
+        pendingConfigOption={null}
+        onSetConfigOption={onSetConfigOption}
+        nativeAvailable
+      />,
     );
     expect(screen.queryByRole("switch")).toBeNull();
   });
@@ -305,6 +311,32 @@ describe("SessionConfigControls", () => {
       }
     }
   });
+
+  it("withdraws native selectors and closes their menu while leaving provider management independent", () => {
+    const onSetConfigOption = vi.fn();
+    const onSetProvider = vi.fn();
+    const props = {
+      configOptions: [MODEL, EFFORT, FAST],
+      pendingConfigOption: null,
+      onSetConfigOption,
+      provider: "api",
+      onSetProvider,
+    };
+    const { rerender } = render(<SessionConfigControls {...props} nativeAvailable />);
+    fireEvent.click(byId("model")!);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    rerender(<SessionConfigControls {...props} nativeAvailable={false} />);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(byId("model")!.hasAttribute("disabled")).toBe(true);
+    expect(byId("effort-value-high")!.hasAttribute("disabled")).toBe(true);
+    expect(byId("fast")!.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(byId("fast")!);
+    fireEvent.click(byId("effort-value-high")!);
+    expect(onSetConfigOption).not.toHaveBeenCalled();
+    fireEvent.click(byId("aoe-provider")!);
+    fireEvent.click(byId("aoe-provider-value-vertex")!);
+    expect(onSetProvider).toHaveBeenCalledWith("vertex");
+  });
 });
 
 describe("ConfigOptionSwitchFailedNotice", () => {
@@ -336,6 +368,7 @@ describe("provider picker", () => {
     const onSet = vi.fn();
     const props = {
       configOptions: [],
+      nativeAvailable: false,
       pendingConfigOption: null,
       onSetConfigOption: vi.fn(),
       provider: "api",
@@ -386,6 +419,7 @@ describe("provider picker", () => {
     const onSet = vi.fn();
     const props = {
       configOptions: [],
+      nativeAvailable: false,
       pendingConfigOption: null,
       onSetConfigOption: vi.fn(),
       provider: "api",
@@ -416,6 +450,7 @@ describe("model default", () => {
     const view = render(
       <SessionConfigControls
         configOptions={[MODEL]}
+        nativeAvailable
         pendingConfigOption={null}
         onSetConfigOption={vi.fn()}
         modelDefault={target}
@@ -465,6 +500,7 @@ describe("model default", () => {
     render(
       <SessionConfigControls
         configOptions={[MODEL]}
+        nativeAvailable
         pendingConfigOption={null}
         onSetConfigOption={vi.fn()}
         modelDefault={target}
@@ -560,6 +596,7 @@ describe("model default", () => {
     view.rerender(
       <SessionConfigControls
         configOptions={[MODEL]}
+        nativeAvailable
         pendingConfigOption={null}
         onSetConfigOption={vi.fn()}
         modelDefault={{ ...target, agent: "codex" }}
@@ -607,6 +644,7 @@ describe("model default", () => {
     render(
       <SessionConfigControls
         configOptions={[MODEL]}
+        nativeAvailable
         pendingConfigOption={null}
         onSetConfigOption={vi.fn()}
         onSetProvider={vi.fn()}

@@ -3,7 +3,7 @@ import { pickPhoneView } from "../helpers/phoneViews";
 import { join } from "node:path";
 import type { Dialog, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { enableStructuredViewAndWait, composer } from "../helpers/acp";
+import { composer, spawnAcpAgentAndWait } from "../helpers/acp";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { openDeleteDialogFromRow } from "../helpers/trashMocks";
 import { openReviewPane } from "../helpers/panes";
@@ -329,19 +329,19 @@ test("a Structured view save offers a note that appends to the draft without sub
   spawnServe,
 }, testInfo) => {
   let target = "";
-  const serve = await spawnServe({
-    acp: true,
-    seedFn: seedSessionViaAoeAdd({
-      title: "file-structured",
-      git: false,
-      files: { "notes.txt": "original" },
-      prepare: (dir) => {
-        target = join(dir, "notes.txt");
-      },
-    }),
-  });
+  const serve = await spawnServe({ acp: true });
+  // Keep the live daemon in charge of Original establishment.
+  seedSessionViaAoeAdd({
+    title: "file-structured",
+    structuredView: true,
+    git: false,
+    files: { "notes.txt": "original" },
+    prepare: (dir) => {
+      target = join(dir, "notes.txt");
+    },
+  })(serve);
   const [session] = await listSessions(serve.baseUrl);
-  await enableStructuredViewAndWait(serve.baseUrl, session!.id, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, session!.id, 30_000, serve.home);
   await enableEditing(page, serve);
   await openFile(page, serve);
   const draft = composer(page);

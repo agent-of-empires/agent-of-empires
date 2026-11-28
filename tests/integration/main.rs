@@ -49,28 +49,6 @@ mod tmux_send_keys;
 mod update_command;
 mod worktree_integration;
 
-mod acp_mcp;
-
-mod acp_smoke;
-
-mod acp_session_delete;
-
-mod acp_model_respawn;
-mod acp_session_import;
-
-mod acp_provider_respawn;
-
-#[cfg(debug_assertions)]
-mod acp_midturn_resume;
-
-#[cfg(debug_assertions)]
-mod acp_silent_orphan;
-
-#[cfg(unix)]
-mod acp_proxy_launch;
-#[cfg(debug_assertions)]
-mod acp_runner_control;
-mod acp_runner_orphan;
 mod agent_lifecycle_cli;
 mod build_cache_config;
 mod build_version_rerun;

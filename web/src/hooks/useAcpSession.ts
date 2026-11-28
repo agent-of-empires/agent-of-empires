@@ -1,9 +1,12 @@
 // Structured view session: reduces the ACP stream into AcpState and exposes the user's actions.
-// Failed actions surface through `state.lastError` rather than being silently lost.
+// Failed actions surface through transient interaction errors without replacing operation diagnostics.
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
 import {
   emptyAcpState,
+  nativeInputAvailable,
+  canDecideRequest,
+  canSubmitPromptIntent,
   SANDBOX_LOGIN_REQUIRED_CODE,
   type AcpAttachment,
   type AcpState,
@@ -27,7 +30,15 @@ import {
 } from "../lib/api";
 import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
-import { cacheGet, cacheSet, flushPersist, sweepExpiredStorage } from "./acpSession/stateCache";
+import {
+  cacheGet,
+  cacheSet,
+  flushPersist,
+  sweepExpiredStorage,
+  registerLiveAcpActions,
+  ownsLiveAcpActions,
+  NATIVE_INPUT_UNCONFIRMED,
+} from "./acpSession/stateCache";
 import { setLiveQueueCount } from "../lib/acpStateStorage";
 import { useLatestRef } from "./useLatestRef";
 
@@ -133,23 +144,22 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** POST and report a failure as `Could not <verb>` or `Network error <gerund>`, calling `onFail` first. */
-async function postReportingErrors(
-  dispatch: Dispatch<Action>,
+/** Return a POST's user-facing failure, calling `onFail` before the caller reports it. */
+async function postErrorMessage(
   url: string,
   init: RequestInit,
   [verb, gerund]: [string, string],
   onFail?: () => void,
-): Promise<void> {
+): Promise<string | null> {
   try {
     const res = await fetch(url, init);
-    if (res.ok) return;
+    if (res.ok) return null;
     const detail = await safeText(res);
     onFail?.();
-    dispatch({ kind: "error", message: `Could not ${verb} (${res.status}). ${detail}`.trim() });
+    return `Could not ${verb} (${res.status}). ${detail}`.trim();
   } catch (e) {
     onFail?.();
-    dispatch({ kind: "error", message: `Network error ${gerund}: ${describeError(e)}` });
+    return `Network error ${gerund}: ${describeError(e)}`;
   }
 }
 
@@ -165,7 +175,10 @@ interface QueuePosts {
 }
 const queuePosts = new Map<string, QueuePosts>();
 // The mounted hooks showing each Session; with none, an acknowledgment goes to its stored state.
-const queueAckTargets = new Map<string, Set<Dispatch<Action>>>();
+const queueAckTargets = new Map<string, Map<Dispatch<Action>, () => boolean>>();
+const queueMigrations = new Map<string, Promise<ReadonlySet<string>>>();
+const attemptedMigrations = new Map<string, Set<string>>();
+const queueEdits = new Map<string, Promise<unknown>>();
 
 export function pendingRowIds(state: AcpState): ReadonlySet<string> {
   return new Set(state.queuedPrompts.filter((q) => q.pending).map((q) => q.id));
@@ -180,7 +193,7 @@ export function pendingRowsChanged(before: ReadonlySet<string>, state: AcpState)
 function acknowledgeQueued(sessionId: string, action: Action): void {
   const targets = queueAckTargets.get(sessionId);
   if (targets?.size) {
-    for (const target of targets) target(action);
+    for (const target of targets.keys()) target(action);
     return;
   }
   const stored = cacheGet(sessionId);
@@ -233,12 +246,25 @@ async function postQueuedRow(
   return true;
 }
 
-function migrateQueue(sessionId: string, rows: QueuedPrompt[]): Promise<void> {
-  return postQueuedInOrder(sessionId, async (entry) => {
+async function migrateQueue(
+  sessionId: string,
+  rows: QueuedPrompt[],
+  admitted: () => boolean,
+): Promise<ReadonlySet<string>> {
+  const confirmed = new Set<string>();
+  const attempted = attemptedMigrations.get(sessionId) ?? new Set<string>();
+  attemptedMigrations.set(sessionId, attempted);
+  await postQueuedInOrder(sessionId, async (entry) => {
     for (const q of rows) {
+      if (!admitted()) break;
+      // A missing response does not prove the daemon did not deliver the row.
+      if (attempted.has(q.id)) continue;
+      attempted.add(q.id);
       await postQueuedRow(sessionId, entry, { id: q.id, text: q.text, attachments: q.attachments });
+      if (entry.posted.has(q.id)) confirmed.add(q.id);
     }
   });
+  return confirmed;
 }
 
 function markQueuedRemoved(sessionId: string, ids: Iterable<string>): void {
@@ -267,7 +293,7 @@ function optimisticPromptId(): string {
 
 export function useAcpSession(
   sessionId: string | null,
-  /** Queued prompts can be sent immediately only while the worker is running. */
+  /** Explicit worker shutdown also disables queue delivery while it is in progress. */
   workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   archivedAt: string | null = null,
   snoozedUntil: string | null = null,
@@ -299,11 +325,39 @@ export function useAcpSession(
   const queuedPromptsRef = useLatestRef(state.queuedPrompts);
   const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch);
   const { status, lastActivityRef } = connection;
+  const inputStateRef = useRef(state);
+  const connectionStatusRef = useRef(status);
+  useLayoutEffect(() => {
+    inputStateRef.current = state;
+    connectionStatusRef.current = status;
+  }, [state, status]);
+  const actionOwner = useMemo(() => Symbol(sessionId ?? undefined), [sessionId]);
+  const requireNativeInput = useCallback(
+    (
+      target?: NonNullable<AcpState["interactionError"]>["target"],
+      mode: "native" | "decision" | "prompt_intent" | "authorized_snooze_wake" = "native",
+    ): boolean => {
+      const current = inputStateRef.current;
+      const allowed =
+        mode === "decision"
+          ? !!target && !archivedAtRef.current && canDecideRequest(current, target.nonce)
+          : mode === "native"
+            ? nativeInputAvailable(current)
+            : mode === "prompt_intent"
+              ? canSubmitPromptIntent(current)
+              : current.nativeSnapshotSeq != null && current.connectionUnavailable === null;
+      if (connectionStatusRef.current === "open" && allowed) return true;
+      dispatch({ kind: "error", message: NATIVE_INPUT_UNCONFIRMED, target });
+      return false;
+    },
+    [inputStateRef, connectionStatusRef, archivedAtRef],
+  );
 
-  // Resolvers throw on failure so the card re-enables and the same nonce can be resubmitted.
+  // Reject failures so the card rolls back and the same nonce remains retryable.
   const resolveApproval = useCallback(
     async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
+      if (!requireNativeInput({ kind: "approval", nonce }, "decision")) throw new Error(NATIVE_INPUT_UNCONFIRMED);
       let res: Response;
       try {
         res = await fetch(
@@ -311,7 +365,11 @@ export function useAcpSession(
           jsonPost(optionId === undefined ? { decision } : { decision, option_id: optionId }),
         );
       } catch (e) {
-        dispatch({ kind: "error", message: `Network error resolving approval: ${describeError(e)}` });
+        dispatch({
+          kind: "error",
+          message: `Network error resolving approval: ${describeError(e)}`,
+          target: { kind: "approval", nonce },
+        });
         throw e;
       }
       const detail = res.ok ? "" : await safeText(res);
@@ -320,20 +378,25 @@ export function useAcpSession(
         dispatch({ kind: "approval_resolved_locally", nonce });
         return;
       }
-      dispatch({ kind: "error", message: outcome.message });
+      dispatch({ kind: "error", message: outcome.message, target: { kind: "approval", nonce } });
       throw new Error(outcome.message);
     },
-    [sessionId],
+    [sessionId, requireNativeInput],
   );
 
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
       if (!sessionId) return;
+      if (!requireNativeInput({ kind: "elicitation", nonce }, "decision")) throw new Error(NATIVE_INPUT_UNCONFIRMED);
       let res: Response;
       try {
         res = await fetch(acpUrl(sessionId, `elicitations/${encodeURIComponent(nonce)}`), jsonPost(resolution));
       } catch (e) {
-        dispatch({ kind: "error", message: `Network error resolving question: ${describeError(e)}` });
+        dispatch({
+          kind: "error",
+          message: `Network error resolving question: ${describeError(e)}`,
+          target: { kind: "elicitation", nonce },
+        });
         throw e;
       }
       const detail = res.ok ? "" : await safeText(res);
@@ -342,15 +405,20 @@ export function useAcpSession(
         dispatch({ kind: "elicitation_resolved_locally", nonce, resolution });
         return;
       }
-      dispatch({ kind: "error", message: outcome.message });
+      dispatch({ kind: "error", message: outcome.message, target: { kind: "elicitation", nonce } });
       throw new Error(outcome.message);
     },
-    [sessionId],
+    [sessionId, requireNativeInput],
   );
 
   // POST a prompt behind an optimistic overlay row keyed by its prompt_id and report the outcome.
   const dispatchPromptNow = useCallback(
-    async (text: string, attachments?: PromptAttachmentInput[], queuedPromptId?: string): Promise<PromptSendResult> => {
+    async (
+      text: string,
+      attachments?: PromptAttachmentInput[],
+      queuedPromptId?: string,
+      admission: "prompt_intent" | "authorized_snooze_wake" = "prompt_intent",
+    ): Promise<PromptSendResult> => {
       if (!sessionId) return { kind: "retryable_failure" };
       const previews: AcpAttachment[] = (attachments ?? []).map((a, i) => ({
         id: `local-${Date.now()}-${i}`,
@@ -362,6 +430,11 @@ export function useAcpSession(
       }));
       const promptId = optimisticPromptId();
       dispatch({ kind: "user_prompt", id: promptId, text, attachments: previews.length > 0 ? previews : undefined });
+      if (!requireNativeInput(undefined, admission)) {
+        dispatch({ kind: "prompt_send_rejected", id: promptId });
+        dispatch({ kind: "prompt_answered", promptId });
+        return { kind: "non_retryable_failure" };
+      }
       lastActivityRef.current = Date.now();
       try {
         const res = await fetch(
@@ -438,7 +511,7 @@ export function useAcpSession(
         dispatch({ kind: "prompt_answered", promptId });
       }
     },
-    [sessionId, lastActivityRef],
+    [sessionId, lastActivityRef, requireNativeInput],
   );
 
   const enqueueServer = useCallback(
@@ -459,7 +532,7 @@ export function useAcpSession(
   );
 
   const showServerQueued = useCallback((id: string, text: string, attachments?: PromptAttachmentInput[]) => {
-    dispatch({ kind: "enqueue_prompt", id, text, attachments });
+    dispatch({ kind: "enqueue_prompt", id, text, attachments, preserveExisting: true });
     dispatch({ kind: "confirm_queued_prompt", id });
   }, []);
 
@@ -471,6 +544,13 @@ export function useAcpSession(
         dispatch({ kind: "error", message: "session is archived; unarchive it first" });
         return;
       }
+      // Refuse before waking or touching the queue. Opening a socket, replay,
+      // and cached lifecycle flags are not current intent admission.
+      if (connectionStatusRef.current !== "open" || !canSubmitPromptIntent(inputStateRef.current)) {
+        await dispatchPromptNow(text, attachments);
+        return;
+      }
+      const authorizedSnoozeWake = !!snoozedUntilRef.current && inputStateRef.current.promptWakeEligible;
       // The reconciler skips snoozed sessions, so wake them before sending.
       if (snoozedUntilRef.current && !(await setSessionSnooze(sessionId, null))) {
         dispatch({
@@ -479,7 +559,15 @@ export function useAcpSession(
         });
         return;
       }
-      const result = await dispatchPromptNow(text, attachments);
+      // Our own authorized unsnooze can consume its eligibility before the POST.
+      // Carry only that single existing wake intent, never generic Unknown;
+      // loss still refuses here and actual delivery rechecks the core fences.
+      const result = await dispatchPromptNow(
+        text,
+        attachments,
+        undefined,
+        authorizedSnoozeWake ? "authorized_snooze_wake" : "prompt_intent",
+      );
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, text, attachments);
         reportAcpInteraction("prompt_queued");
@@ -491,9 +579,19 @@ export function useAcpSession(
         enqueueServer(text, attachments);
       }
     },
-    [sessionId, archivedAtRef, snoozedUntilRef, dispatchPromptNow, enqueueServer, showServerQueued],
+    [
+      sessionId,
+      archivedAtRef,
+      snoozedUntilRef,
+      dispatchPromptNow,
+      enqueueServer,
+      showServerQueued,
+      inputStateRef,
+      connectionStatusRef,
+    ],
   );
 
+  const queueMigrationEligible = status === "open" && canSubmitPromptIntent(state);
   /** Resends a refused prompt as it was sent, attachments included. */
   const retryRejectedPrompt = useCallback(
     async (prompt: RejectedPrompt) => {
@@ -518,11 +616,11 @@ export function useAcpSession(
   // poll). The first list per session waits for rows the server never confirmed to be re-sent,
   // once each; a rerun must not cancel that. A confirmed row missing from the server was
   // drained and must not be re-created.
-  const queueMigrationRef = useRef<Map<string, Promise<void>>>(new Map());
   useEffect(() => {
     if (!sessionId) return;
-    const targets = queueAckTargets.get(sessionId) ?? new Set<Dispatch<Action>>();
-    queueAckTargets.set(sessionId, targets.add(dispatch));
+    const targets = queueAckTargets.get(sessionId) ?? new Map<Dispatch<Action>, () => boolean>();
+    targets.set(dispatch, () => connectionStatusRef.current === "open" && canSubmitPromptIntent(inputStateRef.current));
+    queueAckTargets.set(sessionId, targets);
     return () => {
       targets.delete(dispatch);
       if (!targets.size && queueAckTargets.get(sessionId) === targets) queueAckTargets.delete(sessionId);
@@ -545,24 +643,34 @@ export function useAcpSession(
   useEffect(() => {
     if (!sessionId || status !== "open") return;
     let cancelled = false;
-    let migration = queueMigrationRef.current.get(sessionId);
-    if (!migration) {
+    let migration = queueMigrations.get(sessionId);
+    if (!migration && queueMigrationEligible) {
       migration = migrateQueue(
         sessionId,
         queuedPromptsRef.current.filter((q) => q.pending),
+        () => Array.from(queueAckTargets.get(sessionId)?.values() ?? []).some((admitted) => admitted()),
       );
-      queueMigrationRef.current.set(sessionId, migration);
+      queueMigrations.set(sessionId, migration);
+      const pending = migration;
+      const settle = () => {
+        if (queueMigrations.get(sessionId) === pending) queueMigrations.delete(sessionId);
+      };
+      pending.then(settle, settle);
     }
     const migrated = migration;
     let retry: ReturnType<typeof setTimeout> | undefined;
     void (async () => {
-      await migrated;
+      const migrationConfirmed = queueMigrationEligible ? await migrated : undefined;
       for (const delay of [...QUEUE_LIST_RETRY_MS, null]) {
+        await queueEdits.get(sessionId);
+        if (cancelled) return;
+        const queueAtRead = queuedPromptsRef.current;
         const rows = await listServerQueue(sessionId);
         if (cancelled) return;
+        if (rows !== null && queueAtRead !== queuedPromptsRef.current) continue;
         if (rows !== null) {
           queueListedRef.current = true;
-          dispatch({ kind: "hydrate_server_queue", rows });
+          dispatch({ kind: "hydrate_server_queue", rows, queueAtRead, migrationConfirmed });
           return;
         }
         // A failed list must not replace the rows on screen. The sidebar falls back to the polled
@@ -577,7 +685,16 @@ export function useAcpSession(
       cancelled = true;
       clearTimeout(retry);
     };
-  }, [sessionId, status, state.turnActive, queuedPromptsRef, polledQueuedCount]);
+  }, [
+    sessionId,
+    status,
+    state.turnActive,
+    queuedPromptsRef,
+    polledQueuedCount,
+    queueMigrationEligible,
+    inputStateRef,
+    connectionStatusRef,
+  ]);
 
   // Queue mutations are optimistic; a failed server call is corrected by the next hydrate.
   const removeQueuedPrompt = useCallback(
@@ -595,7 +712,14 @@ export function useAcpSession(
       dispatch({ kind: "edit_queued_prompt", id, text });
       if (!sessionId) return;
       markQueuedEdited(sessionId, id, text);
-      void editServerQueuedPrompt(sessionId, id, text);
+      const previous = queueEdits.get(sessionId);
+      const send = () => editServerQueuedPrompt(sessionId, id, text);
+      const edit = previous ? previous.then(send, send) : send();
+      queueEdits.set(sessionId, edit);
+      const settle = () => {
+        if (queueEdits.get(sessionId) === edit) queueEdits.delete(sessionId);
+      };
+      edit.then(settle, settle);
     },
     [sessionId],
   );
@@ -611,19 +735,53 @@ export function useAcpSession(
   }, [sessionId, queuedPromptsRef]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
-  const cancelPrompt = useCallback(async () => {
-    if (!sessionId) return;
-    await postReportingErrors(dispatch, acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"]);
-  }, [sessionId]);
+  const hostPromptIntent = state.hostPromptIntent;
+  const performCancelPrompt = useCallback(async (): Promise<string | null> => {
+    if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
+    const current = inputStateRef.current;
+    if (current.hostPromptIntent !== hostPromptIntent) return NATIVE_INPUT_UNCONFIRMED;
+    const hostIntent =
+      current.nativeSnapshotSeq != null &&
+      Number.isFinite(current.nativeSnapshotSeq) &&
+      current.connectionUnavailable === null
+        ? current.hostPromptIntent
+        : null;
+    if (!hostIntent && !requireNativeInput()) return NATIVE_INPUT_UNCONFIRMED;
+    const request: RequestInit = { method: "POST" };
+    if (hostIntent) {
+      request.headers = { "Content-Type": "application/json" };
+      request.body = JSON.stringify({ host_prompt_intent: hostIntent });
+    }
+    const message = await postErrorMessage(acpUrl(sessionId, "cancel"), request, ["cancel", "cancelling"]);
+    if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
+    return message;
+  }, [sessionId, actionOwner, hostPromptIntent, requireNativeInput]);
+  const cancelPrompt = useCallback(async () => (await performCancelPrompt()) === null, [performCancelPrompt]);
 
+  const performCancelSubagent = useCallback(
+    async (childId: string): Promise<string | null> => {
+      if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
+      if (!requireNativeInput()) return NATIVE_INPUT_UNCONFIRMED;
+      const message = await cancelSubagent(sessionId, childId);
+      if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
+      return message;
+    },
+    [sessionId, actionOwner, requireNativeInput],
+  );
   const cancelSubagentById = useCallback(
     async (childId: string) => {
-      if (!sessionId) return;
-      const message = await cancelSubagent(sessionId, childId);
-      if (message) dispatch({ kind: "error", message });
+      await performCancelSubagent(childId);
     },
-    [sessionId],
+    [performCancelSubagent],
   );
+
+  useLayoutEffect(() => {
+    if (!sessionId) return;
+    return registerLiveAcpActions(sessionId, actionOwner, {
+      cancelPrompt: performCancelPrompt,
+      cancelSubagent: performCancelSubagent,
+    });
+  }, [sessionId, actionOwner, performCancelPrompt, performCancelSubagent]);
 
   const steerable = !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;
 
@@ -632,6 +790,7 @@ export function useAcpSession(
     async (prompt: QueuedPrompt) => {
       const sid = sessionIdRef.current;
       if (!sid) return;
+      if (!requireNativeInput(undefined, "prompt_intent")) return;
       if (state.turnActive && !steerable) {
         await cancelPrompt();
         return;
@@ -642,6 +801,9 @@ export function useAcpSession(
       // and a plugin-sent row keeps the sender it stored.
       dispatch({ kind: "dequeue_prompt", id: prompt.id });
       const result = await dispatchPromptNow(prompt.text, prompt.attachments, prompt.id);
+      // A concurrent list can have reintroduced the row while delivery awaited
+      // the daemon. Settle it again at acknowledgement before any retained-row upsert.
+      dispatch({ kind: "dequeue_prompt", id: prompt.id });
       // The daemon keeps the row until it accepts the send, so a refusal or a re-park leaves it queued.
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, prompt.text, prompt.attachments);
@@ -653,34 +815,38 @@ export function useAcpSession(
         showServerQueued(prompt.id, prompt.text, prompt.attachments);
       }
     },
-    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, showServerQueued],
+    [sessionIdRef, state.turnActive, steerable, cancelPrompt, dispatchPromptNow, showServerQueued, requireNativeInput],
   );
 
   // Pessimistic: the value changes when the adapter confirms; pending only dims the clicked option.
   const setConfigOption = useCallback(
     async (configId: string, value: string) => {
       if (!sessionId) return;
+      if (!requireNativeInput()) return;
       dispatch({ kind: "set_pending_config_option", configId, value });
-      await postReportingErrors(
-        dispatch,
+      const message = await postErrorMessage(
         acpUrl(sessionId, "config-option"),
         jsonPost({ config_id: configId, value }),
         [`set ${configId}`, `setting ${configId}`],
         () => dispatch({ kind: "clear_pending_config_option_if_match", configId, value }),
       );
+      if (message) dispatch({ kind: "error", message });
     },
-    [sessionId],
+    [sessionId, requireNativeInput],
   );
 
   // The server publishes the resulting Stopped event; no client-side Stopped is fabricated.
+  const hostOnlyForceRefused = hostPromptIntent != null && !(state.turnActive && nativeInputAvailable(state));
   const forceEndTurn = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner) || hostOnlyForceRefused) return;
+    if (inputStateRef.current.hostPromptIntent !== hostPromptIntent) return;
     lastActivityRef.current = Date.now();
-    await postReportingErrors(dispatch, acpUrl(sessionId, "force_end_turn"), { method: "POST" }, [
+    const message = await postErrorMessage(acpUrl(sessionId, "force_end_turn"), { method: "POST" }, [
       "force end turn",
       "forcing end turn",
     ]);
-  }, [sessionId, lastActivityRef]);
+    if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
+  }, [sessionId, actionOwner, hostOnlyForceRefused, hostPromptIntent, inputStateRef, lastActivityRef]);
 
   const dismissers = useMemo(
     () => ({
@@ -715,16 +881,7 @@ export function useAcpSession(
     editQueuedPrompt,
     clearQueue,
     sendQueuedNow,
-    canSendQueuedNow:
-      status === "open" &&
-      !state.workerStopped &&
-      !state.workerRestarting &&
-      // Same mirror: "Send now" is offered wherever a prompt can start a worker, which is what
-      // lets a row queued before the park drain without waiting out the reset window.
-      (workerState === "running" ||
-        state.workerIdleStopped ||
-        state.rateLimitRetriesExhausted ||
-        state.rateLimitParked),
+    canSendQueuedNow: status === "open" && canSubmitPromptIntent(state) && workerState !== "stopping",
     /** Send now would cancel a running, non-steerable turn rather than send immediately. */
     sendNowInterruptsTurn: state.turnActive && !steerable,
     setConfigOption,

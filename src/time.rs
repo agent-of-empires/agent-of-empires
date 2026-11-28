@@ -116,6 +116,10 @@ impl Timestamp {
         self.0.unix_timestamp()
     }
 
+    pub(crate) fn subsec_nanos(self) -> u32 {
+        self.0.nanosecond()
+    }
+
     /// Floors toward negative infinity, as chrono's `timestamp_millis` does.
     pub fn as_millis(self) -> i64 {
         self.0.unix_timestamp_nanos().div_euclid(1_000_000) as i64

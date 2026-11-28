@@ -787,9 +787,32 @@ mod tests {
         });
         let app = test_support::build_router_for_test(state);
         let cred = secret.plugin_server_credential_for("plug", "srv", &id);
-        let (status, body) = call(&app, ENDPOINT, Some(&cred), Some(&id)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(body["error"], "cityhall_mode");
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let request = Request::builder()
+                .method(method)
+                .uri(ENDPOINT)
+                .header(header::HOST, "localhost")
+                .header(header::AUTHORIZATION, format!("Bearer {cred}"))
+                .header("x-aoe-session", id.as_str())
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    5555,
+                ))))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                "cityhall_mode",
+                "{method}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "cityhall_mode", "{method}");
+        }
     }
 
     fn manifest(id: &str, caps: &str) -> PluginManifest {

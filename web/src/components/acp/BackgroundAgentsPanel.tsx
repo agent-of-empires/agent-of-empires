@@ -13,7 +13,7 @@ import {
   useWorkflowRuns,
 } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, SubagentRecord } from "../../lib/acpTypes";
-import { cancelSubagent } from "../../lib/api";
+import { getLiveAcpActions, NATIVE_INPUT_UNCONFIRMED } from "../../hooks/acpSession/stateCache";
 import { reportError } from "../../lib/toastBus";
 import {
   BackgroundAgentsContext,
@@ -107,7 +107,8 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
       subagents,
       readOnly,
       cancelSubagent: async (childId: string) => {
-        const error = sessionId ? await cancelSubagent(sessionId, childId) : null;
+        const actions = sessionId ? getLiveAcpActions(sessionId) : undefined;
+        const error = actions ? await actions.cancelSubagent(childId) : NATIVE_INPUT_UNCONFIRMED;
         if (error) reportError(error);
       },
     }),
@@ -397,7 +398,10 @@ function AgentRow({
         {stoppable && (
           <StopSubagent
             childId={roster.session_id}
-            cancel={async (id) => setStopError(await cancelSubagent(sessionId, id))}
+            cancel={async (id) => {
+              const actions = getLiveAcpActions(sessionId);
+              setStopError(actions ? await actions.cancelSubagent(id) : NATIVE_INPUT_UNCONFIRMED);
+            }}
           />
         )}
       </div>

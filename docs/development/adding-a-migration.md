@@ -17,6 +17,29 @@ Migrations must be idempotent, use `tracing::info!`, gate platform-specific ones
 
 Do not reuse a published migration number for a different transformation. When integrating divergent schema histories, preserve the published meaning and add idempotent reconciliation steps newer than both histories. Test upgrades from each history and a second run over the migrated state.
 
+ACP reconciliation preserves ACP54–57 establishment, event scope, prompt
+publication, and budget knowledge. A main55 marker does not prove ACP55
+event scope. The registry preserves main63 for retired color labels, main64 for
+retired sound file overrides, main65 for separate account-limit estimate rows,
+main66 for removing retired agent-update restart fields from session rows, and
+main67 for dropping retired restart wake settings.
+The estimate migration first reconciles the cache shape if an ACP marker skipped
+main58. ACP reconciliation repeats the color, sound, agent-update, and restart
+wake cleanups because ACP markers do not prove those main steps ran. In
+particular, a marker of 67 can mean either main's wake cleanup or ACP's
+reconciliation, not necessarily both.
+
+A marker of 68 can mean main's shared sidebar migration or ACP's reconciliation.
+The registry keeps main's v068. v069 reconciles ACP and folds any remaining
+legacy sidebar preferences, preserving shared choices over stale web mirrors
+when the stored preferences could already be shared. The runner stamps each
+migration only after it succeeds; a retry can safely repeat completed steps.
+
+Qualification reconciliation also validates recorded private child source and
+ancestry metadata. It does not synthesize that proof from reported parent/child
+IDs, rewrite historical content into current authority, or treat a current schema
+marker as proof that a legacy child may join a current resource.
+
 Adding an optional field whose missing and null forms mean the same thing does not require rewriting existing rows.
 
 Scope and process authority must remain exact. Missing legacy proof stays unresolved until complete authoritative inventory proves absence. Preserve captured units, process births, native runtime and producer identity. An unfinished constructor prevents discharge of unknown scope debt. Never overwrite readable malformed proof or infer launch or retirement authority from a missing field. Inventory selectors never authorize retirement, except units in the pre-custody naming format, which earlier releases stopped by the same glob.

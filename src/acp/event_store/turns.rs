@@ -2,10 +2,15 @@
 
 use std::collections::HashMap;
 
+use crate::acp::establishment::{NativeResourceSelector, NativeResourceWitness};
+use crate::acp::event_sender::EventMetadata;
+use anyhow::Result;
 use rusqlite::{params, OptionalExtension};
+use std::sync::Arc;
 
 use super::{
-    decode_logged, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+    decode_logged, logged, query_strings, ControlKnowledge, EventStore,
+    NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
 };
 use crate::acp::approvals::{Approval, Nonce};
 use crate::acp::state::{BackgroundTaskLaunch, Event, Plan, SubagentRecord, WorkflowAgents};
@@ -30,31 +35,40 @@ pub struct TerminalRepairProbe {
 pub struct UnresolvedBackgroundAgentLaunch {
     pub agent_id: String,
     pub output_file: String,
+    pub(crate) witness: Option<std::sync::Arc<crate::acp::establishment::NativeResourceWitness>>,
 }
 
-/// Launches with no matching completion, shared by both unresolved-launch
-/// queries. Both `agent_id` extractions are `IS NOT NULL`-guarded: SQLite's
-/// `NOT IN` evaluates to `NULL` (never true) for every row once the subquery
-/// yields one `NULL`, so a single unextractable id would otherwise blank the
-/// whole result instead of just miscounting that row.
+/// Only a matching allocation's later completion can retire its launch.
 const UNRESOLVED_BACKGROUND_AGENT_WHERE: &str = "
-     FROM acp_events
-     WHERE session_id = ?1
-       AND discriminant = 'BackgroundAgentLaunched'
-       AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
-       AND json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') NOT IN (
-           SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
-           FROM acp_events
-           WHERE session_id = ?1
-             AND discriminant = 'BackgroundAgentCompleted'
-             AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IS NOT NULL
+     FROM acp_events AS started
+     WHERE started.session_id = ?1
+       AND started.discriminant = 'BackgroundAgentLaunched'
+       AND json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM acp_events later
+           WHERE later.session_id = started.session_id
+             AND later.discriminant = started.discriminant AND later.seq > started.seq
+             AND json_extract(later.event_json, '$.BackgroundAgentLaunched.agent_id') =
+                 json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id')
+             AND (json_extract(later.qualification_json, '$.resource_ref') IS NOT NULL
+                 OR json_extract(started.qualification_json, '$.resource_ref') IS NULL)
        )
-     ORDER BY seq ASC";
+       AND NOT EXISTS (
+           SELECT 1 FROM acp_events finished
+           WHERE finished.session_id = started.session_id
+             AND finished.discriminant = 'BackgroundAgentCompleted' AND finished.seq > started.seq
+             AND json_extract(finished.event_json, '$.BackgroundAgentCompleted.agent_id') =
+                 json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id')
+             AND json_extract(finished.qualification_json, '$.resource_ref')
+                 IS json_extract(started.qualification_json, '$.resource_ref')
+       )
+     ORDER BY started.seq ASC";
 
 const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
     "SELECT json_extract(started.event_json, '$.BackgroundTaskStarted.task_id') AS task_id,
             json_extract(started.event_json, '$.BackgroundTaskStarted.tool_call_id'),
-            json_extract(started.event_json, '$.BackgroundTaskStarted.workflow')
+            json_extract(started.event_json, '$.BackgroundTaskStarted.workflow'),
+            started.scope, started.qualification_json
      FROM acp_events AS started
      WHERE started.session_id = ?1
        AND started.discriminant = 'BackgroundTaskStarted'
@@ -66,6 +80,8 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
              AND later.seq > started.seq
              AND json_extract(later.event_json, '$.BackgroundTaskStarted.task_id') =
                  json_extract(started.event_json, '$.BackgroundTaskStarted.task_id')
+             AND (json_extract(later.qualification_json, '$.resource_ref') IS NOT NULL
+                 OR json_extract(started.qualification_json, '$.resource_ref') IS NULL)
        )
        AND NOT EXISTS (
            SELECT 1 FROM acp_events AS finished
@@ -74,6 +90,8 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
              AND finished.seq > started.seq
              AND json_extract(finished.event_json, '$.BackgroundTaskFinished.task_id') =
                  json_extract(started.event_json, '$.BackgroundTaskStarted.task_id')
+             AND json_extract(finished.qualification_json, '$.resource_ref')
+                 IS json_extract(started.qualification_json, '$.resource_ref')
        )
      ORDER BY started.seq ASC";
 
@@ -101,34 +119,132 @@ const OPEN_SUBAGENTS_SQL: &str = "SELECT latest.event_json
            IN ('running', 'requires_action')
      ORDER BY latest.seq ASC";
 
-/// The agents of workflow run `run_id` the log has launched, and those of
-/// them it has completed.
-fn workflow_agents(conn: &rusqlite::Connection, session_id: &str, run_id: &str) -> WorkflowAgents {
-    let what = "workflow_agents";
-    let ids = |sql: &str| -> std::collections::HashSet<String> {
-        let Some(mut stmt) = logged(conn.prepare_cached(sql), what, session_id) else {
-            return Default::default();
+/// Group child allocations once for all retained workflow parents.
+fn workflow_agents(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<HashMap<String, HashMap<Option<uuid::Uuid>, WorkflowAgents>>> {
+    const SQL: &str = "
+        SELECT json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id'),
+               json_extract(started.event_json, '$.BackgroundAgentLaunched.output_file'),
+               json_extract(started.event_json, '$.BackgroundAgentLaunched.tool_call_id'),
+               started.scope, started.qualification_json,
+               json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow.run_id'),
+               EXISTS (
+                   SELECT 1 FROM acp_events finished
+                   WHERE finished.session_id = started.session_id
+                     AND finished.discriminant = 'BackgroundAgentCompleted'
+                     AND finished.seq > started.seq
+                     AND json_extract(finished.event_json, '$.BackgroundAgentCompleted.agent_id') =
+                         json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id')
+                     AND json_extract(finished.qualification_json, '$.resource_ref')
+                         IS json_extract(started.qualification_json, '$.resource_ref')
+               )
+        FROM acp_events started
+        WHERE started.session_id = ?1 AND started.discriminant = 'BackgroundAgentLaunched'
+          AND json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow.run_id') IS NOT NULL
+        ORDER BY started.seq ASC";
+    let mut statement = conn.prepare_cached(SQL)?;
+    let mut rows = statement.query([session_id])?;
+    let mut groups: HashMap<String, HashMap<Option<uuid::Uuid>, WorkflowAgents>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let agent: String = row.get(0)?;
+        let run = optional_text(row, 5)?.ok_or_else(|| invalid_launch("workflow run is absent"))?;
+        let witness = launch_witness(row, 3, 4, session_id)?;
+        let parent = match witness.as_deref() {
+            Some(witness) => {
+                if !witness.matches_agent_launch(
+                    &agent,
+                    optional_text(row, 2)?.unwrap_or_default(),
+                    optional_text(row, 1)?.unwrap_or_default(),
+                    Some(run),
+                ) {
+                    return Err(invalid_launch(
+                        "workflow resource selector differs from its launch",
+                    )
+                    .into());
+                }
+                match witness.selector.as_ref() {
+                    NativeResourceSelector::WorkflowChild {
+                        parent_allocation, ..
+                    } => Some(*parent_allocation),
+                    _ => {
+                        return Err(
+                            invalid_launch("workflow launch has no parent allocation").into()
+                        )
+                    }
+                }
+            }
+            None => None,
         };
-        let rows = stmt.query_map(params![session_id, run_id], |row| row.get::<_, String>(0));
-        logged(rows, what, session_id)
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-    };
-    const LAUNCHED: &str = "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id')
-         FROM acp_events
-         WHERE session_id = ?1
-           AND discriminant = 'BackgroundAgentLaunched'
-           AND json_extract(event_json, '$.BackgroundAgentLaunched.workflow.run_id') = ?2";
-    WorkflowAgents {
-        launched: ids(LAUNCHED),
-        completed: ids(&format!(
-            "SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
-             FROM acp_events
-             WHERE session_id = ?1
-               AND discriminant = 'BackgroundAgentCompleted'
-               AND json_extract(event_json, '$.BackgroundAgentCompleted.agent_id') IN ({LAUNCHED})"
-        )),
+        if !groups.contains_key(run) {
+            groups.insert(run.to_owned(), HashMap::new());
+        }
+        let known = groups
+            .get_mut(run)
+            .expect("run inserted")
+            .entry(parent)
+            .or_default();
+        known.launched.insert(agent.clone());
+        if row.get::<_, bool>(6)? {
+            known.completed.insert(agent.clone());
+        } else {
+            known.completed.remove(&agent);
+        }
+        if let Some(witness) = witness {
+            known.resources.insert(agent, witness);
+        }
     }
+    Ok(groups)
+}
+
+fn invalid_launch(message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        4,
+        rusqlite::types::Type::Text,
+        anyhow::anyhow!(message).into(),
+    )
+}
+
+fn optional_text<'a>(
+    row: &'a rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<&'a str>> {
+    row.get_ref(column)?.as_str_or_null().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn launch_witness(
+    row: &rusqlite::Row<'_>,
+    scope: usize,
+    qualification: usize,
+    session_id: &str,
+) -> rusqlite::Result<Option<Arc<NativeResourceWitness>>> {
+    let metadata =
+        EventMetadata::decode_private(row.get(scope)?, optional_text(row, qualification)?)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    qualification,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?;
+    if let Some(witness) = metadata.resource_witness.as_deref() {
+        if witness.session_id != session_id || metadata.host_action || metadata.availability_denial
+        {
+            return Err(invalid_launch(
+                "resource qualification has a different owner or role",
+            ));
+        }
+    } else if metadata.resource_ref.is_some() {
+        return Err(invalid_launch("resource launch has no first-I/O witness"));
+    }
+    Ok(metadata.resource_witness)
 }
 
 impl EventStore {
@@ -210,8 +326,7 @@ impl EventStore {
         }
     }
 
-    /// The first prompt and the agent prose of its turn (up to the first
-    /// `Stopped`, whatever the reason), capped at `max_agent_bytes`.
+    /// The first prompt and its turn's prose, capped at `max_agent_bytes`.
     pub fn first_turn_context(
         &self,
         session_id: &str,
@@ -249,7 +364,12 @@ impl EventStore {
                 {
                     agent.push_str(&text);
                 }
-                Event::Stopped { .. } if first_prompt.is_some() => break,
+                Event::Stopped { .. } | Event::AgentStartupError { .. }
+                    if first_prompt.is_some() =>
+                {
+                    break
+                }
+                event if first_prompt.is_some() && event.is_channel_loss() => break,
                 _ => {}
             }
         }
@@ -264,11 +384,12 @@ impl EventStore {
         Some((first_prompt, agent))
     }
 
-    /// Nonces of `ApprovalRequested` events with no later `ApprovalResolved`.
+    /// Nonces whose responders were neither resolved nor invalidated by loss.
     pub fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
         query_strings(
             &self.conn(),
-            "SELECT json_extract(event_json, '$.ApprovalRequested.approval.nonce') AS nonce
+            concat!(
+                "SELECT json_extract(event_json, '$.ApprovalRequested.approval.nonce') AS nonce
              FROM acp_events
              WHERE session_id = ?1
                AND discriminant = 'ApprovalRequested'
@@ -278,7 +399,17 @@ impl EventStore {
                    WHERE session_id = ?1
                      AND discriminant = 'ApprovalResolved'
                )
-             ORDER BY seq ASC",
+               AND NOT EXISTS (
+                   SELECT 1 FROM acp_events loss
+                   WHERE loss.session_id = ?1
+                     AND loss.discriminant = 'AcpConnectionUnavailable'
+                     AND ",
+                native_channel_loss_sql!("loss.event_json"),
+                "
+                     AND loss.seq > acp_events.seq
+               )
+             ORDER BY seq ASC"
+            ),
             "unresolved_approval_nonces",
             session_id,
         )
@@ -335,15 +466,11 @@ impl EventStore {
         .collect()
     }
 
-    /// `None` when the query failed.
-    fn has_open_subagent(&self, session_id: &str) -> Option<bool> {
-        logged(
-            self.conn()
-                .prepare_cached(OPEN_SUBAGENTS_SQL)
-                .and_then(|mut statement| statement.exists(params![session_id])),
-            "has_open_subagent",
-            session_id,
-        )
+    fn has_open_subagent(&self, session_id: &str) -> Result<bool> {
+        Ok(self
+            .reader()
+            .prepare_cached(OPEN_SUBAGENTS_SQL)?
+            .exists(params![session_id])?)
     }
 
     pub fn has_unresolved_background_tasks(&self, session_id: &str) -> bool {
@@ -365,79 +492,132 @@ impl EventStore {
     pub fn unresolved_background_task_launches(
         &self,
         session_id: &str,
-    ) -> Vec<BackgroundTaskLaunch> {
+    ) -> Result<Vec<BackgroundTaskLaunch>> {
         let conn = self.conn();
-        let what = "unresolved_background_task_launches";
-        let Some(mut statement) = logged(
-            conn.prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL),
-            what,
-            session_id,
-        ) else {
-            return Vec::new();
+        let tx = conn.unchecked_transaction()?;
+        let mut launches = {
+            let mut statement = tx.prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)?;
+            let rows = statement.query_map([session_id], |row| {
+                let workflow = optional_text(row, 2)?
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let launch = BackgroundTaskLaunch {
+                    task_id: row.get(0)?,
+                    tool_call_id: row.get(1)?,
+                    workflow,
+                    workflow_agents: WorkflowAgents::default(),
+                    witness: launch_witness(row, 3, 4, session_id)?,
+                };
+                if launch.witness.as_ref().is_some_and(|witness| {
+                    !witness.matches_task_launch(
+                        &launch.task_id,
+                        launch.tool_call_id.as_deref(),
+                        launch.workflow.as_ref(),
+                    )
+                }) {
+                    return Err(invalid_launch(
+                        "task resource selector differs from its launch",
+                    ));
+                }
+                Ok(launch)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let rows = statement.query_map(params![session_id], |row| {
-            Ok(BackgroundTaskLaunch {
-                task_id: row.get(0)?,
-                tool_call_id: row.get(1)?,
-                workflow: row
-                    .get::<_, Option<String>>(2)?
-                    .and_then(|json| serde_json::from_str(&json).ok()),
-                workflow_agents: WorkflowAgents::default(),
-            })
-        });
-        let mut launches: Vec<BackgroundTaskLaunch> = logged(rows, what, session_id)
-            .map(|rows| {
-                rows.filter_map(|row| logged(row, what, session_id))
-                    .collect()
-            })
-            .unwrap_or_default();
-        drop(statement);
-        for launch in &mut launches {
-            if let Some(workflow) = &launch.workflow {
-                launch.workflow_agents = workflow_agents(&conn, session_id, &workflow.run_id);
+        if launches.iter().any(|launch| launch.workflow.is_some()) {
+            let mut groups = workflow_agents(&tx, session_id)?;
+            for launch in &mut launches {
+                if let Some(workflow) = &launch.workflow {
+                    let allocation = launch.witness.as_ref().map(|witness| witness.allocation);
+                    launch.workflow_agents = groups
+                        .get_mut(&workflow.run_id)
+                        .and_then(|parents| parents.remove(&allocation))
+                        .unwrap_or_default();
+                }
             }
         }
-        launches
+        tx.commit()?;
+        Ok(launches)
     }
 
-    /// The same rows as [`Self::unresolved_background_agent_ids`], carrying
-    /// the transcript path a resumed tailer needs. `Supervisor::attach` uses
-    /// it to resume tracking a sub-agent that survived the restart instead of
-    /// detaching it.
+    /// Standalone launch payload and qualification are read from the same SQLite row.
     pub fn unresolved_background_agent_launches(
         &self,
         session_id: &str,
-    ) -> Vec<UnresolvedBackgroundAgentLaunch> {
+    ) -> Result<Vec<UnresolvedBackgroundAgentLaunch>> {
+        self.unresolved_background_agent_launches_inner(session_id, false)
+    }
+
+    /// Tracking retirement includes workflow children even after their parent task ended.
+    pub(crate) fn unresolved_background_agent_tracking_launches(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<UnresolvedBackgroundAgentLaunch>> {
+        self.unresolved_background_agent_launches_inner(session_id, true)
+    }
+
+    fn unresolved_background_agent_launches_inner(
+        &self,
+        session_id: &str,
+        include_workflows: bool,
+    ) -> Result<Vec<UnresolvedBackgroundAgentLaunch>> {
         let conn = self.conn();
-        let what = "unresolved_background_agent_launches";
         let sql = format!(
-            "SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id'),\
-                    json_extract(event_json, '$.BackgroundAgentLaunched.output_file'),\
-                    json_extract(event_json, '$.BackgroundAgentLaunched.workflow') IS NOT NULL\
+            "SELECT json_extract(started.event_json, '$.BackgroundAgentLaunched.agent_id'),
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.output_file'),
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow') IS NOT NULL,
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.tool_call_id'),
+                    started.scope, started.qualification_json,
+                    json_extract(started.event_json, '$.BackgroundAgentLaunched.workflow.run_id')
              {UNRESOLVED_BACKGROUND_AGENT_WHERE}"
         );
-        let Some(mut stmt) = logged(conn.prepare(&sql), what, session_id) else {
-            return Vec::new();
-        };
-        // A workflow's agents resume with their run's journal, which owns
-        // their completion (see `acp::workflow_journal`).
-        let rows = stmt.query_map(params![session_id], |row| {
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([session_id], |row| {
+            let workflow = row.get::<_, bool>(2)?;
+            if workflow && !include_workflows {
+                return Ok(None);
+            }
+            let workflow_run: Option<String> = row.get(6)?;
+            if workflow && workflow_run.is_none() {
+                return Err(invalid_launch("workflow agent launch has no run identity"));
+            }
             let launch = UnresolvedBackgroundAgentLaunch {
                 agent_id: row.get(0)?,
                 output_file: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                witness: launch_witness(row, 4, 5, session_id)?,
             };
-            Ok((!row.get::<_, bool>(2)?).then_some(launch))
-        });
-        logged(rows, what, session_id)
-            .map(|rows| rows.filter_map(|r| r.ok().flatten()).collect())
-            .unwrap_or_default()
+            let tool = optional_text(row, 3)?.unwrap_or_default();
+            if launch.witness.as_ref().is_some_and(|witness| {
+                !witness.matches_agent_launch(
+                    &launch.agent_id,
+                    tool,
+                    &launch.output_file,
+                    workflow_run.as_deref(),
+                )
+            }) {
+                return Err(invalid_launch(
+                    "agent resource selector differs from its launch",
+                ));
+            }
+            Ok(Some(launch))
+        })?;
+        Ok(rows
+            .filter_map(|row| row.transpose())
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Full payloads of unresolved approval requests, in request order.
     pub fn pending_approval_requests(&self, session_id: &str) -> Vec<Approval> {
         query_strings(
             &self.conn(),
-            "SELECT event_json
+            concat!(
+                "SELECT event_json
              FROM acp_events
              WHERE session_id = ?1
                AND discriminant = 'ApprovalRequested'
@@ -447,7 +627,17 @@ impl EventStore {
                    WHERE session_id = ?1
                      AND discriminant = 'ApprovalResolved'
                )
-             ORDER BY seq ASC",
+               AND NOT EXISTS (
+                   SELECT 1 FROM acp_events loss
+                   WHERE loss.session_id = ?1
+                     AND loss.discriminant = 'AcpConnectionUnavailable'
+                     AND ",
+                native_channel_loss_sql!("loss.event_json"),
+                "
+                     AND loss.seq > acp_events.seq
+               )
+             ORDER BY seq ASC"
+            ),
             "pending_approval_requests",
             session_id,
         )
@@ -479,11 +669,11 @@ impl EventStore {
         )
     }
 
-    /// Nonces of `ElicitationRequested` events with no matching `ElicitationResolved`.
+    /// Elicitation nonces whose responders remain available.
     pub fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
         query_strings(
             &self.conn(),
-            "SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
+            concat!("SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
              FROM acp_events
              WHERE session_id = ?1
                AND discriminant = 'ElicitationRequested'
@@ -492,7 +682,14 @@ impl EventStore {
                    FROM acp_events
                    WHERE session_id = ?1
                      AND discriminant = 'ElicitationResolved'
-               )",
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM acp_events loss
+                   WHERE loss.session_id = ?1
+                     AND loss.discriminant = 'AcpConnectionUnavailable'
+                     AND ", native_channel_loss_sql!("loss.event_json"), "
+                     AND loss.seq > acp_events.seq
+               )"),
             "unresolved_elicitation_nonces",
             session_id,
         )
@@ -501,124 +698,111 @@ impl EventStore {
         .collect()
     }
 
-    /// Turn output after the latest `Stopped`: a turn the agent started itself
-    /// (a Monitor or background finish woke it), which opens with no
-    /// `UserPromptSent`. The between-prompt watchdog ends such a turn with a
-    /// `Stopped` once it goes quiet.
-    pub(crate) fn has_open_agent_turn(&self, session_id: &str) -> Option<bool> {
-        logged(
-            self.conn().query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM acp_events
-                     WHERE session_id = ?1
-                       AND discriminant IN ('AgentMessageChunk', 'AgentThoughtChunk', 'ToolCallStarted', 'ThinkingStarted')
-                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
-                                           WHERE session_id = ?1
-                                             AND discriminant = 'Stopped'), 0))",
-                params![session_id],
-                |row| row.get::<_, bool>(0),
-            ),
-            "has_open_agent_turn query",
-            session_id,
-        )
+    pub fn has_in_flight_main_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        self.with_control_snapshot(session_id, |_, cursor| Ok(cursor.projection.main_open))
     }
 
-    /// True while a turn is open: an in-flight prompt, background work, or a turn
-    /// the agent started itself. `None` when a query failed, which callers that
-    /// would stop live work must read as busy.
-    pub fn has_open_turn(&self, session_id: &str) -> Option<bool> {
-        if self.try_in_flight_turn(session_id)? {
-            return Some(true);
+    /// Qualified agent output since the last actual turn boundary, including a
+    /// turn started by the agent without a host prompt.
+    pub(crate) fn has_open_agent_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        self.with_control_snapshot(session_id, |_, cursor| {
+            use ControlKnowledge::{Indeterminate, Known};
+            Ok(
+                match (
+                    cursor.projection.agent_open,
+                    cursor.projection.autonomous_open,
+                ) {
+                    (Known(true), _) | (_, Known(true)) => Known(true),
+                    (Known(false), Known(false)) => Known(false),
+                    _ => Indeterminate,
+                },
+            )
+        })
+    }
+
+    pub fn has_open_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        use ControlKnowledge::{Indeterminate, Known};
+        let main = self.has_in_flight_turn(session_id)?;
+        if main == Known(true) {
+            return Ok(main);
         }
-        self.has_open_agent_turn(session_id)
+        Ok(match (main, self.has_open_agent_turn(session_id)?) {
+            (_, Known(true)) => Known(true),
+            (Known(false), Known(false)) => Known(false),
+            _ => Indeterminate,
+        })
     }
 
-    /// True while the agent process holds work a replacement would lose: an open
-    /// turn, a working subagent, or a recent background finish the agent has not
-    /// yet answered with a turn. `None` when a query failed.
-    pub fn holds_live_work(&self, session_id: &str) -> Option<bool> {
-        if self.has_open_turn(session_id)? || self.has_open_subagent(session_id)? {
-            return Some(true);
+    /// A recent background finish also holds the actor until its follow-up
+    /// reaches a real turn boundary. Unknown control never authorizes retirement.
+    pub fn holds_live_work(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        use ControlKnowledge::{Indeterminate, Known};
+        let open = self.has_open_turn(session_id)?;
+        if open == Known(true) || self.has_open_subagent(session_id)? {
+            return Ok(Known(true));
         }
-        self.has_unhandled_finish(session_id)
+        Ok(match (open, self.has_unhandled_finish(session_id)?) {
+            (_, Known(true)) => Known(true),
+            (Known(false), Known(false)) => Known(false),
+            _ => Indeterminate,
+        })
     }
 
-    /// A background task or agent finished after the latest `Stopped`, so the
-    /// agent's follow-up turn is still pending. Old finishes expire so a turn
-    /// that never came cannot hold the runner forever.
-    fn has_unhandled_finish(&self, session_id: &str) -> Option<bool> {
+    fn has_unhandled_finish(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        use ControlKnowledge::{Indeterminate, Known};
         let stale_cutoff =
             crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
-        logged(
-            self.conn().query_row(
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            let stopped = match cursor.projection.stopped_through {
+                Known(seq) => Some(i64::try_from(seq)?),
+                Indeterminate => None,
+            };
+            let recent: bool = conn.query_row(
                 "SELECT EXISTS (
                      SELECT 1 FROM acp_events
                      WHERE session_id = ?1
                        AND discriminant IN ('BackgroundTaskFinished', 'BackgroundAgentCompleted')
-                       AND created_at >= ?2
-                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
-                                           WHERE session_id = ?1
-                                             AND discriminant = 'Stopped'), 0))",
-                params![session_id, stale_cutoff],
-                |row| row.get::<_, bool>(0),
-            ),
-            "has_unhandled_finish query",
-            session_id,
-        )
+                       AND created_at >= ?3
+                       AND (?2 IS NULL OR seq > ?2))",
+                params![session_id, stopped, stale_cutoff],
+                |row| row.get(0),
+            )?;
+            Ok(if !recent {
+                Known(false)
+            } else if stopped.is_some() {
+                Known(true)
+            } else {
+                Indeterminate
+            })
+        })
     }
 
-    /// `Some(None)` when no prompt exists, `None` when a query failed.
-    fn latest_prompt_state(&self, session_id: &str) -> Option<Option<bool>> {
-        let conn = self.conn();
-        let prompt_seq = logged(
-            conn.query_row(
-                "SELECT MAX(seq) FROM acp_events
-                 WHERE session_id = ?1
-                   AND discriminant = 'UserPromptSent'",
-                params![session_id],
-                |row| row.get::<_, Option<i64>>(0),
-            ),
-            "main_turn_state prompt query",
-            session_id,
-        )?;
-        let Some(prompt_seq) = prompt_seq else {
-            return Some(None);
-        };
-        let terminator = logged(
-            conn.query_row(
-                "SELECT MIN(seq) FROM acp_events
-                 WHERE session_id = ?1
-                   AND seq > ?2
-                   AND discriminant IN ('Stopped', 'AgentStartupError')",
-                params![session_id, prompt_seq],
-                |row| row.get::<_, Option<i64>>(0),
-            ),
-            "main_turn_state terminator query",
-            session_id,
-        )?;
-        Some(Some(terminator.is_none()))
+    pub fn has_unsuccessful_main_outcome(
+        &self,
+        session_id: &str,
+    ) -> Result<ControlKnowledge<bool>> {
+        self.with_control_snapshot(session_id, |_, cursor| {
+            Ok(cursor.projection.unsuccessful_main)
+        })
     }
 
     /// True while a main turn, background task, or recently reporting background agent is open.
-    pub fn has_in_flight_turn(&self, session_id: &str) -> bool {
-        self.try_in_flight_turn(session_id).unwrap_or(false)
-    }
-
-    /// [`Self::has_in_flight_turn`], or `None` when any constituent query failed.
-    pub(crate) fn try_in_flight_turn(&self, session_id: &str) -> Option<bool> {
-        if self.try_has_unresolved_background_tasks(session_id)? {
-            return Some(true);
+    pub fn has_in_flight_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
+        if self
+            .reader()
+            .prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)?
+            .exists(params![session_id])?
+        {
+            return Ok(ControlKnowledge::Known(true));
         }
-        match self.latest_prompt_state(session_id)? {
-            None => return Some(false),
-            Some(true) => return Some(true),
-            Some(false) => {}
+        let main = self.has_in_flight_main_turn(session_id)?;
+        if main == ControlKnowledge::Known(true) {
+            return Ok(main);
         }
-        let conn = self.conn();
+        let conn = self.reader();
         let stale_cutoff =
             crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
-        let bg_in_flight: i64 = logged(
-            conn.query_row(
+        let bg_in_flight: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM (
                      SELECT aid, MAX(created_at) AS last_at FROM (
                          SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid,
@@ -642,37 +826,98 @@ impl EventStore {
                    )",
                 params![session_id, stale_cutoff],
                 |row| row.get(0),
-            ),
-            "has_in_flight_turn bg-agent query",
-            session_id,
-        )?;
-        Some(bg_in_flight > 0)
+            )?;
+        Ok(if bg_in_flight > 0 {
+            ControlKnowledge::Known(true)
+        } else {
+            main
+        })
     }
 
-    /// The agent text of the open turn when that turn has no prompt and ran no
-    /// tool, else `None`.
-    pub fn agent_turn_sole_text(&self, session_id: &str) -> Option<String> {
-        let rows = query_strings(
-            &self.conn(),
-            "SELECT event_json FROM acp_events
-             WHERE session_id = ?1
-               AND seq > (SELECT IFNULL(MAX(seq), 0) FROM acp_events
-                          WHERE session_id = ?1
-                            AND discriminant IN ('Stopped', 'AgentStartupError'))
-               AND discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt',
-                                    'ToolCallStarted', 'AgentMessageChunk')
-             ORDER BY seq ASC",
-            "agent_turn_sole_text",
-            session_id,
-        );
-        let mut text = String::new();
-        for json in rows {
-            match decode_logged(&json, session_id, "agent_turn_sole_text")? {
-                Event::AgentMessageChunk { text: chunk, .. } => text.push_str(&chunk),
-                _ => return None,
+    /// A lone usage-limit sentence and cost marker from the active Native run.
+    pub(crate) fn autonomous_turn_limit(
+        &self,
+        session_id: &str,
+        latest_seq: u64,
+    ) -> Result<
+        Option<(
+            crate::acp::state::RateLimitInfo,
+            Arc<crate::acp::event_sender::NativeAutonomousIdentity>,
+        )>,
+    > {
+        use crate::acp::state::RateLimitInfo;
+        use ControlKnowledge::Known;
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            if cursor.seq != latest_seq
+                || cursor.projection.main_open != Known(false)
+                || cursor.projection.autonomous_open != Known(true)
+                || !matches!(cursor.projection.park, Known(None))
+            {
+                return Ok(None);
             }
-        }
-        (!text.is_empty()).then_some(text)
+            let Some(run) = Self::autonomous_commit(conn, session_id)?
+                .filter(|run| run.activity() == Known(true))
+            else {
+                return Ok(None);
+            };
+            let mut statement = conn.prepare_cached(
+                "SELECT seq, discriminant, event_json, scope, qualification_json
+                   FROM acp_events WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3
+                   ORDER BY seq",
+            )?;
+            let mut rows = statement.query(params![
+                session_id,
+                i64::try_from(run.started)?,
+                i64::try_from(latest_seq)?,
+            ])?;
+            let mut next = run.started + 1;
+            let mut text = String::new();
+            let mut terminal_usage = false;
+            while let Some(row) = rows.next()? {
+                if u64::try_from(row.get::<_, i64>(0)?)? != next {
+                    return Ok(None);
+                }
+                next += 1;
+                let kind = row.get_ref(1)?.as_str()?;
+                match kind {
+                    "Stopped" | "UserPromptSent" | "UserDiffCommentsPrompt" | "ToolCallStarted" => {
+                        return Ok(None);
+                    }
+                    "AgentMessageChunk" | "UsageUpdated" => {}
+                    _ => continue,
+                }
+                let qualification = row.get_ref(4)?.as_str_or_null()?;
+                let metadata = EventMetadata::decode_private(row.get(3)?, qualification)?;
+                if metadata.native_origin != Some(run.identity.origin)
+                    || metadata.reported_session_id.as_ref() != Some(&run.identity.root_session_id)
+                    || metadata.operation.is_some()
+                {
+                    return Ok(None);
+                }
+                match serde_json::from_str::<Event>(row.get_ref(2)?.as_str()?)? {
+                    Event::AgentMessageChunk { text: chunk, .. } => {
+                        let chunk = if text.is_empty() {
+                            chunk.trim_start()
+                        } else {
+                            &chunk
+                        };
+                        if text.len().saturating_add(chunk.len())
+                            > RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4
+                        {
+                            return Ok(None);
+                        }
+                        text.push_str(chunk);
+                        terminal_usage = false;
+                    }
+                    Event::UsageUpdated { usage } => terminal_usage = usage.cost.is_some(),
+                    _ => return Ok(None),
+                }
+            }
+            if next != latest_seq + 1 || !terminal_usage {
+                return Ok(None);
+            }
+            Ok(RateLimitInfo::from_agent_text(&text).map(|info| (info, run.identity)))
+        })
     }
 
     /// Read the inputs the terminal-repair pass decides on.
@@ -721,9 +966,14 @@ impl EventStore {
         let conn = self.conn();
         let epoch_start: i64 = logged(
             conn.query_row(
-                "SELECT MAX(seq) FROM acp_events
+                concat!(
+                    "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
-                   AND discriminant IN ('Stopped', 'AgentStartupError')",
+                   AND (discriminant IN ('Stopped', 'AgentStartupError')
+                     OR ",
+                    native_channel_loss_sql!("event_json"),
+                    ")"
+                ),
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
             ),
@@ -771,12 +1021,21 @@ mod tests {
         let (_tmp, store) = open_store(1000);
         assert!(store.first_user_prompt("s-1").is_none());
         assert!(store.first_turn_context("s-1", 4096).is_none());
-        // Recorded out of order: the earliest seq wins.
         store
-            .record("s-1", 2, &user_prompt("second prompt"))
+            .record(
+                "s-1",
+                1,
+                &user_prompt("first prompt"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         store
-            .record("s-1", 1, &user_prompt("first prompt"))
+            .record(
+                "s-1",
+                2,
+                &user_prompt("second prompt"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         assert_eq!(
             store.first_user_prompt("s-1").as_deref(),
@@ -836,78 +1095,201 @@ mod tests {
     }
 
     #[test]
-    fn has_in_flight_turn_follows_the_latest_prompt_and_background_agents() {
-        let (_tmp, store) = open_store(1000);
+    fn admitted_main_and_background_work_have_independent_knowledge() {
+        use ControlKnowledge::{Indeterminate, Known};
         let progress = || Event::BackgroundAgentProgress {
             agent_id: "bg-1".into(),
             status: BackgroundAgentStatus::Running,
             tool_count: 1,
-            tools: Vec::new(),
+            tools: vec![],
             last_tool: None,
             last_text: None,
             at: crate::time::Timestamp::now(),
         };
-        let startup_error = Event::startup_error("boom");
-        // (events, in flight)
-        let cases = [
-            (vec![], false),
-            (vec![user_prompt("go"), agent_chunk("thinking")], true),
+        for (events, main, any) in [
+            (
+                vec![user_prompt("explicit but not admitted")],
+                Known(false),
+                Known(false),
+            ),
             (
                 vec![
                     user_prompt("go"),
-                    agent_chunk("done"),
+                    Event::ThinkingStarted,
+                    agent_chunk("work"),
+                ],
+                Known(true),
+                Known(true),
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    Event::ThinkingStarted,
                     stopped("prompt_complete"),
                 ],
-                false,
+                Known(false),
+                Known(false),
             ),
-            (vec![user_prompt("go"), startup_error], false),
+            (
+                vec![user_prompt("go"), Event::startup_error("boom")],
+                Known(false),
+                Known(false),
+            ),
             (
                 vec![
                     user_prompt("first"),
+                    Event::ThinkingStarted,
                     stopped("prompt_complete"),
                     user_prompt("second"),
-                    agent_chunk("mid"),
+                    Event::ThinkingStarted,
                 ],
-                true,
+                Known(true),
+                Known(true),
             ),
             (
-                vec![user_prompt("go"), stopped("prompt_complete"), progress()],
-                true,
+                vec![stopped("prompt_complete"), progress()],
+                Known(false),
+                Known(true),
             ),
-        ];
-        for (i, (events, in_flight)) in cases.into_iter().enumerate() {
-            let id = format!("s-{i}");
-            record_from(&store, &id, 1, events);
-            assert_eq!(store.has_in_flight_turn(&id), in_flight, "case {i}");
+            (
+                vec![stopped("rate_limited"), progress()],
+                Known(false),
+                Known(true),
+            ),
+        ] {
+            let (_tmp, store) = open_store(0);
+            record_projection(&store, "s", 1, events);
+            assert_eq!(store.has_in_flight_main_turn("s").unwrap(), main);
+            assert_eq!(store.has_in_flight_turn("s").unwrap(), any);
         }
-
+        let (_tmp, store) = open_store(0);
+        store
+            .record("s", 2, &progress(), &EventMetadata::history())
+            .unwrap();
+        assert_eq!(store.has_in_flight_main_turn("s").unwrap(), Indeterminate);
+        assert_eq!(store.has_in_flight_turn("s").unwrap(), Known(true));
         let completed = Event::BackgroundAgentCompleted {
             agent_id: "bg-1".into(),
             status: BackgroundAgentStatus::Completed,
-            tools: Vec::new(),
+            tools: vec![],
             result: None,
             warning: None,
             ended_at: crate::time::Timestamp::now(),
         };
-        store.record("s-5", 4, &completed).unwrap();
-        assert!(
-            !store.has_in_flight_turn("s-5"),
-            "completion drains the turn"
-        );
+        store
+            .record("s", 3, &completed, &EventMetadata::history())
+            .unwrap();
+        assert_eq!(store.has_in_flight_turn("s").unwrap(), Indeterminate);
+        // A stale progress record does not turn unknown main state into known idle.
+        let stale =
+            crate::time::Timestamp::now().as_millis() - BACKGROUND_AGENT_STALE_AFTER_MS - 60_000;
+        store.record_at("stale", 2, &progress(), stale).unwrap();
+        assert_eq!(store.has_in_flight_turn("stale").unwrap(), Indeterminate);
+    }
 
-        record_from(
+    #[test]
+    fn unsuccessful_main_outcome_survives_historical_ambient_rows_until_host_boundary() {
+        use ControlKnowledge::Known;
+        for reason in [
+            "prompt_failed",
+            "prompt_rejected",
+            "rate_limited",
+            crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+        ] {
+            for boundary in [
+                user_prompt("next explicit prompt"),
+                Event::UserDiffCommentsPrompt {
+                    intro: String::new(),
+                    outro: String::new(),
+                    is_multi_repo: false,
+                    comments: vec![],
+                    assembled_markdown: "review".into(),
+                },
+                stopped("prompt_complete"),
+                Event::SessionCleared,
+                Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "explicit".into(),
+                },
+            ] {
+                let (_tmp, store) = open_store(0);
+                record_projection(
+                    &store,
+                    "s",
+                    1,
+                    [
+                        user_prompt("original"),
+                        Event::ThinkingStarted,
+                        stopped(reason),
+                    ],
+                );
+                record_from(
+                    &store,
+                    "s",
+                    4,
+                    [
+                        agent_chunk("ambient"),
+                        stopped("agent_idle"),
+                        Event::PromptRuntimeError {
+                            message: "later diagnostic".into(),
+                            evidence: None,
+                            native_subject: None,
+                        },
+                        Event::AcpSessionAssigned {
+                            acp_session_id: "read-only".into(),
+                            connection_ready: false,
+                            native_subject: None,
+                        },
+                    ],
+                );
+                assert_eq!(
+                    store.has_unsuccessful_main_outcome("s").unwrap(),
+                    Known(true)
+                );
+                assert_eq!(store.has_in_flight_main_turn("s").unwrap(), Known(false));
+                store
+                    .record("s", 8, &boundary, &EventMetadata::host(&boundary))
+                    .unwrap();
+                assert_eq!(
+                    store.has_unsuccessful_main_outcome("s").unwrap(),
+                    Known(false)
+                );
+            }
+        }
+        // An owned diagnostic is terminal; historical ambient diagnostics are not.
+        let (_tmp, store) = open_store(0);
+        record_projection(
             &store,
-            "stale",
+            "s",
             1,
-            [user_prompt("go"), stopped("prompt_complete")],
+            [
+                user_prompt("work"),
+                Event::ThinkingStarted,
+                Event::PromptRuntimeError {
+                    message: "failed".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+            ],
         );
-        let stale_at =
-            crate::time::Timestamp::now().as_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
-        store.record_at("stale", 3, &progress(), stale_at).unwrap();
-        assert!(
-            !store.has_in_flight_turn("stale"),
-            "a silent background agent is gone"
+        assert_eq!(store.has_in_flight_main_turn("s").unwrap(), Known(false));
+        assert_eq!(
+            store.has_unsuccessful_main_outcome("s").unwrap(),
+            Known(true)
         );
+    }
+
+    #[test]
+    fn continuation_projection_read_errors_remain_errors() {
+        let (_tmp, store) = open_store(0);
+        store
+            .conn()
+            .execute_batch("DROP TABLE acp_rate_limit_budgets")
+            .unwrap();
+        assert!(store.has_in_flight_main_turn("s").is_err());
+        assert!(store.has_unsuccessful_main_outcome("s").is_err());
+        assert!(store.has_in_flight_turn("s").is_err());
     }
 
     #[test]
@@ -950,8 +1332,12 @@ mod tests {
         ];
         for (i, (events, holds)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
-            record_from(&store, &id, 1, events);
-            assert_eq!(store.holds_live_work(&id), Some(holds), "case {i}");
+            record_projection(&store, &id, 1, events);
+            assert_eq!(
+                store.holds_live_work(&id).unwrap(),
+                ControlKnowledge::Known(holds),
+                "case {i}"
+            );
         }
     }
 
@@ -964,6 +1350,7 @@ mod tests {
             subagent: SubagentRecord {
                 session_id: id.into(),
                 parent_session_id: "root".into(),
+                provenance: None,
                 parent_tool_call_id: Some("msg-1".into()),
                 title: None,
                 description: None,
@@ -982,7 +1369,13 @@ mod tests {
             to: "codex".into(),
             reason: "user".into(),
         };
-        let root_done = || [user_prompt("go"), stopped("end_turn")];
+        let root_done = || {
+            [
+                user_prompt("go"),
+                Event::ThinkingStarted,
+                stopped("prompt_complete"),
+            ]
+        };
         // (events after the root's terminal, holds live work)
         let cases = [
             (vec![child("a", SubagentState::Running)], true),
@@ -1006,93 +1399,149 @@ mod tests {
         ];
         for (i, (events, holds)) in cases.into_iter().enumerate() {
             let id = format!("c-{i}");
-            record_from(&store, &id, 1, root_done().into_iter().chain(events));
-            assert_eq!(store.holds_live_work(&id), Some(holds), "case {i}");
+            record_projection(&store, &id, 1, root_done().into_iter().chain(events));
+            assert_eq!(
+                store.holds_live_work(&id).unwrap(),
+                ControlKnowledge::Known(holds),
+                "case {i}"
+            );
         }
     }
 
     /// An agent-initiated turn (a Monitor or background finish waking the
     /// agent) opens with no `UserPromptSent`, so only its own events show it.
-    #[test]
-    fn an_agent_initiated_turn_without_a_stop_is_open_work() {
-        let (_tmp, store) = open_store(1000);
-        let tool_call = || Event::ToolCallStarted {
-            tool_call: crate::acp::state::ToolCall {
-                id: "t".into(),
-                name: "Bash".into(),
-                kind: "execute".into(),
-                args_preview: "{}".into(),
-                prompt: None,
-                started_at: crate::time::Timestamp::now(),
-                parent_tool_call_id: None,
-                memory_recall: None,
-                diffs: Vec::new(),
-            },
-        };
-        // (events, open work)
-        let cases = [
-            (vec![user_prompt("go"), stopped("prompt_complete")], false),
-            (
-                vec![
-                    user_prompt("go"),
-                    stopped("prompt_complete"),
-                    agent_chunk("woken"),
-                    tool_call(),
-                ],
-                true,
-            ),
-            // Text thinking is the only output of a thought-only turn.
-            (
-                vec![
-                    user_prompt("go"),
-                    stopped("prompt_complete"),
-                    Event::AgentThoughtChunk {
-                        text: "hmm".into(),
-                        message_id: None,
-                    },
-                ],
-                true,
-            ),
-            (
-                vec![
-                    user_prompt("go"),
-                    stopped("prompt_complete"),
-                    agent_chunk("woken"),
-                    tool_call(),
-                    stopped("agent_idle"),
-                ],
-                false,
-            ),
-        ];
-        for (i, (events, open)) in cases.into_iter().enumerate() {
-            let id = format!("s-{i}");
-            record_from(&store, &id, 1, events);
-            assert_eq!(store.holds_live_work(&id), Some(open), "case {i}");
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_agent_initiated_turn_without_a_stop_is_open_work() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for (work, closed, open) in [
+            ("none", false, false),
+            ("tool", false, true),
+            ("thought", false, true),
+            ("tool", true, false),
+            ("unadmitted", false, false),
+        ] {
+            with_managed(|scope| Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope, "agent-initiated-work", "claude", None,
+                ).await;
+                let id = live.id().to_owned();
+                let store = live.state.acp_event_store.clone();
+                let prompt = live.start_prompt("go").await;
+                live.finish_prompt(&prompt, None).await;
+                let run = matches!(work, "tool" | "thought").then(uuid::Uuid::new_v4);
+                if let Some(run) = run {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+                    })).await;
+                }
+                if work == "tool" {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,
+                            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}}
+                    })).await;
+                }
+                let update = match work {
+                    "tool" => Some(serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"t",
+                        "title":"Bash","kind":"execute","status":"in_progress","rawInput":{}})),
+                    "thought" => Some(serde_json::json!({"sessionUpdate":"agent_thought_chunk",
+                        "content":{"type":"text","text":"hmm"}})),
+                    "unadmitted" => Some(serde_json::json!({"sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"unadmitted operation"}})),
+                    _ => None,
+                };
+                if let Some(update) = update {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,"update":update}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            let event = live.client.next_event().await.expect("actual original publication");
+                            if match event {
+                                Event::ToolCallStarted { tool_call } => work == "tool" && tool_call.id == "t",
+                                Event::AgentThoughtChunk { text, .. } => work == "thought" && text == "hmm",
+                                Event::AgentMessageChunk { text, .. } => work == "unadmitted" && text == "unadmitted operation",
+                                _ => false,
+                            } { break; }
+                        }
+                    }).await.expect("the actual body closes the observation interval");
+                }
+                if closed {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run.unwrap(),"source":"irc","stopReason":"end_turn"}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("own terminal"),
+                            Event::Stopped { reason } if reason == "agent_idle") {}
+                    }).await.unwrap();
+                }
+                assert_eq!(store.has_in_flight_main_turn(&id).unwrap(), ControlKnowledge::Known(false), "{work}, closed={closed}");
+                assert_eq!(store.holds_live_work(&id).unwrap(), ControlKnowledge::Known(open), "{work}, closed={closed}");
+                if let Some(run) = run.filter(|_| !closed) {
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}
+                    })).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("cleanup own terminal"),
+                            Event::Stopped { reason } if reason == "agent_idle") {}
+                    }).await.unwrap();
+                }
+            })).await;
         }
+        let (_tmp, store) = open_store(1000);
+        record_projection(
+            &store,
+            "unmatched-operation",
+            1,
+            [
+                user_prompt("go"),
+                stopped("prompt_complete"),
+                agent_chunk("unadmitted operation"),
+            ],
+        );
+        assert_eq!(
+            store
+                .has_in_flight_main_turn("unmatched-operation")
+                .unwrap(),
+            ControlKnowledge::Known(false)
+        );
+        assert_eq!(
+            store.holds_live_work("unmatched-operation").unwrap(),
+            ControlKnowledge::Known(false)
+        );
     }
 
-    /// A failed query is unknown, never "no live work": every aggregate that
-    /// callers use to protect work reports `None`, and recovers afterwards.
+    /// A failed query is an error, never "no live work"; every aggregate
+    /// preserves the failure and recovers after the store becomes readable.
     #[test]
     fn a_failed_query_is_unknown_not_idle() {
         let (_tmp, store) = open_store(1000);
-        record_from(
+        record_projection(
             &store,
             "s",
             1,
             vec![user_prompt("go"), stopped("prompt_complete")],
         );
-        assert_eq!(store.holds_live_work("s"), Some(false));
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
 
         store.test_set_unavailable(true);
-        assert_eq!(store.try_in_flight_turn("s"), None);
-        assert_eq!(store.has_open_agent_turn("s"), None);
-        assert_eq!(store.has_open_turn("s"), None);
-        assert_eq!(store.holds_live_work("s"), None);
-        assert!(!store.has_in_flight_turn("s"), "the lossy bool stays false");
+        assert!(store.has_in_flight_main_turn("s").is_err());
+        assert!(store.has_open_agent_turn("s").is_err());
+        assert!(store.has_open_turn("s").is_err());
+        assert!(store.holds_live_work("s").is_err());
+        assert!(store.has_in_flight_turn("s").is_err());
 
         store.test_set_unavailable(false);
-        assert_eq!(store.holds_live_work("s"), Some(false));
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
     }
 
     /// An unhandled finish whose follow-up turn never came does not hold the
@@ -1102,16 +1551,27 @@ mod tests {
         let (_tmp, store) = open_store(1000);
         let old =
             crate::time::Timestamp::now().as_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
-        store.record_at("s", 1, &user_prompt("go"), old).unwrap();
-        store
-            .record_at("s", 2, &stopped("prompt_complete"), old)
-            .unwrap();
         let finished = Event::BackgroundTaskFinished {
             task_id: "t".into(),
             ended_at: None,
         };
-        store.record_at("s", 3, &finished, old).unwrap();
-        assert_eq!(store.holds_live_work("s"), Some(false));
+        record_projection(
+            &store,
+            "s",
+            1,
+            [user_prompt("go"), stopped("prompt_complete"), finished],
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE acp_events SET created_at=?2 WHERE session_id=?1",
+                params!["s", old],
+            )
+            .unwrap();
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
     }
 
     #[test]
@@ -1167,6 +1627,8 @@ mod tests {
             [
                 Event::AcpSessionAssigned {
                     acp_session_id: "acp-1".into(),
+                    connection_ready: false,
+                    native_subject: None,
                 },
                 Event::ModesAvailable {
                     current_mode_id: "default".into(),
@@ -1258,6 +1720,133 @@ mod tests {
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
         assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
 
+        // A failed request leaves the actual responders actionable. Native loss
+        // retires those controls without fabricating any human decision, and a
+        // later ready announcement must not resurrect the old nonces.
+        record_from(
+            &store,
+            "s-1",
+            9,
+            [
+                Event::PromptRuntimeError {
+                    message: "ordinary request failure".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+                Event::Stopped {
+                    reason: "prompt_failed".into(),
+                },
+            ],
+        );
+        assert_eq!(store.pending_approval_requests("s-1").len(), 2);
+        assert_eq!(store.unresolved_elicitation_nonces("s-1").len(), 1);
+        record_from(
+            &store,
+            "s-1",
+            11,
+            [
+                Event::AcpConnectionUnavailable {
+                    source: crate::acp::state::AcpConnectionSource::Native,
+                    cause: crate::acp::state::AcpConnectionCause::StdoutEof,
+                    phase: crate::acp::state::AcpConnectionPhase::Established,
+                    native_subject: None,
+                },
+                Event::AcpSessionAssigned {
+                    acp_session_id: "retained".into(),
+                    connection_ready: true,
+                    native_subject: None,
+                },
+            ],
+        );
+        assert!(store.unresolved_approval_nonces("s-1").is_empty());
+        assert!(store.pending_approval_requests("s-1").is_empty());
+        assert!(store.unresolved_elicitation_nonces("s-1").is_empty());
+        let after_loss = Nonce::new();
+        record_from(
+            &store,
+            "s-1",
+            13,
+            [approval("new-owned-control"), elicitation(&after_loss)],
+        );
+        assert_eq!(
+            store.unresolved_approval_nonces("s-1"),
+            [Nonce("new-owned-control".into())]
+        );
+        assert_eq!(store.pending_approval_requests("s-1").len(), 1);
+        assert_eq!(store.unresolved_elicitation_nonces("s-1"), [after_loss]);
+
+        // A refused management attachment does not end the retained native
+        // turn or resolve its callbacks. Only observed channel loss does.
+        let management_elicitation = Nonce::new();
+        record_projection(
+            &store,
+            "management",
+            1,
+            [
+                user_prompt("retained work"),
+                Event::ThinkingStarted,
+                approval("retained-approval"),
+                elicitation(&management_elicitation),
+                Event::MonitorArmed {
+                    description: Some("retained monitor".into()),
+                },
+                Event::ToolCallStarted {
+                    tool_call: tool_call("retained-tool"),
+                },
+                Event::AcpConnectionUnavailable {
+                    source: crate::acp::state::AcpConnectionSource::RunnerRecord,
+                    cause: crate::acp::state::AcpConnectionCause::ControlProtocolUnknown,
+                    phase: crate::acp::state::AcpConnectionPhase::Establishing,
+                    native_subject: None,
+                },
+            ],
+        );
+        assert_eq!(
+            store.has_in_flight_turn("management").unwrap(),
+            ControlKnowledge::Known(true)
+        );
+        assert!(store.has_open_tool_call_in_epoch("management"));
+        assert_eq!(store.pending_approval_requests("management").len(), 1);
+        assert_eq!(
+            store.unresolved_elicitation_nonces("management"),
+            [management_elicitation]
+        );
+        assert!(store.latest_active_monitor("management").is_some());
+        let mut loss = Event::AcpConnectionUnavailable {
+            source: crate::acp::state::AcpConnectionSource::Native,
+            cause: crate::acp::state::AcpConnectionCause::StdoutEof,
+            phase: crate::acp::state::AcpConnectionPhase::Established,
+            native_subject: None,
+        };
+        let subject = crate::acp::state::NativeEventSubject::channel(
+            serde_json::from_value(serde_json::to_value([31u8; 32]).unwrap()).unwrap(),
+            None,
+            &loss,
+        );
+        if let Event::AcpConnectionUnavailable { native_subject, .. } = &mut loss {
+            *native_subject = Some(subject);
+        }
+        store
+            .record(
+                "management",
+                8,
+                &loss,
+                &crate::acp::event_sender::EventMetadata {
+                    scope: crate::acp::event_sender::EventScope::SessionCurrent,
+                    availability_denial: true,
+                    ..crate::acp::event_sender::EventMetadata::history()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.has_in_flight_turn("management").unwrap(),
+            ControlKnowledge::Known(false)
+        );
+        assert!(!store.has_open_tool_call_in_epoch("management"));
+        assert!(store.pending_approval_requests("management").is_empty());
+        assert!(store.unresolved_elicitation_nonces("management").is_empty());
+        assert!(store.latest_active_monitor("management").is_none());
+
         // A background launch with no matching completion is orphaned.
         let (_tmp, store) = open_store(1000);
         record_from(
@@ -1285,6 +1874,7 @@ mod tests {
         );
         let launches: Vec<(String, String)> = store
             .unresolved_background_agent_launches("s-1")
+            .unwrap()
             .into_iter()
             .map(|l| (l.agent_id, l.output_file))
             .collect();
@@ -1296,13 +1886,21 @@ mod tests {
             ]
         );
         assert!(store.unresolved_background_agent_ids("s-2").is_empty());
-        assert!(store.unresolved_background_agent_launches("s-2").is_empty());
+        assert!(store
+            .unresolved_background_agent_launches("s-2")
+            .unwrap()
+            .is_empty());
 
         // A completion row whose `agent_id` is not extractable must not blank
         // the whole scan: SQLite's `NOT IN` goes `NULL` once the subquery
         // yields one `NULL`. The store never writes such a row.
         store
-            .record("s-3", 1, &bg_launched("bg-real-orphan", ""))
+            .record(
+                "s-3",
+                1,
+                &bg_launched("bg-real-orphan", ""),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         store
             .conn()
@@ -1348,7 +1946,14 @@ mod tests {
         let mut seq = 0;
         let mut record = |event: Event| {
             seq += 1;
-            store.record("s-1", seq, &event).unwrap();
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
         };
         record(task("open"));
         record(task("done"));
@@ -1402,12 +2007,18 @@ mod tests {
             "completed agents age out; recent task pairs stay for the shell panel"
         );
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        for (seq, event) in store.replay_from("s-1", 0) {
-            state.apply_event(seq, event).unwrap();
+        for stored in store.replay_from("s-1", 0).unwrap() {
+            state
+                .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                .unwrap();
         }
         assert_eq!(
-            state.background_tasks,
-            ["open".to_string(), "reused".to_string()]
+            state
+                .background_tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["open", "reused"]
         );
     }
 
@@ -1421,7 +2032,14 @@ mod tests {
         let mut seq = 0;
         let mut record = |event: Event| {
             seq += 1;
-            store.record("s-1", seq, &event).unwrap();
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
         };
         let total = MAX_FINISHED_BACKGROUND_SHELLS + 5;
         for i in 0..total {
@@ -1456,11 +2074,14 @@ mod tests {
 
         let kept: Vec<String> = store
             .replay_from("s-1", 0)
+            .expect("read retained events")
             .into_iter()
-            .filter_map(|(_, e)| match e {
-                Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
-                _ => None,
-            })
+            .filter_map(
+                |stored| match std::sync::Arc::unwrap_or_clone(stored.event) {
+                    Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
+                    _ => None,
+                },
+            )
             .collect();
         let expected: Vec<String> = (total - MAX_FINISHED_BACKGROUND_SHELLS..total)
             .map(|i| format!("t{i}"))
@@ -1482,7 +2103,14 @@ mod tests {
         let mut seq = 0;
         let mut record = |event: Event| {
             seq += 1;
-            store.record("s-1", seq, &event).unwrap();
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
         };
         let finish = |id: &str| Event::BackgroundTaskFinished {
             task_id: id.into(),
@@ -1519,8 +2147,10 @@ mod tests {
         }
 
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        for (seq, event) in store.replay_from("s-1", 0) {
-            state.apply_event(seq, event).unwrap();
+        for stored in store.replay_from("s-1", 0).unwrap() {
+            state
+                .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                .unwrap();
         }
         assert_eq!(state.background_shells.len(), 1);
         assert_eq!(state.background_shells[0].command, "make build");
@@ -1544,24 +2174,69 @@ mod tests {
             task_id: "t".into(),
             ended_at: None,
         };
-        store.record("s-1", 1, &started("toolu_old")).unwrap();
-        assert!(store.has_in_flight_turn("s-1"));
-        store.record("s-1", 2, &finished()).unwrap();
-        assert!(store.unresolved_background_task_ids("s-1").is_empty());
-        assert!(!store.has_in_flight_turn("s-1"));
-        store.record("s-1", 3, &started("toolu_reused")).unwrap();
-        store.record("s-1", 4, &started("toolu_latest")).unwrap();
-        store.record("s-2", 1, &finished()).unwrap();
+        store
+            .record(
+                "s-1",
+                1,
+                &started("toolu_old"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         assert_eq!(
-            store.unresolved_background_task_launches("s-1"),
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
+        store
+            .record(
+                "s-1",
+                2,
+                &finished(),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        assert!(store.unresolved_background_task_ids("s-1").is_empty());
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(false)
+        );
+        store
+            .record(
+                "s-1",
+                3,
+                &started("toolu_reused"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                4,
+                &started("toolu_latest"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        store
+            .record(
+                "s-2",
+                1,
+                &finished(),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.unresolved_background_task_launches("s-1").unwrap(),
             [BackgroundTaskLaunch {
                 task_id: "t".into(),
                 tool_call_id: Some("toolu_latest".into()),
                 workflow: None,
                 workflow_agents: WorkflowAgents::default(),
+                witness: None,
             }]
         );
-        assert!(store.has_in_flight_turn("s-1"));
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
         assert_eq!(
             store.unresolved_background_task_ids("s-1"),
             ["t".to_string()]
@@ -1578,8 +2253,22 @@ mod tests {
             workflow: None,
             started_at: None,
         };
-        store.record("s-1", 1, &started("t-1")).unwrap();
-        store.record("s-1", 2, &started("t-2")).unwrap();
+        store
+            .record(
+                "s-1",
+                1,
+                &started("t-1"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &started("t-2"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         store
             .record(
                 "s-1",
@@ -1588,6 +2277,7 @@ mod tests {
                     task_id: "t-1".into(),
                     ended_at: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         assert_eq!(
@@ -1649,7 +2339,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            store.unresolved_background_task_launches("s-1"),
+            store.unresolved_background_task_launches("s-1").unwrap(),
             [BackgroundTaskLaunch {
                 task_id: "wfx".into(),
                 tool_call_id: Some("toolu_wf".into()),
@@ -1657,11 +2347,14 @@ mod tests {
                 workflow_agents: WorkflowAgents {
                     launched: ["a1".to_string(), "a2".to_string()].into(),
                     completed: ["a1".to_string()].into(),
+                    resources: Default::default(),
                 },
+                witness: None,
             }]
         );
         let generic: Vec<String> = store
             .unresolved_background_agent_launches("s-1")
+            .unwrap()
             .into_iter()
             .map(|l| l.agent_id)
             .collect();
@@ -1671,6 +2364,26 @@ mod tests {
             store.unresolved_background_agent_ids("s-1"),
             ["a2", "other-run", "plain"].map(String::from)
         );
+        record_from(
+            &store,
+            "s-1",
+            7,
+            [Event::BackgroundTaskFinished {
+                task_id: "wfx".into(),
+                ended_at: Some(crate::time::Timestamp::now()),
+            }],
+        );
+        assert!(store
+            .unresolved_background_task_launches("s-1")
+            .unwrap()
+            .is_empty());
+        let tracking: Vec<_> = store
+            .unresolved_background_agent_tracking_launches("s-1")
+            .unwrap()
+            .into_iter()
+            .map(|launch| launch.agent_id)
+            .collect();
+        assert_eq!(tracking, ["a2", "other-run", "plain"]);
     }
 
     /// Probes find event types through the indexed `discriminant` column, never by
@@ -1700,15 +2413,17 @@ mod tests {
             completed_at: crate::time::Timestamp::now(),
             async_subagent: false,
         };
-        record_from(
+        record_projection(
             &store,
             "s-1",
             1,
             [
                 user_prompt("first"),
+                Event::ThinkingStarted,
                 agent_chunk("first turn"),
                 stopped("prompt_complete"),
                 user_prompt("second"),
+                Event::ThinkingStarted,
                 bg_launched("bg-1", ""),
                 elicitation,
                 Event::ToolCallStarted {
@@ -1721,31 +2436,64 @@ mod tests {
             ],
         );
         // An unprompted turn the rate limit interrupted.
-        record_from(
+        record_projection(
             &store,
             "s-2",
             1,
-            [agent_chunk("work"), stopped("rate_limited")],
+            [
+                Event::SessionCleared,
+                Event::ThinkingStarted,
+                agent_chunk("work"),
+            ],
         );
+        let mut outcome = store
+            .replay_from("s-2", 0)
+            .unwrap()
+            .last()
+            .unwrap()
+            .metadata
+            .clone();
+        outcome.operation.as_mut().unwrap().outcome =
+            Some(crate::acp::protocol::AcpOriginalRequestResult::Failed);
+        store
+            .record("s-2", 4, &stopped("rate_limited"), &outcome)
+            .unwrap();
         {
             let conn = store.hold_writer();
-            for id in ["s-1", "s-2"] {
-                events::insert_event(&conn, &store.schema, id, 100, "{\"Opaque\":{", 0).unwrap();
+            for (id, seq) in [("s-1", 12), ("s-2", 5)] {
+                events::insert_event(&conn, &store.schema, id, seq, "{\"Opaque\":{", 0).unwrap();
             }
         }
 
         assert_eq!(store.unresolved_elicitation_nonces("s-1"), [nonce]);
-        assert_eq!(store.try_in_flight_turn("s-1"), Some(true));
-        assert!(store.rate_limit_interrupted_agent_turn("s-2"));
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
+        assert_eq!(
+            store.rate_limit_interrupted_agent_turn("s-2").unwrap(),
+            ControlKnowledge::Known(true)
+        );
         // Fails closed (true) if a tool filter parses the malformed row, still in this epoch.
         assert!(store.has_open_tool_call_in_epoch("s-1"));
-        store.record("s-1", 101, &tool_done("tc-open")).unwrap();
+        store
+            .record(
+                "s-1",
+                13,
+                &tool_done("tc-open"),
+                &super::EventMetadata::history(),
+            )
+            .unwrap();
         assert!(!store.has_open_tool_call_in_epoch("s-1"));
         // A closed prompt leaves the background agent as the open work.
+        let terminal = stopped("prompt_complete");
         store
-            .record("s-1", 102, &stopped("prompt_complete"))
+            .record("s-1", 14, &terminal, &super::EventMetadata::host(&terminal))
             .unwrap();
-        assert_eq!(store.try_in_flight_turn("s-1"), Some(true));
+        assert_eq!(
+            store.has_in_flight_turn("s-1").unwrap(),
+            ControlKnowledge::Known(true)
+        );
     }
 
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {

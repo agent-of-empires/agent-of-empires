@@ -1,745 +1,1246 @@
-use super::*;
-use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
-use crate::acp::runner_lifecycle::{LifecycleTable, ResumeKind};
-use std::time::Duration;
-use tokio::net::UnixListener;
-use tokio::time::{timeout, Instant};
+//! Control recovery preserves the original resources and turn ownership.
 
-struct Runner {
-    temp: tempfile::TempDir,
-    frames: mpsc::UnboundedReceiver<ControlBody>,
-    send: mpsc::Sender<Option<ControlBody>>,
-    task: tokio::task::JoinHandle<()>,
+use super::*;
+use crate::acp::control_protocol::{ControlBody, PromptCompletedMarker};
+use crate::acp::establishment::NativeRequestScope;
+use crate::acp::event_sender::EventScope;
+use crate::acp::protocol::{AcpOriginalRequestResult, AcpPromptObservation, AcpPromptWindowId};
+use crate::acp::runner_lifecycle::RunnerIdentity;
+use crate::acp::state::{Event, NativeEventOrigin};
+use crate::acp::supervisor::test_support::managed::{
+    with_managed, ManagedClient, ManagedScope, NativePeer,
+};
+use crate::process::runner::test_support::managed_runner::RunnerInspection;
+use futures_util::FutureExt as _;
+use serde_json::{json, Value};
+use std::future::Future;
+use std::time::Duration;
+use tokio::time::{timeout, timeout_at, Instant};
+
+const BOUND: Duration = Duration::from_secs(15);
+
+async fn bounded<T>(future: impl Future<Output = T>) -> T {
+    timeout(BOUND, future)
+        .await
+        .expect("actual recovery boundary completes")
 }
 
-impl Drop for Runner {
-    fn drop(&mut self) {
-        self.task.abort();
+#[derive(Clone)]
+struct OriginalPrompt {
+    request: Value,
+    scope: NativeRequestScope,
+    window: AcpPromptWindowId,
+    origin: NativeEventOrigin,
+    prefix: u64,
+}
+
+impl OriginalPrompt {
+    fn id(&self) -> i64 {
+        self.request["id"]
+            .as_i64()
+            .expect("runner allocates a numeric Native prompt ID")
     }
+}
+
+struct Runner {
+    client: ManagedClient,
+    native: NativePeer,
+    requests: mpsc::UnboundedReceiver<Value>,
+    controls: mpsc::UnboundedReceiver<ControlBody>,
+    inspection: RunnerInspection,
+    directory: Arc<tempfile::TempDir>,
+    store: Arc<crate::acp::event_store::EventStore>,
+    sid: String,
+    callback: u64,
+    events: Vec<Event>,
 }
 
 impl Runner {
-    fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        let listener = UnixListener::bind(crate::process::worker::control_socket_sibling(
-            &temp.path().join("runner.sock"),
-        ))
-        .unwrap();
-        let (send, mut receive) = mpsc::channel::<Option<ControlBody>>(256);
-        let (frames_tx, frames) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                control_protocol::write_frame(
-                    &mut stream,
-                    &ControlBody::Hello {
-                        control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                        session_id: "recovery".into(),
-                    },
-                )
-                .await
-                .unwrap();
-                loop {
-                    let frame = tokio::select! {
-                        frame = control_protocol::read_frame(&mut stream) => match frame.unwrap() {
-                            Some(frame) => frame,
-                            None => break,
-                        },
-                        body = receive.recv() => {
-                            match body {
-                                Some(Some(body)) => control_protocol::write_frame(&mut stream, &body).await.unwrap(),
-                                Some(None) => break,
-                                None => return,
-                            }
-                            continue;
-                        }
-                    };
-                    let response = match &frame {
-                        ControlBody::Attach { .. } => None,
-                        ControlBody::Initialize { .. } => Some(ControlBody::Initialized {
-                            result: serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}}),
-                        }),
-                        ControlBody::ResumeSession => Some(ControlBody::SessionReady {
-                            acp_session_id: "native".into(),
-                            result: serde_json::json!({}),
-                            adapter_frames: 0,
-                        }),
-                        ControlBody::Prompt { .. } => {
-                            Some(ControlBody::PromptStarted { prompt_req_id: 7 })
-                        }
-                        _ => None,
-                    };
-                    if let Some(response) = response {
-                        control_protocol::write_frame(&mut stream, &response)
-                            .await
-                            .unwrap();
+    async fn new(scope: &mut ManagedScope) -> Self {
+        let directory = scope.tempdir();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let inspection = scope.inspect_next_runner(&name);
+        let sid = format!("native-{}", uuid::Uuid::new_v4());
+        let selected = sid.clone();
+        let (seen, requests) = mpsc::unbounded_channel();
+        let (control_tx, controls) = mpsc::unbounded_channel();
+        scope.configure_sdk(SdkTestOptions {
+            control_output: Some(control_tx),
+            ..Default::default()
+        });
+        let (config, native) =
+            scope.native_peer(directory.path().into(), "codex", "codex", move |request| {
+                seen.send(request.clone()).unwrap();
+                match request["method"].as_str().unwrap() {
+                    "initialize" => Some(json!({
+                        "jsonrpc":"2.0", "id":request["id"],
+                        "result":{"protocolVersion":1,"agentCapabilities":{}}
+                    })),
+                    "session/new" => Some(json!({
+                        "jsonrpc":"2.0", "id":request["id"],
+                        "result":{"sessionId":selected}
+                    })),
+                    "session/prompt" => {
+                        assert_eq!(request["params"]["sessionId"], selected);
+                        None
                     }
-                    frames_tx.send(frame).unwrap();
+                    "session/cancel" => {
+                        assert_eq!(request["params"]["sessionId"], selected);
+                        None
+                    }
+                    method => panic!("unexpected Native operation: {method}"),
+                }
+            });
+        let client = scope
+            .spawn(config, format!("recovery-{sid}"))
+            .await
+            .unwrap();
+        client.ready().await;
+        let store = Arc::clone(&scope.state.acp_event_store);
+        let mut runner = Self {
+            client,
+            native,
+            requests,
+            controls,
+            inspection,
+            directory,
+            store,
+            sid,
+            callback: 0,
+            events: Vec::new(),
+        };
+        runner.assert_owner().await;
+        runner.assigned().await;
+        assert_eq!(runner.native.requests(), ["initialize", "session/new"]);
+        runner
+    }
+
+    fn actual(&self) -> Arc<AcpClient> {
+        self.client.actual()
+    }
+
+    fn state(&self) -> Arc<SessionState> {
+        Arc::clone(&self.actual().reattach.as_ref().unwrap().state)
+    }
+
+    async fn assert_owner(&self) -> RunnerIdentity {
+        let owner = self.actual().connected_runner().unwrap();
+        assert_ne!(owner.pid, std::process::id());
+        let record = bounded(async {
+            loop {
+                match crate::process::worker_registry::load_strict(&self.client.id) {
+                    Err(error) if error.is::<crate::process::worker_registry::RegistryBusy>() => {
+                        tokio::task::yield_now().await;
+                    }
+                    result => {
+                        break result
+                            .unwrap()
+                            .expect("actual owned runner has registry custody")
+                    }
                 }
             }
-        });
-        Self {
-            temp,
-            frames,
-            send,
-            task,
+        })
+        .await;
+        assert_eq!(RunnerIdentity::from_record(&record), owner);
+        let birth = crate::process::process_birth_identity(owner.pid)
+            .unwrap()
+            .expect("same original physical runner remains live");
+        assert_eq!(owner.birth_fingerprint, Some(birth.fingerprint()));
+        owner
+    }
+
+    fn observe_controls(&mut self) {
+        let (send, receive) = mpsc::unbounded_channel();
+        *self
+            .actual()
+            .test_connection_state()
+            .test_control_output
+            .lock()
+            .unwrap() = Some(send);
+        self.controls = receive;
+    }
+
+    async fn recv(&mut self) -> Event {
+        let event = bounded(self.client.next_event())
+            .await
+            .expect("actual managed publication remains available");
+        if let Event::AgentStartupError { message, .. } = &event {
+            panic!("unexpected startup failure: {message}");
         }
+        self.events.push(event.clone());
+        event
     }
 
-    async fn attach(&self, in_flight: bool) -> AcpClient {
-        let mut client = AcpClient::attach(
-            self.temp.path().join("runner.sock"),
-            self.temp.path().into(),
-            vec![],
-            "native".into(),
-            in_flight,
-            AcpSessionId("recovery".into()),
-            None,
-            "test-agent".into(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-        assigned(&mut client).await;
-        client.test_flush_commands().await;
-        client
-    }
-
-    async fn frame(&mut self) -> ControlBody {
+    async fn assigned(&mut self) {
         loop {
-            let frame = timeout(Duration::from_secs(5), self.frames.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            if !matches!(
-                frame,
-                ControlBody::Attach { .. }
-                    | ControlBody::Initialize { .. }
-                    | ControlBody::ResumeSession
-            ) {
-                return frame;
+            if let Event::AcpSessionAssigned {
+                acp_session_id,
+                connection_ready,
+                ..
+            } = self.recv().await
+            {
+                assert_eq!(acp_session_id, self.sid);
+                assert!(connection_ready);
+                assert_eq!(self.actual().selected_native_session(), self.sid);
+                assert!(self
+                    .actual()
+                    .establishment_projection()
+                    .unwrap()
+                    .applied()
+                    .is_some());
+                return;
             }
         }
     }
 
-    async fn send(&self, frame: ControlBody) {
-        self.send.send(Some(frame)).await.unwrap();
-    }
-
-    async fn call(&mut self, method: &str, fields: serde_json::Value) -> serde_json::Value {
-        let mut params = fields;
-        params["sessionId"] = "native".into();
-        self.send(ControlBody::ServerCall {
-            call_id: 1,
-            method: method.into(),
-            params,
-        })
-        .await;
-        match self.frame().await {
-            ControlBody::ServerResult { call_id: 1, result } => result,
-            other => panic!("callback failed: {other:?}"),
-        }
-    }
-
-    async fn disconnect(&self, client: &mut AcpClient) {
-        self.send.send(None).await.unwrap();
-        timeout(Duration::from_secs(5), async {
-            while let Some(event) = client.next_event().await {
+    async fn native_request(&mut self, method: &str) -> Value {
+        bounded(async {
+            loop {
+                let request = self
+                    .requests
+                    .recv()
+                    .await
+                    .expect("actual Native reader remains live");
+                if request["method"] == method {
+                    return request;
+                }
                 assert!(
-                    !matches!(
-                        event,
-                        Event::Stopped { .. } | Event::AgentStartupError { .. }
+                    matches!(
+                        request["method"].as_str(),
+                        Some("initialize" | "session/new")
                     ),
-                    "{event:?}"
+                    "unexpected queued Native operation while awaiting {method}: {request}"
                 );
             }
         })
         .await
-        .expect("connection loss must release watchdog senders promptly");
-        assert!(client.control_loss().is_some());
     }
 
-    async fn recover(&self, client: &AcpClient, in_flight: bool) -> AcpClient {
-        let lease = LifecycleTable::new(1)
-            .admit("recovery", ResumeKind::Attach)
-            .unwrap();
-        let mut next = client
-            .reattach(
-                "native".into(),
-                in_flight,
-                Instant::now() + Duration::from_secs(5),
-                lease,
-            )
-            .await
-            .unwrap();
-        assigned(&mut next).await;
-        next.test_flush_commands().await;
-        next
-    }
-
-    async fn complete(&self, stop_reason: &str) {
-        self.send(ControlBody::PromptCompleted {
-            prompt_req_id: 7,
-            outcome: PromptOutcome::Completed {
-                stop_reason: Some(stop_reason.into()),
-            },
-        })
-        .await;
-    }
-}
-
-async fn assigned(client: &mut AcpClient) {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            match client.next_event().await.unwrap() {
-                Event::AcpSessionAssigned { acp_session_id } => {
-                    assert_eq!(acp_session_id, "native");
-                    return;
+    async fn start(&mut self, text: &str) -> OriginalPrompt {
+        let prefix = self.store.highest_seq(&self.client.id).unwrap();
+        self.client.send_prompt(text, &[]).await.unwrap();
+        let request = self.native_request("session/prompt").await;
+        let control = self.actual().test_control();
+        let (scope, window) = bounded(async {
+            loop {
+                let frozen = {
+                    let completion = control.completion.lock().unwrap();
+                    match &*completion {
+                        control::PromptCompletion::Pending {
+                            prompt_req_id: Some(id),
+                            scope,
+                            window_id: Some(window),
+                            ..
+                        } if Some(*id) == request["id"].as_i64() => Some((scope.clone(), *window)),
+                        _ => None,
+                    }
+                };
+                if let Some(frozen) = frozen {
+                    break frozen;
                 }
-                Event::AgentStartupError { message, .. } => panic!("{message}"),
-                _ => {}
-            }
-        }
-    })
-    .await
-    .unwrap();
-}
-
-async fn stopped(client: &mut AcpClient) -> String {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            match client.next_event().await.unwrap() {
-                Event::Stopped { reason } => return reason,
-                Event::AgentStartupError { message, .. } => panic!("{message}"),
-                _ => {}
-            }
-        }
-    })
-    .await
-    .unwrap()
-}
-
-#[tokio::test]
-async fn terminal_callbacks_keep_their_ids_after_control_recovery() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
-    let mut first = runner.attach(false).await;
-    let terminal = runner
-        .call(
-            "terminal/create",
-            serde_json::json!({"command": "echo", "args": ["retained"]}),
-        )
-        .await;
-    let id = terminal["terminalId"].as_str().unwrap();
-    runner.disconnect(&mut first).await;
-    let next = runner.recover(&first, false).await;
-    let fields = serde_json::json!({"terminalId": id});
-    let output = runner.call("terminal/output", fields.clone()).await;
-    assert_eq!(output["output"], "retained\n");
-    assert_eq!(
-        runner.call("terminal/wait_for_exit", fields.clone()).await["exitCode"],
-        0
-    );
-    runner.call("terminal/release", fields.clone()).await;
-    runner
-        .send(ControlBody::ServerCall {
-            call_id: 2,
-            method: "terminal/output".into(),
-            params: serde_json::json!({"sessionId": "native", "terminalId": id}),
-        })
-        .await;
-    assert!(matches!(
-        runner.frame().await,
-        ControlBody::ServerError { call_id: 2, .. }
-    ));
-    next.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn completed_turn_keeps_its_terminal_claim_when_eof_snapshots_it_active() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
-    let mut first = runner.attach(false).await;
-    first.send_prompt("run", &[]).await.unwrap();
-    assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-    runner.complete("end_turn").await;
-    assert_eq!(stopped(&mut first).await, "prompt_complete");
-    runner.disconnect(&mut first).await;
-    // EOF can observe the active flag before the prior terminal send clears it.
-    let mut next = runner.recover(&first, true).await;
-    runner.complete("end_turn").await;
-    // A later callback proves the cached completion passed the ordered dispatcher.
-    runner
-        .call(
-            "terminal/release",
-            serde_json::json!({"terminalId": "unused"}),
-        )
-        .await;
-    next.test_flush_commands().await;
-    assert!(matches!(
-        next.inbound.as_mut().unwrap().try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
-    runner.disconnect(&mut next).await;
-    assert!(
-        !next.control_loss().unwrap().turn_in_flight,
-        "replayed completion must clear the recovered in-flight flag"
-    );
-    next.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    for (local, limited) in [(true, false), (false, false), (true, true), (false, true)] {
-        let mut runner = Runner::new();
-        let mut first = runner.attach(!local).await;
-        if local {
-            first.send_prompt("run", &[]).await.unwrap();
-            assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-        }
-        let capacity = first.inbound.as_ref().unwrap().max_capacity();
-        for index in 0..capacity {
-            runner
-                .send(ControlBody::Notify {
-                    method: "session/update".into(),
-                    params: serde_json::json!({"sessionId": "native", "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": format!("queued-{index}")}
-                    }}),
-                })
-                .await;
-        }
-        if limited {
-            runner
-                .send(ControlBody::PromptCompleted {
-                    prompt_req_id: 7,
-                    outcome: PromptOutcome::Error {
-                        code: -32000,
-                        message: "rate limit exceeded".into(),
-                        data: Some(serde_json::json!({"errorKind": "rate_limit"})),
-                    },
-                })
-                .await;
-        } else {
-            runner.complete("end_turn").await;
-        }
-        let claim = first
-            .reattach
-            .as_ref()
-            .unwrap()
-            .state
-            .terminal_claim
-            .clone();
-        timeout(Duration::from_secs(5), async {
-            while !claim.claimed() {
                 tokio::task::yield_now().await;
             }
         })
+        .await;
+        let receipt = self
+            .actual()
+            .establishment_projection()
+            .unwrap()
+            .receipt_snapshot()
+            .unwrap();
+        let origin = scope.origin(Some(receipt.as_ref())).unwrap();
+        assert_eq!(scope.owner(), Some(self.assert_owner().await));
+        assert_eq!(origin.owner, self.actual().connected_runner());
+        assert!(scope.correlation().is_some());
+        OriginalPrompt {
+            request,
+            scope,
+            window,
+            origin,
+            prefix,
+        }
+    }
+
+    async fn adopt(mut self, scope: &mut ManagedScope, original: &OriginalPrompt) -> Self {
+        let owner = self.assert_owner().await;
+        let (send, receive) = mpsc::unbounded_channel();
+        scope.configure_sdk(SdkTestOptions {
+            control_output: Some(send),
+            ..Default::default()
+        });
+        self.client = scope.adopt(self.client, true).await;
+        self.controls = receive;
+        self.client.ready().await;
+        self.assigned().await;
+        assert_eq!(self.assert_owner().await, owner);
+        let control = self.actual().test_control();
+        let completion = control.completion.lock().unwrap();
+        let control::PromptCompletion::Adopted(Some(head)) = &*completion else {
+            panic!("actual adoption must retain the genuine in-flight Native head");
+        };
+        assert_eq!(head.prompt_req_id, original.id());
+        assert_eq!(head.scope, original.scope);
+        assert_eq!(head.window_id, original.window);
+        drop(completion);
+        self
+    }
+
+    async fn close_control(&self) -> Arc<AcpClient> {
+        let actual = self.actual();
+        let owner = self.assert_owner().await;
+        let closed = self.inspection.query("close-control").await;
+        assert!(closed["closed_attachment"].as_u64().is_some());
+        bounded(async {
+            while actual.control_loss().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(actual.connected_runner(), Some(owner));
+        actual
+    }
+
+    async fn recover(&mut self, previous: &Arc<AcpClient>) {
+        let owner = previous.connected_runner().unwrap();
+        let state = Arc::clone(&previous.reattach.as_ref().unwrap().state);
+        let lease = self.client.lease.clone();
+        self.client.refresh_after_control_loss().await;
+        assert!(!Arc::ptr_eq(previous, &self.actual()));
+        assert_eq!(self.client.lease, lease);
+        assert_eq!(self.assert_owner().await, owner);
+        assert!(Arc::ptr_eq(&state, &self.state()));
+        self.observe_controls();
+        self.assigned().await;
+        bounded(previous.observe_sdk_task()).await.unwrap();
+        self.client.test_flush_commands().await;
+    }
+
+    async fn reply(&self, original: &OriginalPrompt, reason: &str) {
+        self.native
+            .send(json!({
+                "jsonrpc":"2.0", "id":original.request["id"], "result":{"stopReason":reason}
+            }))
+            .await;
+    }
+
+    async fn quota(&self, original: &OriginalPrompt) {
+        self.native
+            .send(json!({
+                "jsonrpc":"2.0", "id":original.request["id"],
+                "error":{"code":-32000,"message":"rate limit exceeded",
+                    "data":{"errorKind":"rate_limit","privateTokenMarker":"must-not-leak"}}
+            }))
+            .await;
+    }
+
+    async fn update(&self, update: Value) {
+        self.native
+            .send(json!({
+                "jsonrpc":"2.0","method":"session/update",
+                "params":{"sessionId":self.sid,"update":update}
+            }))
+            .await;
+    }
+
+    async fn call(&mut self, method: &str, mut params: Value) -> Value {
+        self.callback += 1;
+        let id = format!("recovery-callback-{}", self.callback);
+        params["sessionId"] = self.sid.clone().into();
+        self.native
+            .send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .await;
+        let reply = bounded(self.native.reply()).await;
+        assert_eq!(reply["id"], id);
+        reply
+    }
+
+    async fn barrier(&mut self) {
+        self.callback += 1;
+        let id = format!("ordered-denial-{}", self.callback);
+        let forbidden = self.directory.path().join(&id);
+        assert!(!forbidden.exists());
+        self.native.send(json!({
+            "jsonrpc":"2.0","id":id,"method":"fs/write_text_file",
+            "params":{"sessionId":"not-the-selected-session","path":forbidden,"content":"forbidden"}
+        })).await;
+        let denied = bounded(self.native.reply()).await;
+        assert_eq!(denied["id"], id);
+        assert_eq!(denied["error"]["code"], -32602);
+        assert!(!forbidden.exists());
+    }
+
+    async fn cancel(&mut self) -> NativeRequestScope {
+        self.client.cancel_prompt().await.unwrap();
+        let frame = bounded(async {
+            loop {
+                let frame = self
+                    .controls
+                    .recv()
+                    .await
+                    .expect("actual control output observer");
+                if matches!(frame, ControlBody::Cancel { .. }) {
+                    break frame;
+                }
+            }
+        })
+        .await;
+        let ControlBody::Cancel { scope } = frame else {
+            unreachable!()
+        };
+        assert_eq!(scope.owner(), Some(self.assert_owner().await));
+        assert!(scope.correlation().is_some());
+        self.native_request("session/cancel").await;
+        scope
+    }
+
+    async fn event_since(&mut self, start: usize, wanted: impl Fn(&Event) -> bool) -> usize {
+        bounded(async {
+            loop {
+                if let Some(index) = self.events[start..].iter().position(&wanted) {
+                    return start + index;
+                }
+                self.recv().await;
+            }
+        })
         .await
-        .unwrap();
-        assert_eq!(first.inbound.as_ref().unwrap().len(), capacity);
-        runner.send.send(None).await.unwrap();
-        timeout(Duration::from_secs(5), async {
-            while !first
-                .connection_task
+    }
+
+    async fn stopped_since(&mut self, start: usize, expected: &str) -> usize {
+        let index = self
+            .event_since(start, |event| matches!(event, Event::Stopped { .. }))
+            .await;
+        assert!(
+            matches!(&self.events[index], Event::Stopped { reason } if reason == expected),
+            "unexpected terminal: {:?}",
+            self.events[index]
+        );
+        index
+    }
+
+    fn drain_observer(&mut self) {
+        while let Ok(event) = self.client.try_recv() {
+            assert!(!matches!(event, Event::AgentStartupError { .. }));
+            self.events.push(event);
+        }
+    }
+
+    fn assert_original(
+        &self,
+        original: &OriginalPrompt,
+        outcome: AcpOriginalRequestResult,
+        scope: EventScope,
+    ) {
+        let stored = self
+            .store
+            .replay_from(&self.client.id, original.prefix)
+            .unwrap();
+        let terminals: Vec<_> = stored
+            .iter()
+            .filter(|stored| {
+                matches!(stored.event.as_ref(), Event::Stopped { .. })
+                    && stored.metadata.native_prompt_id == Some(original.id())
+            })
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "the exact original Native result publishes once"
+        );
+        let metadata = &terminals[0].metadata;
+        assert_eq!(metadata.scope, scope);
+        assert_eq!(metadata.native_origin, Some(original.origin));
+        assert_eq!(
+            metadata.operation.unwrap().correlation,
+            original.scope.correlation().unwrap()
+        );
+        assert_eq!(metadata.operation.unwrap().outcome, Some(outcome));
+        assert_eq!(
+            metadata.prompt_observation,
+            Some(AcpPromptObservation::Written {
+                window_id: original.window
+            })
+        );
+        assert!(!metadata.host_action);
+        assert!(!serde_json::to_string(&self.events)
+            .unwrap()
+            .contains("must-not-leak"));
+    }
+
+    async fn assert_cancel_grace(&self, original: &CancelGrace) {
+        let state = self.state();
+        let grace = state
+            .cancel_deadline
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("retained cancellation grace");
+        assert_eq!(grace.deadline, original.deadline);
+        assert_eq!(grace.turn, original.turn);
+        assert_eq!(grace.turn, state.terminal_claim.current_turn());
+        let before = original
+            .scope
+            .as_ref()
+            .expect("genuine Native cancel context");
+        let after = grace
+            .scope
+            .as_ref()
+            .expect("genuine recovered Native cancel context");
+        assert_eq!(after.scope, before.scope);
+        assert_eq!(after.receipt, before.receipt);
+        assert_eq!(after.origin(), before.origin());
+        assert_eq!(after.correlation(), before.correlation());
+        assert_eq!(after.scope.owner(), Some(self.assert_owner().await));
+        assert!(after.correlation().is_some());
+        assert!(after.receipt.is_some());
+    }
+
+    async fn no_terminal_before(&mut self, deadline: Instant) {
+        loop {
+            match timeout_at(deadline, self.client.next_event()).await {
+                Err(_) => return,
+                Ok(Some(event)) => {
+                    assert!(
+                        !matches!(
+                            event,
+                            Event::Stopped { .. } | Event::AgentStartupError { .. }
+                        ),
+                        "{event:?}"
+                    );
+                    self.events.push(event);
+                }
+                Ok(None) => panic!("the recovered actor ended before its original grace"),
+            }
+        }
+    }
+
+    async fn finish_cancel(&mut self, grace: &CancelGrace, start: usize) {
+        self.no_terminal_before(grace.deadline - Duration::from_millis(1))
+            .await;
+        self.stopped_since(start, "agent_unresponsive").await;
+        let actual = self.actual();
+        bounded(actual.observe_sdk_task()).await.unwrap();
+        let stored = self.store.replay_from(&self.client.id, 0).unwrap();
+        let terminals: Vec<_> = stored.iter().filter(|stored| {
+            matches!(stored.event.as_ref(), Event::Stopped { reason } if reason == "agent_unresponsive")
+        }).collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "the retained turn escalates exactly once"
+        );
+        let operation = terminals[0]
+            .metadata
+            .operation
+            .expect("the retained cancel operation owns escalation");
+        assert_eq!(
+            operation.correlation,
+            grace.scope.as_ref().unwrap().correlation().unwrap()
+        );
+        assert_eq!(
+            operation.outcome, None,
+            "timeout cannot forge a positive Native result"
+        );
+        assert_eq!(terminals[0].metadata.native_prompt_id, None);
+        self.client.shutdown().await.unwrap();
+        self.drain_observer();
+        assert_eq!(
+            self.events
+                .iter()
+                .filter(|event| matches!(event,
+            Event::Stopped { reason } if reason == "agent_unresponsive"))
+                .count(),
+            1
+        );
+    }
+
+    async fn shutdown(&mut self) {
+        self.client.shutdown().await.unwrap();
+        self.drain_observer();
+        assert!(!self
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::AgentStartupError { .. })));
+    }
+}
+
+async fn armed(state: &Arc<SessionState>) -> CancelGrace {
+    bounded(async {
+        loop {
+            if let Some(grace) = state.cancel_deadline.lock().unwrap().clone() {
+                break grace;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn terminal_callbacks_keep_their_ids_after_control_recovery() {
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut runner = Runner::new(scope).await;
+            let created = runner
+                .call(
+                    "terminal/create",
+                    json!({"command":"echo","args":["retained"]}),
+                )
+                .await;
+            assert!(created.get("error").is_none(), "{created}");
+            let id = created["result"]["terminalId"].as_str().unwrap().to_owned();
+            let old = runner.close_control().await;
+            runner.recover(&old).await;
+            let fields = json!({"terminalId":id});
+            let exited = runner.call("terminal/wait_for_exit", fields.clone()).await;
+            assert_eq!(exited["result"]["exitCode"], 0);
+            let output = runner.call("terminal/output", fields.clone()).await;
+            assert_eq!(output["result"]["output"], "retained\n");
+            let released = runner.call("terminal/release", fields.clone()).await;
+            assert!(released.get("error").is_none(), "{released}");
+            let missing = runner.call("terminal/output", fields).await;
+            assert!(
+                missing.get("error").is_some(),
+                "released original terminal must not reappear: {missing}"
+            );
+            assert_eq!(runner.native.requests(), ["initialize", "session/new"]);
+            assert!(!runner
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Stopped { .. })));
+            runner.shutdown().await;
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn completed_turn_keeps_its_terminal_claim_when_eof_snapshots_it_active() {
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut runner = Runner::new(scope).await;
+            let original = runner
+                .start("complete before the active snapshot is cleared")
+                .await;
+            let state = runner.state();
+            let turn = state.terminal_claim.current_turn();
+            let (entered, reached) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            assert!(state
+                .terminal_before_clear
                 .lock()
                 .unwrap()
-                .as_ref()
-                .unwrap()
-                .is_finished()
-            {
-                tokio::task::yield_now().await;
-            }
+                .replace((entered, released))
+                .is_none());
+            let start = runner.events.len();
+            runner.reply(&original, "end_turn").await;
+            bounded(reached).await.unwrap();
+            runner.stopped_since(start, "prompt_complete").await;
+            assert!(state.terminal_claim.claimed());
+            assert_eq!(state.terminal_claim.current_turn(), turn);
+            runner.assert_original(
+                &original,
+                AcpOriginalRequestResult::Succeeded,
+                EventScope::OperationCurrent,
+            );
+            let old = runner.close_control().await;
+            assert!(
+                old.control_loss().unwrap().turn_in_flight,
+                "actual EOF captures the active flag before original publication cleanup"
+            );
+            assert!(!old.claim_lost_turn(old.control_loss().unwrap()));
+            release.send(()).unwrap();
+            runner.recover(&old).await;
+            runner.barrier().await;
+            runner.client.test_flush_commands().await;
+            runner.drain_observer();
+            assert_eq!(
+                runner
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Stopped { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(state.terminal_claim.current_turn(), turn);
+            let replayed = runner.close_control().await;
+            assert!(
+                !replayed.control_loss().unwrap().turn_in_flight,
+                "replayed completion cannot keep the recovered turn active"
+            );
+            runner.recover(&replayed).await;
+            runner.assert_original(
+                &original,
+                AcpOriginalRequestResult::Succeeded,
+                EventScope::OperationCurrent,
+            );
+            assert_eq!(
+                runner
+                    .native
+                    .requests()
+                    .iter()
+                    .filter(|method| *method == "session/prompt")
+                    .count(),
+                1
+            );
+            runner.shutdown().await;
         })
-        .await
-        .expect("the transport must close while terminal publication is backpressured");
-        // EOF may still snapshot the turn as active; if recovery then fails,
-        // the fallback must not end the claimed turn a second time.
-        let loss = control::ControlLoss {
-            turn_in_flight: true,
-            ..first.control_loss().unwrap()
-        };
-        assert!(!first.claim_lost_turn(loss));
-        let mut terminals = 0;
-        let mut rate_limits = 0;
-        timeout(Duration::from_secs(5), async {
-            while let Some(event) = first.next_event().await {
-                terminals += usize::from(matches!(event, Event::Stopped { .. }));
-                rate_limits += usize::from(matches!(event, Event::RateLimit { .. }));
-            }
-        })
-        .await
-        .unwrap();
-        let mut next = runner.recover(&first, true).await;
-        runner.complete("end_turn").await;
-        runner
-            .call(
-                "terminal/release",
-                serde_json::json!({"terminalId": "unused"}),
-            )
-            .await;
-        next.test_flush_commands().await;
-        while let Ok(event) = next.inbound.as_mut().unwrap().try_recv() {
-            terminals += usize::from(matches!(event, Event::Stopped { .. }));
-        }
-        assert_eq!(
-            terminals, 1,
-            "a terminal claimed before EOF must reach the drain exactly once"
-        );
-        assert_eq!(rate_limits, usize::from(limited));
-        next.shutdown().await.unwrap();
-    }
+    })
+    .await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
+    with_managed(|scope| {
+        Box::pin(async move {
+            for (local, limited, cancel) in [
+                (true, false, false),
+                (false, false, false),
+                (true, true, false),
+                (false, true, false),
+                (false, true, true),
+            ] {
+                let mut runner = Runner::new(scope).await;
+                let original = runner
+                    .start("real original under publication backpressure")
+                    .await;
+                if !local {
+                    runner = runner.adopt(scope, &original).await;
+                }
+                let actual = runner.actual();
+                let state = runner.state();
+                let turn = state.terminal_claim.current_turn();
+                if cancel {
+                    let start = runner.events.len();
+                    let sent = runner.cancel().await;
+                    runner
+                        .event_since(start, |event| {
+                            matches!(event, Event::CancelRequested { .. })
+                        })
+                        .await;
+                    let grace = armed(&state).await;
+                    assert_eq!(sent, grace.scope.as_ref().unwrap().scope);
+                    runner.assert_cancel_grace(&grace).await;
+                }
+                let start = runner.events.len();
+                let pause = runner.client.pause_drain().await;
+                let sender = actual.test_event_queue().upgrade().unwrap();
+                let capacity = sender.capacity();
+                assert!(capacity > 0, "drain ACK precedes the deliberate pressure");
+                while let Some(result) = sender
+                    .historical()
+                    .send(Event::AuthStatusUpdated { status: None })
+                    .now_or_never()
+                {
+                    result.unwrap();
+                }
+                assert_eq!(sender.capacity(), 0);
+                let (observed, mut relay) = mpsc::unbounded_channel();
+                *actual
+                    .test_connection_state()
+                    .test_relay_observer
+                    .lock()
+                    .unwrap() = Some(observed);
+                let (entered, reached) = oneshot::channel();
+                let (release, released) = oneshot::channel();
+                *actual
+                    .test_connection_state()
+                    .test_prompt_completed
+                    .lock()
+                    .unwrap() = Some((entered, released));
+                let queued = capacity + if cancel { 2 } else { 0 };
+                for index in 0..queued {
+                    runner
+                        .update(json!({"sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":format!("queued-{index}")}}))
+                        .await;
+                }
+                if limited {
+                    runner.quota(&original).await;
+                } else {
+                    runner.reply(&original, "end_turn").await;
+                }
+                bounded(reached).await.unwrap();
+                assert_eq!(sender.capacity(), 0);
+                assert!(
+                    !state.terminal_claim.claimed(),
+                    "control receipt is not ordered SDK publication"
+                );
+                assert_eq!(state.terminal_claim.current_turn(), turn);
+                release.send(()).unwrap();
+                bounded(async {
+                    loop {
+                        let observation = relay
+                            .recv()
+                            .await
+                            .expect("actual completion relay remains observed");
+                        if observation.stage == control::TestRelayStage::Relayed
+                            && observation.payload["method"] == "_aoe/prompt_completed"
+                        {
+                            let marker: PromptCompletedMarker =
+                                serde_json::from_value(observation.payload["params"].clone())
+                                    .unwrap();
+                            assert_eq!(
+                                marker.prompt_req_id.or_else(|| marker
+                                    .adopted
+                                    .as_ref()
+                                    .map(|adopted| adopted.prompt_req_id)),
+                                Some(original.id())
+                            );
+                            if !local {
+                                let adopted = marker.adopted.unwrap();
+                                let evidence = adopted.evidence.unwrap();
+                                assert_eq!(evidence.scope, original.scope);
+                                assert_eq!(evidence.window_id, original.window);
+                                assert_eq!(evidence.origin, original.origin);
+                            }
+                            break;
+                        }
+                    }
+                })
+                .await;
+                runner.barrier().await;
+                assert_eq!(
+                    sender.capacity(),
+                    0,
+                    "the public lane remains full at actual control EOF"
+                );
+                let old = runner.close_control().await;
+                assert!(old.control_loss().unwrap().turn_in_flight);
+                drop(sender);
+                drop(pause);
+                runner.recover(&old).await;
+                let stop = runner
+                    .stopped_since(
+                        start,
+                        if limited {
+                            "rate_limited"
+                        } else {
+                            "prompt_complete"
+                        },
+                    )
+                    .await;
+                runner.barrier().await;
+                runner.client.test_flush_commands().await;
+                runner.drain_observer();
+                assert!(
+                    !old.claim_lost_turn(old.control_loss().unwrap()),
+                    "fallback cannot settle the published original twice"
+                );
+                assert!(state.terminal_claim.claimed());
+                assert_eq!(state.terminal_claim.current_turn(), turn);
+                assert!(state.cancel_deadline.lock().unwrap().is_none());
+                let events = &runner.events[start..];
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Event::Stopped { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Event::RateLimit { .. }))
+                        .count(),
+                    usize::from(limited)
+                );
+                let chunks: Vec<_> = runner.events[start..stop]
+                    .iter()
+                    .filter_map(|event| {
+                        if let Event::AgentMessageChunk { text, .. } = event {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    chunks,
+                    (0..queued)
+                        .map(|index| format!("queued-{index}"))
+                        .collect::<Vec<_>>()
+                );
+                runner.assert_original(
+                    &original,
+                    if limited {
+                        AcpOriginalRequestResult::Failed
+                    } else {
+                        AcpOriginalRequestResult::Succeeded
+                    },
+                    if local {
+                        EventScope::OperationCurrent
+                    } else {
+                        EventScope::HistoryOnly
+                    },
+                );
+                assert_eq!(
+                    runner
+                        .native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
+                    1
+                );
+                runner.shutdown().await;
+            }
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn unfinished_lost_turn_is_claimed_once_by_the_fallback() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
-    let mut first = runner.attach(false).await;
-    first.send_prompt("run", &[]).await.unwrap();
-    assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-    runner.disconnect(&mut first).await;
-    let loss = first.control_loss().unwrap();
-    assert!(first.claim_lost_turn(loss));
-    assert!(!first.claim_lost_turn(loss), "one terminal per turn");
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut runner = Runner::new(scope).await;
+            let original = runner.start("unfinished genuine original").await;
+            let state = runner.state();
+            let turn = state.terminal_claim.current_turn();
+            let pause = runner.client.pause_drain().await;
+            let old = runner.close_control().await;
+            let loss = old.control_loss().unwrap();
+            assert!(loss.turn_in_flight);
+            assert!(!state.terminal_claim.claimed());
+            assert!(old.claim_lost_turn(loss));
+            assert!(
+                !old.claim_lost_turn(loss),
+                "one fallback claim per actual lost turn"
+            );
+            assert_eq!(state.terminal_claim.current_turn(), turn);
+            assert!(
+                !runner
+                    .store
+                    .replay_from(&runner.client.id, original.prefix)
+                    .unwrap()
+                    .iter()
+                    .any(|stored| {
+                        stored
+                            .metadata
+                            .operation
+                            .is_some_and(|operation| operation.outcome.is_some())
+                    }),
+                "claiming a lost slot cannot fabricate a Native outcome"
+            );
+            drop(pause);
+            runner.recover(&old).await;
+            assert!(state.terminal_claim.claimed());
+            assert!(!old.claim_lost_turn(loss));
+            let start = runner.events.len();
+            runner.reply(&original, "end_turn").await;
+            runner.stopped_since(start, "prompt_complete").await;
+            runner.assert_original(
+                &original,
+                AcpOriginalRequestResult::Succeeded,
+                EventScope::HistoryOnly,
+            );
+            runner.shutdown().await;
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn cancelling_turn_recovers_with_only_the_original_grace_remaining() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    let mut runner = Runner::new();
-    let mut first = runner.attach(false).await;
-    first.send_prompt("run", &[]).await.unwrap();
-    assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-    first.cancel_prompt().await.unwrap();
-    assert!(matches!(runner.frame().await, ControlBody::Cancel));
-    loop {
-        if matches!(
-            first.next_event().await.unwrap(),
-            Event::CancelRequested { .. }
-        ) {
-            break;
-        }
-    }
-    // Only the Tokio cancellation timer affects this assertion.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(6)).await;
-    tokio::time::resume();
-    let deadline = first
-        .reattach
-        .as_ref()
-        .unwrap()
-        .state
-        .cancel_deadline
-        .lock()
-        .unwrap()
-        .unwrap();
-    runner.disconnect(&mut first).await;
-    let mut next = runner.recover(&first, true).await;
-    next.cancel_prompt().await.unwrap();
-    assert!(matches!(runner.frame().await, ControlBody::Cancel));
-    next.test_flush_commands().await;
-    assert!(
-        tokio::time::timeout_at(deadline - Duration::from_millis(1), next.next_event())
-            .await
-            .is_err(),
-        "recovery must retain the remaining grace"
-    );
-    assert_eq!(stopped(&mut next).await, "agent_unresponsive");
-    assert!(timeout(Duration::from_secs(2), next.next_event())
-        .await
-        .unwrap()
-        .is_none());
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut runner = Runner::new(scope).await;
+            let _original = runner.start("cancel before control recovery").await;
+            let state = runner.state();
+            let start = runner.events.len();
+            let sent = runner.cancel().await;
+            runner
+                .event_since(start, |event| {
+                    matches!(event, Event::CancelRequested { .. })
+                })
+                .await;
+            let grace = armed(&state).await;
+            assert_eq!(sent, grace.scope.as_ref().unwrap().scope);
+            runner.assert_cancel_grace(&grace).await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(6)).await;
+            tokio::time::resume();
+            let old = runner.close_control().await;
+            runner.recover(&old).await;
+            runner.assert_cancel_grace(&grace).await;
+            let repeated = runner.cancel().await;
+            assert_ne!(
+                repeated.correlation(),
+                sent.correlation(),
+                "two host cancel operations have distinct admission"
+            );
+            runner.client.test_flush_commands().await;
+            runner.assert_cancel_grace(&grace).await;
+            runner.finish_cancel(&grace, start).await;
+        })
+    })
+    .await;
 }
 
-/// A control loss while the first cancel is still being sent keeps its
-/// escalation: the recovered turn ends at the original deadline.
 #[tokio::test]
+#[serial_test::serial]
+async fn captured_cancel_survives_physical_admission_contention() {
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut runner = Runner::new(scope).await;
+            let original = runner
+                .start("cancel across actual lifecycle exclusion")
+                .await;
+            let owner = runner.assert_owner().await;
+            let state = runner.state();
+            let connection = runner.actual().test_connection_state();
+            let gate = state.cancel_send_gate.write().await;
+            let start = runner.events.len();
+            runner.client.cancel_prompt().await.unwrap();
+            let grace = armed(&state).await;
+            let (busy, observed) = oneshot::channel();
+            *connection.test_prompt_admission_busy.lock().unwrap() = Some(busy);
+            let storage = crate::session::Storage::open_reference("test").unwrap();
+            let exclusion = storage
+                .acquire_instance_lifecycle_lock(&runner.client.id)
+                .unwrap();
+            drop(gate);
+            bounded(observed)
+                .await
+                .expect("captured cancel encounters physical contention");
+            assert!(
+                timeout(Duration::from_millis(100), async {
+                    loop {
+                        if runner
+                            .native
+                            .requests()
+                            .iter()
+                            .any(|method| method == "session/cancel")
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_err(),
+                "no Native cancel while its physical fence is held"
+            );
+            drop(exclusion);
+            runner
+                .event_since(start, |event| {
+                    matches!(event, Event::CancelRequested { .. })
+                })
+                .await;
+            runner.assert_cancel_grace(&grace).await;
+            assert_eq!(runner.assert_owner().await, owner);
+            bounded(async {
+                while !runner
+                    .native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/cancel")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let stored = runner
+                .store
+                .replay_from(&runner.client.id, original.prefix)
+                .unwrap();
+            let cancels: Vec<_> = stored
+                .iter()
+                .filter(|stored| matches!(stored.event.as_ref(), Event::CancelRequested { .. }))
+                .collect();
+            assert_eq!(cancels.len(), 1);
+            assert_eq!(cancels[0].metadata.scope, EventScope::OperationCurrent);
+            assert_eq!(
+                cancels[0].metadata.operation.unwrap().correlation,
+                grace.scope.as_ref().unwrap().correlation().unwrap()
+            );
+            assert_eq!(
+                runner
+                    .native
+                    .requests()
+                    .iter()
+                    .filter(|method| method.as_str() == "session/cancel")
+                    .count(),
+                1
+            );
+            runner.reply(&original, "end_turn").await;
+            runner.stopped_since(start, "prompt_complete").await;
+            runner.shutdown().await;
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn cancel_armed_before_its_send_survives_control_loss_mid_send() {
-    #[derive(Debug, Clone, Copy)]
+    let thread = std::thread::current();
+    if crate::process::runner::test_support::managed_runner::child_if_requested(
+        thread.name().unwrap(),
+    )
+    .await
+    {
+        return;
+    }
+    #[derive(Clone, Copy, Debug)]
     enum Cancel {
         Local,
         Adopted,
         SilentOrphan,
     }
     for case in [Cancel::Local, Cancel::Adopted, Cancel::SilentOrphan] {
-        let _env = match case {
-            Cancel::SilentOrphan => crate::session::test_support::EnvGuard::set(&[
-                ("AOE_SILENT_ORPHAN_GRACE_MS", "50"),
-                ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "10"),
-            ]),
-            Cancel::Local | Cancel::Adopted => crate::session::test_support::EnvGuard::read_lock(),
-        };
-        let mut runner = Runner::new();
-        let mut first = runner.attach(matches!(case, Cancel::Adopted)).await;
-        let state = Arc::clone(&first.reattach.as_ref().unwrap().state);
-        let gate = state.cancel_send_gate.write().await;
-        if !matches!(case, Cancel::Adopted) {
-            first.send_prompt("run", &[]).await.unwrap();
-            assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-        }
         match case {
             Cancel::SilentOrphan => {
-                runner
-                    .send(ControlBody::Notify {
-                        method: "session/update".into(),
-                        params: serde_json::json!({"sessionId": "native", "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": "progress"}
-                        }}),
-                    })
-                    .await;
+                let _environment = crate::session::test_support::EnvGuard::set(&[
+                    ("AOE_SILENT_ORPHAN_GRACE_MS", "50"),
+                    ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "10"),
+                ]);
+                connection::test_local_silent_orphan_cancel_recovery().await;
             }
-            Cancel::Local | Cancel::Adopted => first.cancel_prompt().await.unwrap(),
-        }
-        let deadline = timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(deadline) = *state.cancel_deadline.lock().unwrap() {
-                    return deadline;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{case:?}: no deadline while the cancel send is held"));
-        while let Ok(frame) = runner.frames.try_recv() {
-            assert!(
-                !matches!(frame, ControlBody::Cancel),
-                "{case:?}: the held cancel must not reach the runner"
-            );
-        }
-        // Only the Tokio cancellation timer affects the grace assertion.
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(6)).await;
-        tokio::time::resume();
-        runner.disconnect(&mut first).await;
-        drop(gate);
-        let mut next = runner.recover(&first, true).await;
-        next.test_flush_commands().await;
-        assert!(
-            tokio::time::timeout_at(deadline - Duration::from_millis(1), next.next_event())
-                .await
-                .is_err(),
-            "{case:?}: recovery must retain the remaining grace"
-        );
-        assert_eq!(stopped(&mut next).await, "agent_unresponsive", "{case:?}");
-    }
-}
-
-#[tokio::test]
-async fn silent_initial_adoption_releases_its_watchdog_on_control_loss() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    let runner = Runner::new();
-    let mut first = runner.attach(true).await;
-    runner.disconnect(&mut first).await;
-    let mut next = runner.recover(&first, true).await;
-    runner.complete("end_turn").await;
-    assert_eq!(stopped(&mut next).await, "prompt_complete");
-    next.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    for (report, stop_reason, reset_after, parked) in [
-        ("rejected", "end_turn", 3600, true),
-        ("rejected", "cancelled", 3600, false),
-        ("allowed", "end_turn", 3600, false),
-        ("rejected", "end_turn", -60, false),
-        ("rejected", "error", 3600, true),
-    ] {
-        let mut runner = Runner::new();
-        let mut first = runner.attach(false).await;
-        first.send_prompt("run", &[]).await.unwrap();
-        assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-        let resets_at = crate::time::Timestamp::now().as_unix_secs() + reset_after;
-        runner.send(ControlBody::Notify { method: "session/update".into(), params: serde_json::json!({"sessionId": "native", "update": {
-            "sessionUpdate": "usage_update", "used": 1, "size": 2, "_meta": {"_claude/rateLimit": {"status": "rejected", "resetsAt": resets_at}}
-        }}) }).await;
-        // The callback reply proves the pre-loss rejection was captured.
-        runner
-            .call(
-                "terminal/release",
-                serde_json::json!({"terminalId": "unused"}),
-            )
-            .await;
-        runner.disconnect(&mut first).await;
-        let mut next = runner.recover(&first, true).await;
-        if report == "allowed" {
-            runner.send(ControlBody::Notify { method: "session/update".into(), params: serde_json::json!({"sessionId": "native", "update": {
-                "sessionUpdate": "usage_update", "used": 1, "size": 2, "_meta": {"_claude/rateLimit": {"status": report}}
-            }}) }).await;
-        }
-        for index in 0..100 {
-            runner.send(ControlBody::Notify { method: "session/update".into(), params: serde_json::json!({"sessionId": "native", "update": {
-                "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": format!("final-{index}")}
-            }}) }).await;
-        }
-        if stop_reason == "error" {
-            runner
-                .send(ControlBody::PromptCompleted {
-                    prompt_req_id: 7,
-                    outcome: PromptOutcome::Error {
-                        code: -32000,
-                        message: "rate limit exceeded".into(),
-                        data: Some(serde_json::json!({"errorKind": "rate_limit"})),
-                    },
-                })
-                .await;
-        } else {
-            runner.complete(stop_reason).await;
-        }
-        let mut chunks = Vec::new();
-        let mut limited = false;
-        loop {
-            match timeout(Duration::from_secs(5), next.next_event())
-                .await
-                .unwrap()
-                .unwrap()
-            {
-                Event::AgentMessageChunk { text, .. } => chunks.push(text),
-                Event::RateLimit { info } => {
-                    limited = true;
-                    assert_eq!(info.resets_at.unwrap().as_unix_secs(), resets_at);
-                }
-                Event::Stopped { reason } => {
-                    assert_eq!(
-                        reason,
-                        if parked {
-                            "rate_limited"
-                        } else if stop_reason == "cancelled" {
-                            "cancelled"
-                        } else {
-                            "prompt_complete"
-                        }
-                    );
-                    break;
-                }
-                Event::AgentStartupError { message, .. } => panic!("{message}"),
-                _ => {}
-            }
-        }
-        assert_eq!(
-            chunks,
-            (0..100)
-                .map(|index| format!("final-{index}"))
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(limited, parked);
-        if parked {
-            assert!(
-                timeout(Duration::from_secs(2), next.next_event())
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "parking must end the event stream"
-            );
-        } else {
-            next.test_flush_commands().await;
-            next.shutdown().await.unwrap();
-        }
-    }
-}
-
-/// The runner relays the agent's error answer to `session/prompt`: the turn
-/// surfaces it, returns the prompt as sent (text and attachment refs) and
-/// cancels any leftover agent turn, unless it answers a cancel. The same
-/// connection runs the next prompt (#5662).
-#[tokio::test]
-async fn rejected_prompt_over_the_runner_keeps_the_connection() {
-    let _env = crate::session::test_support::EnvGuard::read_lock();
-    let image = AttachmentBlob {
-        id: "att-1".into(),
-        kind: PromptAttachmentKind::Image,
-        mime_type: "image/png".into(),
-        name: Some("shot.png".into()),
-        data: b"png".to_vec(),
-    };
-    let image_block = serde_json::json!({"type": "image", "data": "cG5n", "mimeType": "image/png"});
-    let text_block = |text: &str| serde_json::json!({"type": "text", "text": text});
-    for (text, with_image, cancel_first, want_blocks) in [
-        ("retry me", false, false, vec![text_block("retry me")]),
-        (
-            "look at this",
-            true,
-            false,
-            vec![text_block("look at this"), image_block.clone()],
-        ),
-        ("", true, false, vec![image_block.clone()]),
-        ("retry me", false, true, vec![text_block("retry me")]),
-    ] {
-        let attachments: &[AttachmentBlob] = if with_image {
-            std::slice::from_ref(&image)
-        } else {
-            &[]
-        };
-        let mut runner = Runner::new();
-        let mut client = runner.attach(false).await;
-        client.send_prompt(text, attachments).await.unwrap();
-        match runner.frame().await {
-            ControlBody::Prompt { request } => {
-                assert_eq!(
-                    request["prompt"],
-                    serde_json::json!(want_blocks),
-                    "{text:?}"
-                );
-            }
-            other => panic!("expected the prompt: {other:?}"),
-        }
-        if cancel_first {
-            client.cancel_prompt().await.unwrap();
-            assert!(matches!(runner.frame().await, ControlBody::Cancel));
-        }
-        runner
-            .send(ControlBody::PromptCompleted {
-                prompt_req_id: 7,
-                outcome: PromptOutcome::Error {
-                    code: -32603,
-                    message: "a turn is already running".into(),
-                    data: None,
-                },
-            })
-            .await;
-        let (mut surfaced, mut returned) = (false, None);
-        let reason = timeout(Duration::from_secs(5), async {
-            loop {
-                match client.next_event().await.expect("connection remains open") {
-                    Event::PromptRuntimeError { message } => {
-                        surfaced = message.contains("a turn is already running");
+            Cancel::Local | Cancel::Adopted => {
+                with_managed(|scope| Box::pin(async move {
+                    let mut runner = Runner::new(scope).await;
+                    let original = runner.start("actual turn before held cancel send").await;
+                    if matches!(case, Cancel::Adopted) { runner = runner.adopt(scope, &original).await; }
+                    let state = runner.state();
+                    let gate = state.cancel_send_gate.write().await;
+                    let start = runner.events.len();
+                    runner.client.cancel_prompt().await.unwrap();
+                    let grace = armed(&state).await;
+                    runner.assert_cancel_grace(&grace).await;
+                    assert!(!runner.native.requests().iter().any(|method| method == "session/cancel"),
+                        "{case:?}: the held send cannot reach Native");
+                    while let Ok(frame) = runner.controls.try_recv() {
+                        assert!(!matches!(frame, ControlBody::Cancel { .. }), "{case:?}: no actual control cancel before gate release");
                     }
-                    Event::PromptRejected {
-                        text, attachments, ..
-                    } => returned = Some((text, attachments)),
-                    Event::Stopped { reason } => return reason,
-                    _ => {}
-                }
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(6)).await;
+                    tokio::time::resume();
+                    let old = runner.close_control().await;
+                    drop(gate);
+                    runner.recover(&old).await;
+                    runner.assert_cancel_grace(&grace).await;
+                    runner.client.test_flush_commands().await;
+                    assert!(!runner.native.requests().iter().any(|method| method == "session/cancel"),
+                        "{case:?}: a lost send is not silently reissued on the recovered attachment");
+                    runner.finish_cancel(&grace, start).await;
+                })).await;
             }
-        })
-        .await
-        .unwrap();
-        if cancel_first {
-            assert_eq!(reason, "cancelled");
-            assert!(!surfaced && returned.is_none());
-        } else {
-            assert_eq!(reason, "prompt_rejected");
-            assert!(surfaced);
-            let refs: Vec<_> = attachments.iter().map(AttachmentBlob::to_ref).collect();
-            assert_eq!(returned, Some((text.to_string(), refs)), "{text:?}");
-            // The rejection clears a turn the agent may still be running.
-            assert!(matches!(runner.frame().await, ControlBody::Cancel));
         }
-
-        client.send_prompt("again", &[]).await.unwrap();
-        assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
-        runner.complete("end_turn").await;
-        assert_eq!(stopped(&mut client).await, "prompt_complete");
-        assert!(client.control_loss().is_none());
-        client.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn silent_initial_adoption_releases_its_watchdog_on_control_loss() {
+    with_managed(|scope| Box::pin(async move {
+        let mut runner = Runner::new(scope).await;
+        let original = runner.start("actual original remains silent during initial adoption").await;
+        runner = runner.adopt(scope, &original).await;
+        let state = runner.state();
+        let turn = state.terminal_claim.current_turn();
+        let start = runner.events.len();
+        runner.update(json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":"observed Native progress"}})).await;
+        runner.event_since(start, |event| matches!(event, Event::AgentMessageChunk { text, .. } if text == "observed Native progress")).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        runner.client.test_flush_commands().await;
+        tokio::time::resume();
+        assert!(state.cancel_deadline.lock().unwrap().is_none(), "Native silence does not arm the local orphan watchdog");
+        assert!(!state.terminal_claim.claimed());
+        assert_eq!(state.terminal_claim.current_turn(), turn);
+        assert!(!runner.native.requests().iter().any(|method| method == "session/cancel"));
+        let old = runner.close_control().await;
+        assert!(old.control_loss().unwrap().turn_in_flight);
+        runner.recover(&old).await;
+        assert!(!state.terminal_claim.claimed());
+        runner.reply(&original, "end_turn").await;
+        runner.stopped_since(start, "prompt_complete").await;
+        runner.assert_original(&original, AcpOriginalRequestResult::Succeeded, EventScope::HistoryOnly);
+        assert_eq!(runner.events[start..].iter().filter(|event| matches!(event, Event::Stopped { .. })).count(), 1);
+        assert!(!runner.native.requests().iter().any(|method| method == "session/cancel"));
+        runner.shutdown().await;
+    })).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn recovered_completion_orders_updates_and_applies_rate_limit_parking() {
+    with_managed(|scope| Box::pin(async move {
+        for (report, stop_reason, reset_after, parked) in [
+            ("rejected", "end_turn", 3600, false),
+            ("rejected", "cancelled", 3600, false),
+            ("allowed", "end_turn", 3600, false),
+            ("rejected", "end_turn", -60, false),
+            ("rejected", "error", 3600, true),
+        ] {
+            let mut runner = Runner::new(scope).await;
+            let original = runner.start("original Native operation before quota recovery").await;
+            let resets_at = crate::time::Timestamp::now().as_unix_secs() + reset_after;
+            let usage_start = runner.events.len();
+            runner.update(json!({"sessionUpdate":"usage_update","used":1,"size":2,
+                "_meta":{"_claude/rateLimit":{"status":"rejected","rateLimitType":"five_hour","resetsAt":resets_at}}})).await;
+            runner.event_since(usage_start, |event| matches!(event, Event::UsageUpdated { .. })).await;
+            runner.barrier().await;
+            let old = runner.close_control().await;
+            runner.recover(&old).await;
+            if report == "allowed" {
+                let start = runner.events.len();
+                runner.update(json!({"sessionUpdate":"usage_update","used":1,"size":2,
+                    "_meta":{"_claude/rateLimit":{"status":"allowed"}}})).await;
+                runner.event_since(start, |event| matches!(event, Event::UsageUpdated { .. })).await;
+            }
+            let start = runner.events.len();
+            for index in 0..100 {
+                runner.update(json!({"sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":format!("final-{index}")}})).await;
+            }
+            if stop_reason == "error" { runner.quota(&original).await; }
+            else { runner.reply(&original, stop_reason).await; }
+            let stop = runner.stopped_since(start,
+                if parked { "rate_limited" } else if stop_reason == "cancelled" { "cancelled" } else { "prompt_complete" }).await;
+            let events = &runner.events[start..=stop];
+            let chunks: Vec<_> = events.iter().filter_map(|event| {
+                if let Event::AgentMessageChunk { text, .. } = event { Some(text.clone()) } else { None }
+            }).collect();
+            assert_eq!(chunks, (0..100).map(|index| format!("final-{index}")).collect::<Vec<_>>());
+            let limits: Vec<_> = events.iter().enumerate().filter_map(|(index, event)| {
+                if let Event::RateLimit { info } = event { Some((index, info)) } else { None }
+            }).collect();
+            assert_eq!(limits.len(), usize::from(parked));
+            if parked {
+                assert_eq!(limits[0].1.resets_at.unwrap().as_unix_secs(), resets_at);
+                assert!(limits[0].0 < events.len() - 1);
+            }
+            assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { .. })).count(), 1);
+            runner.assert_original(&original,
+                if parked { AcpOriginalRequestResult::Failed } else { AcpOriginalRequestResult::Succeeded },
+                EventScope::HistoryOnly);
+            runner.barrier().await;
+            assert!(runner.actual().connection_ready());
+            runner.client.test_flush_commands().await;
+            let follow_start = runner.events.len();
+            let follow = runner.start("next explicit input uses the same actual Native").await;
+            assert_ne!(follow.id(), original.id());
+            assert_ne!(follow.scope.correlation(), original.scope.correlation());
+            assert_ne!(follow.window, original.window);
+            assert_eq!(follow.request["params"]["sessionId"], original.request["params"]["sessionId"]);
+            runner.reply(&follow, "end_turn").await;
+            runner.stopped_since(follow_start, "prompt_complete").await;
+            runner.assert_original(&follow, AcpOriginalRequestResult::Succeeded, EventScope::OperationCurrent);
+            assert!(!runner.events[follow_start..].iter().any(|event| matches!(event,
+                Event::RateLimit { .. } | Event::AcpSessionAssigned { .. } | Event::SessionContextReset { .. })));
+            let methods = runner.native.requests();
+            assert_eq!(methods.iter().filter(|method| *method == "session/new").count(), 1);
+            assert_eq!(methods.iter().filter(|method| *method == "session/prompt").count(), 2);
+            assert!(!methods.iter().any(|method| matches!(method.as_str(), "session/load" | "session/fork")));
+            runner.shutdown().await;
+            assert!(bounded(runner.client.next_event()).await.is_none(), "explicit shutdown ends the actual observer stream");
+        }
+    })).await;
 }

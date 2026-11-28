@@ -17,8 +17,8 @@ pub(super) fn permission_response_tokens<'a>(
     }
 }
 
-/// Types `message` into the session's live pane, resolved once so the draft check and the keys
-/// address the same pane. `Err` is the dialog text.
+/// Checks and types into the pane owned by the supplied native session.
+/// `Err` is the dialog text.
 fn deliver_to_live_pane(
     inst: &crate::session::Instance,
     tmux: &crate::tmux::Session,
@@ -112,7 +112,7 @@ impl HomeView {
     pub(in crate::tui) fn finish_send(
         &mut self,
         session_id: &str,
-        tmux_name: &str,
+        terminal: &std::sync::Arc<crate::daemon::TerminalTarget>,
         target: live_send::LiveSendTarget,
         message: &str,
         lease: &crate::tui::session_feed::NativeLease,
@@ -144,9 +144,7 @@ impl HomeView {
             ));
             return;
         };
-        // The receipt named the pane the daemon confirmed, so nothing is
-        // resolved locally and a stale name cannot be sent to.
-        let tmux_session = crate::tmux::Session::from_name(tmux_name);
+        let agent = matches!(target, live_send::LiveSendTarget::Agent);
         // Agent gets a tool-specific Enter delay so paste-burst-aware
         // agents (e.g. Codex) don't swallow the final Enter. Shells in
         // the paired terminal panes don't need the delay.
@@ -156,25 +154,51 @@ impl HomeView {
             | live_send::LiveSendTarget::ContainerTerminal
             | live_send::LiveSendTarget::Tool(_) => 0,
         };
-        // Rechecks the stored row and keeps a CLI or TUI archive out until the keys land.
-        let _input_lock = match &target {
-            live_send::LiveSendTarget::Agent => match inst.lock_for_input() {
-                Ok(lock) => Some(lock),
-                Err(e) => {
-                    self.info_dialog = Some(InfoDialog::new("Send Failed", &e.to_string()));
-                    return;
-                }
-            },
-            _ => None,
-        };
-        let check_draft = matches!(target, live_send::LiveSendTarget::Agent);
-        if let Err(refusal) =
-            deliver_to_live_pane(&inst, &tmux_session, check_draft, message, delay)
-        {
+        let delivered = (|| -> Result<(), String> {
+            let failed = |e: anyhow::Error| e.to_string();
+            if !lease
+                .target()
+                .is_some_and(|owned| std::sync::Arc::ptr_eq(owned, terminal))
+                || inst.lifecycle_generation != terminal.lifecycle_generation
+                || inst.effective_profile() != terminal.profile
+            {
+                return Err(crate::session::NativeInputError::Ownership.to_string());
+            }
+            let physical = terminal
+                .physical
+                .clone()
+                .ok_or(crate::session::NativeInputError::Ownership)
+                .map_err(|e| e.to_string())?;
+            let fence = lease.input_fence(agent).map_err(failed)?;
+            let session = if agent {
+                inst.agent_input_session(&terminal.tmux_session, physical, true, Some(fence))
+                    .map_err(failed)?
+            } else {
+                crate::tmux::Session::from_observation(&terminal.tmux_session, physical)
+                    .with_native_input_fence(fence)
+            };
+            if !lease.is_valid() {
+                return Err(crate::session::NativeInputError::Ownership.to_string());
+            }
+            deliver_to_live_pane(&inst, &session, agent, message, delay)
+        })();
+        if let Err(refusal) = delivered {
             self.refuse_send(session_id, target, &inst.title, message, &refusal);
             return;
         }
-        self.stamp_last_accessed(session_id);
+        #[cfg(test)]
+        post_send_test_hook::run(session_id);
+        if let Err(error) = self.session_feed.submit(
+            session_id.to_owned(),
+            crate::daemon::SessionMutation::InputRecency(crate::daemon::InputRecencyBody {
+                created_at: inst.created_at,
+                lifecycle_generation: terminal.lifecycle_generation,
+                profile: terminal.profile.clone(),
+                profile_identity: lease.preparation_profile_identity(),
+            }),
+        ) {
+            tracing::warn!(target: "tui.home", session_id, %error, "input recency request refused");
+        }
     }
 
     /// Send the tmux keystrokes for a permission-prompt decision straight
@@ -212,24 +236,24 @@ impl HomeView {
         let Some(tokens) = permission_response_tokens(&response, choice) else {
             return;
         };
-        let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
-            Ok(s) => s,
-            Err(e) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Respond Failed",
-                    &format!("Failed to resolve session: {}", e),
-                ));
-                return;
-            }
-        };
-        let _input_lock = match inst.lock_for_input() {
-            Ok(lock) => lock,
-            Err(error) => {
-                self.info_dialog = Some(InfoDialog::new("Respond Failed", &error.to_string()));
-                return;
-            }
-        };
-        if let Err(e) = tmux_session.send_key_tokens(tokens) {
+        let delivered = (|| -> anyhow::Result<()> {
+            let pane = &inst.agent_pane;
+            anyhow::ensure!(
+                pane.state == crate::session::PanePresence::Alive,
+                crate::session::NativeInputError::Ownership
+            );
+            let name = pane
+                .tmux_session
+                .as_deref()
+                .ok_or(crate::session::NativeInputError::Ownership)?;
+            let physical = pane
+                .physical
+                .clone()
+                .ok_or(crate::session::NativeInputError::Ownership)?;
+            let session = inst.agent_input_session(name, physical, false, None)?;
+            session.send_key_tokens(tokens)
+        })();
+        if let Err(e) = delivered {
             self.info_dialog = Some(InfoDialog::new(
                 "Respond Failed",
                 &format!("Failed to send response: {}", e),
@@ -273,15 +297,23 @@ impl HomeView {
             ));
             return;
         }
-        let tmux = match crate::tmux::Session::new(&inst.id, &inst.title) {
+        let tmux = match (|| -> anyhow::Result<crate::tmux::Session> {
+            let pane = &inst.agent_pane;
+            anyhow::ensure!(
+                pane.state == crate::session::PanePresence::Alive,
+                crate::session::NativeInputError::Ownership
+            );
+            let name = pane
+                .tmux_session
+                .as_deref()
+                .ok_or(crate::session::NativeInputError::Ownership)?;
+            let physical = pane
+                .physical
+                .clone()
+                .ok_or(crate::session::NativeInputError::Ownership)?;
+            inst.agent_input_session(name, physical, false, None)
+        })() {
             Ok(session) => session,
-            Err(error) => {
-                self.info_dialog = Some(InfoDialog::new("Respond Failed", &error.to_string()));
-                return;
-            }
-        };
-        let _input_lock = match inst.lock_for_input() {
-            Ok(lock) => lock,
             Err(error) => {
                 self.info_dialog = Some(InfoDialog::new("Respond Failed", &error.to_string()));
                 return;
@@ -308,6 +340,41 @@ impl HomeView {
                     "The agent declaration changed or no longer permits this response.",
                 ));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod post_send_test_hook {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static HOOKS: RefCell<HashMap<String, Box<dyn FnOnce()>>> = RefCell::new(HashMap::new());
+    }
+
+    pub(in crate::tui::home) struct Guard(String);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.with(|hooks| hooks.borrow_mut().remove(&self.0));
+        }
+    }
+
+    pub(in crate::tui::home) fn install(id: &str, hook: impl FnOnce() + 'static) -> Guard {
+        HOOKS.with(|hooks| {
+            assert!(hooks
+                .borrow_mut()
+                .insert(id.into(), Box::new(hook))
+                .is_none());
+        });
+        Guard(id.into())
+    }
+
+    pub(super) fn run(id: &str) {
+        let hook = HOOKS.with(|hooks| hooks.borrow_mut().remove(id));
+        if let Some(hook) = hook {
+            hook();
         }
     }
 }
@@ -482,7 +549,14 @@ mod deliver_to_live_pane_tests {
                 }
             });
             let inst = crate::session::Instance::new("tui-send", "/tmp");
-            let tmux = crate::tmux::Session::from_name(session.name());
+            let physical = crate::tmux::utils::observe_checked_pane(
+                session.name(),
+                &checked,
+                &crate::tmux::TmuxCommandDeadline::new(),
+            )
+            .unwrap()
+            .unwrap();
+            let tmux = crate::tmux::Session::from_observation(session.name(), physical.into());
 
             let sent = deliver_to_live_pane(&inst, &tmux, true, "hello", 0);
 
@@ -505,7 +579,7 @@ mod deliver_to_live_pane_tests {
                 Then::MoveBeforeEnter => {
                     let err = sent.expect_err(case);
                     assert!(
-                        err.contains("did not submit") && err.contains(&checked),
+                        err.contains(&crate::session::NativeInputError::Ownership.to_string()),
                         "{case}: {err}"
                     );
                     wait_for(case, "never typed", || pane_shows(&checked, "hello"));

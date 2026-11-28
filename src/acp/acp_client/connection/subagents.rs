@@ -11,10 +11,12 @@ use agent_client_protocol::v1::schema::{
 use super::notifications::Shared;
 use crate::acp::acp_client::config_options::map_acp_config_option;
 use crate::acp::acp_client::lifecycle::ASYNC_AGENT_LAUNCHED;
-use crate::acp::acp_client::tool_context::update_tool_context_cache;
+use crate::acp::acp_client::session_identity::ChildRoute;
+use crate::acp::acp_client::tool_context::{capture_tool_context_input, update_tool_context_cache};
 use crate::acp::acp_client::tool_output::preview_args;
 use crate::acp::acp_client::update_events::map_update_to_events;
 use crate::acp::acp_client::watchdog::OFF_PROTOCOL_WORK_GRACE_FLOOR;
+use crate::acp::event_sender::EventSender;
 use crate::acp::state::{
     ConfigOptionCategory, Event, SubagentRecord, SubagentState, ToolCall, ToolOutputBlock,
 };
@@ -24,6 +26,7 @@ use crate::acp::state::{
 #[derive(Debug)]
 pub(super) struct BackgroundReport {
     tool_call_id: String,
+    provenance: Option<std::sync::Arc<crate::acp::event_sender::NativeChildProvenance>>,
     message_id: Option<String>,
     text: String,
 }
@@ -133,78 +136,92 @@ impl Shared {
     /// Merge `edit` into the child's snapshot and publish the result.
     async fn publish_subagent(
         &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
         parent: &SessionId,
         child: &SessionId,
         edit: impl FnOnce(&mut SubagentRecord),
     ) {
-        let record = {
+        let fresh = || SubagentRecord {
+            session_id: child.0.to_string(),
+            parent_session_id: parent.0.to_string(),
+            provenance: route.1.provenance.clone(),
+            parent_tool_call_id: None,
+            title: None,
+            description: None,
+            state: SubagentState::default(),
+            stop_reason: None,
+            error: None,
+            cancel_capable: route.1.cancel_capable,
+            model: None,
+            background: false,
+            runs: 0,
+        };
+        // A late frame retains its display history, never the replacement's live cache.
+        let current_route = self
+            .ingress
+            .child_route(child)
+            .is_some_and(|current| current == route.1);
+        let record = if current_route {
             let mut subagents = self.subagents.lock().expect("subagents mutex poisoned");
-            let record = subagents
-                .entry(child.0.to_string())
-                .or_insert_with(|| SubagentRecord {
-                    session_id: child.0.to_string(),
-                    parent_session_id: parent.0.to_string(),
-                    parent_tool_call_id: None,
-                    title: None,
-                    description: None,
-                    state: SubagentState::default(),
-                    stop_reason: None,
-                    error: None,
-                    cancel_capable: false,
-                    model: None,
-                    background: false,
-                    runs: 0,
-                });
-            record.cancel_capable = self
-                .ingress
-                .child_route(child)
-                .is_some_and(|route| route.cancel_capable);
+            let record = subagents.entry(child.0.to_string()).or_insert_with(fresh);
+            if record.provenance != route.1.provenance {
+                *record = fresh();
+            }
+            record.cancel_capable = route.1.cancel_capable;
             edit(record);
             record.clone()
+        } else {
+            let mut record = fresh();
+            edit(&mut record);
+            record
         };
-        self.emit(Event::SubagentUpdated {
-            subagent: record,
-            at: crate::time::Timestamp::now(),
-        })
-        .await;
+        let _ = sender
+            .send(Event::SubagentUpdated {
+                subagent: record,
+                at: crate::time::Timestamp::now(),
+            })
+            .await;
     }
 
     /// `parent` is the session the announcement arrived on.
     pub(super) async fn handle_subagent_update(
         &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
         parent: SessionId,
         update: SubagentUpdate,
-        local_prompt_signals: bool,
-        epoch: u64,
     ) {
         let child = update.session_id.clone();
         // Ingress registers only announcements that name a valid child of the
         // session they arrived on; anything else is dropped here.
-        if self
-            .ingress
-            .child_route(&child)
-            .is_none_or(|route| route.parent != parent)
-        {
+        if route.0 != child || route.1.parent != parent {
             return;
         }
-        self.note_child_activity(&child, local_prompt_signals, epoch)
-            .await;
-        self.publish_subagent(&parent, &child, |record| {
+        self.publish_subagent(sender, route, &parent, &child, |record| {
             record.parent_session_id = parent.0.to_string();
             patch(&mut record.title, update.title);
             patch(&mut record.description, update.description);
             apply_state(record, update.state);
         })
         .await;
-        self.finish_background_report(&child).await;
+        self.finish_background_report(sender, route, &child).await;
     }
 
     /// An idle background child's answer, or its error, completes its card.
     /// A cancelled or orphaned one leaves it open for the turn's end to mark stopped.
-    async fn finish_background_report(&self, child: &SessionId) {
+    async fn finish_background_report(
+        &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
+        child: &SessionId,
+    ) {
         let (stop_reason, error) = {
             let subagents = self.subagents.lock().expect("subagents mutex poisoned");
-            match subagents.get(child.0.as_ref()) {
+            match subagents
+                .get(child.0.as_ref())
+                .filter(|record| record.provenance == route.1.provenance)
+            {
                 Some(record) if record.state == SubagentState::Idle => {
                     (record.stop_reason.clone(), record.error.clone())
                 }
@@ -217,19 +234,27 @@ impl Shared {
             Some("error") => true,
             _ => return,
         };
-        let Some(report) = self
-            .background_reports
-            .lock()
-            .expect("background reports mutex poisoned")
-            .remove(child.0.as_ref())
-        else {
+        let report = {
+            let mut reports = self
+                .background_reports
+                .lock()
+                .expect("background reports mutex poisoned");
+            if !reports
+                .get(child.0.as_ref())
+                .is_some_and(|report| report.provenance == route.1.provenance)
+            {
+                return;
+            }
+            reports.remove(child.0.as_ref())
+        };
+        let Some(report) = report else {
             return;
         };
         let text = match error {
             Some(error) if is_error => error,
             _ => report.text,
         };
-        self.emit_card_completion(report.tool_call_id, text, is_error)
+        self.emit_card_completion(sender, report.tool_call_id, text, is_error)
             .await;
     }
 
@@ -239,21 +264,17 @@ impl Shared {
     /// report (child to parent) completes it. Other messages are dropped.
     pub(super) async fn handle_session_message(
         &self,
+        events: &EventSender,
+        route: &(SessionId, ChildRoute),
         session: SessionId,
         message: SessionMessage,
-        local_prompt_signals: bool,
-        epoch: u64,
     ) {
         let (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient)) =
             (&message.sender_session_id, &message.recipient_session_id)
         else {
             return;
         };
-        let child_of_session = |id: &SessionId| {
-            self.ingress
-                .child_route(id)
-                .is_some_and(|route| route.parent == session)
-        };
+        let child_of_session = |id: &SessionId| route.0 == *id && route.1.parent == session;
         let text: String = match &message.content {
             MaybeUndefined::Value(blocks) => blocks
                 .iter()
@@ -265,14 +286,17 @@ impl Shared {
             _ => String::new(),
         };
         if *sender == session && child_of_session(recipient) {
-            self.note_child_activity(recipient, local_prompt_signals, epoch)
-                .await;
-            self.start_delegation_card(&session, recipient, message.message_id.0.to_string(), text)
-                .await;
+            self.start_delegation_card(
+                events,
+                route,
+                &session,
+                recipient,
+                message.message_id.0.to_string(),
+                text,
+            )
+            .await;
         } else if *recipient == session && child_of_session(sender) {
-            self.note_child_activity(sender, local_prompt_signals, epoch)
-                .await;
-            self.complete_delegation_card(sender, &message.message_id.0, text)
+            self.complete_delegation_card(events, route, sender, &message.message_id.0, text)
                 .await;
         }
     }
@@ -281,6 +305,8 @@ impl Shared {
     /// ones are follow-ups, not new launches.
     async fn start_delegation_card(
         &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
         parent: &SessionId,
         child: &SessionId,
         message_id: String,
@@ -288,7 +314,10 @@ impl Shared {
     ) {
         let (title, description, outer) = {
             let subagents = self.subagents.lock().expect("subagents mutex poisoned");
-            let Some(record) = subagents.get(child.0.as_ref()) else {
+            let Some(record) = subagents
+                .get(child.0.as_ref())
+                .filter(|record| record.provenance == route.1.provenance)
+            else {
                 return;
             };
             if record.parent_tool_call_id.is_some() {
@@ -299,37 +328,55 @@ impl Shared {
                 record.description.clone(),
                 subagents
                     .get(parent.0.as_ref())
+                    .filter(|record| match (&record.provenance, &route.1.provenance) {
+                        (Some(parent), Some(child)) => {
+                            parent.origin == child.origin
+                                && parent.ancestry.as_ref()
+                                    == &child.ancestry[..child.ancestry.len() - 1]
+                        }
+                        (None, None) => route.1.source.is_none(),
+                        _ => false,
+                    })
                     .and_then(|record| record.parent_tool_call_id.clone()),
             )
         };
         let name = title.clone().or(description.clone()).unwrap_or_default();
         let args = serde_json::json!({ "description": description.or(title), "prompt": prompt });
-        self.emit(Event::ToolCallStarted {
-            tool_call: ToolCall {
-                id: message_id.clone(),
-                name,
-                kind: "think".into(),
-                args_preview: preview_args(&args),
-                prompt: None,
-                started_at: crate::time::Timestamp::now(),
-                parent_tool_call_id: outer,
-                memory_recall: None,
-                diffs: Vec::new(),
-            },
-        })
-        .await;
-        self.publish_subagent(parent, child, |record| {
+        let _ = sender
+            .send(Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: message_id.clone(),
+                    name,
+                    kind: "think".into(),
+                    args_preview: preview_args(&args),
+                    prompt: None,
+                    started_at: crate::time::Timestamp::now(),
+                    parent_tool_call_id: outer,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            })
+            .await;
+        self.publish_subagent(sender, route, parent, child, |record| {
             record.parent_tool_call_id = Some(message_id);
         })
         .await;
     }
 
-    async fn complete_delegation_card(&self, child: &SessionId, message_id: &str, reply: String) {
+    async fn complete_delegation_card(
+        &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
+        child: &SessionId,
+        message_id: &str,
+        reply: String,
+    ) {
         let Some(tool_call_id) = self
             .subagents
             .lock()
             .expect("subagents mutex poisoned")
             .get(child.0.as_ref())
+            .filter(|record| record.provenance == route.1.provenance)
             .and_then(|record| record.parent_tool_call_id.clone())
         else {
             return;
@@ -341,7 +388,9 @@ impl Shared {
                 .lines()
                 .any(|line| line.trim_start().starts_with(ASYNC_AGENT_LAUNCHED));
         if !launch_notice {
-            return self.emit_card_completion(tool_call_id, reply, false).await;
+            return self
+                .emit_card_completion(sender, tool_call_id, reply, false)
+                .await;
         }
         self.background_reports
             .lock()
@@ -350,29 +399,36 @@ impl Shared {
                 child.0.to_string(),
                 BackgroundReport {
                     tool_call_id,
+                    provenance: route.1.provenance.clone(),
                     message_id: None,
                     text: String::new(),
                 },
             );
-        let parent = self.ingress.child_route(child).map(|route| route.parent);
-        if let Some(parent) = parent {
-            self.publish_subagent(&parent, child, |record| record.background = true)
-                .await;
-        }
-    }
-
-    async fn emit_card_completion(&self, tool_call_id: String, reply: String, is_error: bool) {
-        self.emit(Event::ToolCallCompleted {
-            tool_call_id,
-            is_error,
-            output: vec![ToolOutputBlock::Text {
-                text: reply.clone(),
-            }],
-            content: reply,
-            completed_at: crate::time::Timestamp::now(),
-            async_subagent: false,
+        self.publish_subagent(sender, route, &route.1.parent, child, |record| {
+            record.background = true
         })
         .await;
+    }
+
+    async fn emit_card_completion(
+        &self,
+        sender: &EventSender,
+        tool_call_id: String,
+        reply: String,
+        is_error: bool,
+    ) {
+        let _ = sender
+            .send(Event::ToolCallCompleted {
+                tool_call_id,
+                is_error,
+                output: vec![ToolOutputBlock::Text {
+                    text: reply.clone(),
+                }],
+                content: reply,
+                completed_at: crate::time::Timestamp::now(),
+                async_subagent: false,
+            })
+            .await;
     }
 
     /// Only a child's tool calls and model reach the transcript; its own
@@ -380,17 +436,15 @@ impl Shared {
     /// latest message is kept as its answer.
     pub(super) async fn handle_child_notification(
         &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
         child: SessionId,
         update: SessionUpdate,
-        local_prompt_signals: bool,
-        epoch: u64,
     ) {
-        self.note_child_activity(&child, local_prompt_signals, epoch)
-            .await;
         match update {
             SessionUpdate::SubagentUpdate(nested) => {
-                self.handle_subagent_update(child, nested, local_prompt_signals, epoch)
-                    .await;
+                self.handle_subagent_update(sender, route, child, nested)
+                    .await
             }
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let ContentBlock::Text(text) = chunk.content else {
@@ -401,7 +455,10 @@ impl Shared {
                     .background_reports
                     .lock()
                     .expect("background reports mutex poisoned");
-                if let Some(report) = reports.get_mut(child.0.as_ref()) {
+                if let Some(report) = reports
+                    .get_mut(child.0.as_ref())
+                    .filter(|report| report.provenance == route.1.provenance)
+                {
                     if id.is_some() && id != report.message_id {
                         report.message_id = id;
                         report.text.clear();
@@ -417,6 +474,7 @@ impl Shared {
                         .lock()
                         .expect("background reports mutex poisoned")
                         .get_mut(child.0.as_ref())
+                        .filter(|report| report.provenance == route.1.provenance)
                     {
                         report.text.clear();
                     }
@@ -426,8 +484,9 @@ impl Shared {
                     .lock()
                     .expect("subagents mutex poisoned")
                     .get(child.0.as_ref())
+                    .filter(|record| record.provenance == route.1.provenance)
                     .and_then(|record| record.parent_tool_call_id.clone());
-                let source = tool.clone();
+                let mut source = capture_tool_context_input(&tool);
                 for mut event in map_update_to_events(tool, self.profile) {
                     match &mut event {
                         Event::ToolCallStarted { tool_call } => {
@@ -441,8 +500,8 @@ impl Shared {
                         | Event::DiffEmitted { .. } => {}
                         _ => continue,
                     }
-                    update_tool_context_cache(&self.tool_context_cache, &mut event, &source);
-                    if self.event_tx.send(event).await.is_err() {
+                    update_tool_context_cache(&self.tool_context_cache, &mut event, &mut source);
+                    if sender.send(event).await.is_err() {
                         break;
                     }
                 }
@@ -460,12 +519,8 @@ impl Shared {
                             .find(|choice| choice.value == option.current_value)
                             .map_or(option.current_value.clone(), |choice| choice.name.clone())
                     });
-                let parent = self
-                    .ingress
-                    .child_route(&child)
-                    .map(|route| route.parent)
-                    .unwrap_or_else(|| child.clone());
-                self.publish_subagent(&parent, &child, |record| record.model = model)
+                let parent = &route.1.parent;
+                self.publish_subagent(sender, route, parent, &child, |record| record.model = model)
                     .await;
             }
             _ => {}
@@ -534,12 +589,16 @@ mod tests {
         })
     }
 
-    fn harness() -> (Arc<SessionIngress>, Shared, mpsc::Receiver<Event>) {
+    fn harness() -> (
+        Arc<SessionIngress>,
+        Shared,
+        mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
+    ) {
         let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
         let (event_tx, events) = mpsc::channel(16);
         let (lifecycle_tx, _lifecycle) = mpsc::channel(16);
         let shared = Shared::new(
-            event_tx,
+            event_tx.into(),
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
@@ -548,15 +607,24 @@ mod tests {
             None,
             ingress.clone(),
             None,
+            Arc::default(),
+            None,
+            Arc::default(),
         );
         (ingress, shared, events)
     }
 
-    async fn drain(shared: Shared, mut events: mpsc::Receiver<Event>) -> Vec<Event> {
+    async fn drain(
+        shared: Shared,
+        mut events: mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
+    ) -> Vec<Event> {
         drop(shared);
         let mut all = Vec::new();
         while let Some(event) = events.recv().await {
-            all.push(event);
+            let crate::acp::event_sender::SdkEvent::Data(data) = event else {
+                panic!("unmanaged child fixture produced a private SDK barrier");
+            };
+            all.push(Arc::try_unwrap(data.event).unwrap());
         }
         all
     }
@@ -620,7 +688,7 @@ mod tests {
         let (event_tx, events) = mpsc::channel(16);
         let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
         let shared = Shared::new(
-            event_tx,
+            event_tx.into(),
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
@@ -629,6 +697,9 @@ mod tests {
             None,
             ingress.clone(),
             None,
+            Arc::default(),
+            None,
+            Arc::default(),
         );
         shared.prompt_epoch.store(1, Ordering::Relaxed);
         shared
@@ -846,10 +917,13 @@ mod tests {
     }
 
     async fn feed(ingress: &SessionIngress, shared: &Shared, value: serde_json::Value) {
-        let admitted = ingress
-            .notification(notification(value), None)
-            .await
+        let (update, wire_bytes) =
+            crate::acp::acp_client::session_identity::SessionIngressNotification::decode_update(
+                value, false,
+            )
             .unwrap();
+        let update = ingress.capture_notification(update, false);
+        let admitted = ingress.notification(update, wire_bytes).await.unwrap();
         if let Some((notification, _guard)) = admitted {
             shared.handle_notification(notification, true).await;
         }
@@ -861,10 +935,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_capability_flips_when_a_later_update_carries_it() {
         let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
-        let (event_tx, mut events) = mpsc::channel(16);
+        let (event_tx, events) = mpsc::channel(16);
         let (lifecycle_tx, _lifecycle) = mpsc::channel(16);
         let shared = Shared::new(
-            event_tx,
+            event_tx.into(),
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
@@ -873,6 +947,9 @@ mod tests {
             None,
             ingress.clone(),
             None,
+            Arc::default(),
+            None,
+            Arc::default(),
         );
         let update = |capabilities: serde_json::Value| {
             serde_json::json!({
@@ -904,10 +981,12 @@ mod tests {
                 .unwrap()
                 .cancel_capable
         );
-        drop(shared);
 
         let mut flags = Vec::new();
-        while let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await {
+        for event in drain(shared, events).await {
+            let Event::SubagentUpdated { subagent, .. } = event else {
+                panic!("expected only actual child snapshots");
+            };
             flags.push(subagent.cancel_capable);
         }
         assert_eq!(flags, [false, true]);
@@ -923,6 +1002,7 @@ mod tests {
         let child = |id: &str, state| SubagentRecord {
             session_id: id.into(),
             parent_session_id: "root".into(),
+            provenance: None,
             parent_tool_call_id: None,
             title: None,
             description: None,
@@ -986,10 +1066,10 @@ mod tests {
     async fn child_traffic_nests_tool_calls_and_keeps_the_parent_turn_live() {
         for in_flight in [false, true] {
             let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
-            let (event_tx, mut events) = mpsc::channel(16);
+            let (event_tx, events) = mpsc::channel(16);
             let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
             let shared = Shared::new(
-                event_tx,
+                event_tx.into(),
                 "test".into(),
                 &CLAUDE,
                 lifecycle_tx,
@@ -998,6 +1078,9 @@ mod tests {
                 None,
                 ingress.clone(),
                 None,
+                Arc::default(),
+                None,
+                Arc::default(),
             );
             shared.prompt_epoch.store(1, Ordering::Relaxed);
             feed(
@@ -1060,12 +1143,11 @@ mod tests {
             .await;
             let fed = now_ms();
             if in_flight {
-                // Announcement, delegation, tool call, prose and message chunk;
-                // the stranger and the self-announcement are rejected.
+                // The stranger and self-announcement produce no activity.
                 for _ in 0..5 {
-                    let env = lifecycle.try_recv().expect("child activity signal");
-                    assert_eq!(env.epoch, 1);
-                    assert!(matches!(env.signal, LifecycleSignal::SubagentActivity));
+                    let envelope = lifecycle.try_recv().expect("child activity signal");
+                    assert_eq!(envelope.epoch, 1);
+                    assert!(matches!(envelope.signal, LifecycleSignal::SubagentActivity));
                 }
             } else {
                 let active = shared.subagent_working(fed);
@@ -1078,10 +1160,9 @@ mod tests {
                     Some(false)
                 );
             }
-            assert!(lifecycle.try_recv().is_err());
-            drop(shared);
+            let mut events = drain(shared, events).await.into_iter();
 
-            let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await else {
+            let Some(Event::SubagentUpdated { subagent, .. }) = events.next() else {
                 panic!("expected the announcement first");
             };
             assert_eq!(subagent.session_id, "child");
@@ -1091,16 +1172,16 @@ mod tests {
             assert_eq!(subagent.state, SubagentState::Running);
             assert!(subagent.cancel_capable);
 
-            let Some(Event::ToolCallStarted { tool_call: card }) = events.recv().await else {
+            let Some(Event::ToolCallStarted { tool_call: card }) = events.next() else {
                 panic!("expected the delegation card");
             };
             assert_eq!(card.id, "tool-1");
-            let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await else {
+            let Some(Event::SubagentUpdated { subagent, .. }) = events.next() else {
                 panic!("expected the linked snapshot");
             };
             assert_eq!(subagent.parent_tool_call_id.as_deref(), Some("tool-1"));
 
-            let Some(Event::ToolCallStarted { tool_call }) = events.recv().await else {
+            let Some(Event::ToolCallStarted { tool_call }) = events.next() else {
                 panic!("expected the child's tool call");
             };
             assert_eq!(tool_call.id, "child-tool");
@@ -1108,7 +1189,8 @@ mod tests {
 
             // The child's own announcement of itself is rejected (self-parenting),
             // so nothing else was published: no message, no stranger, no signal.
-            assert!(events.recv().await.is_none());
+            assert!(events.next().is_none());
+            assert!(lifecycle.try_recv().is_err());
         }
     }
 
@@ -1136,7 +1218,7 @@ mod tests {
             let (event_tx, mut events) = mpsc::channel(16);
             let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
             let shared = Arc::new(Shared::new(
-                event_tx,
+                event_tx.clone().into(),
                 "test".into(),
                 &CLAUDE,
                 lifecycle_tx,
@@ -1145,6 +1227,9 @@ mod tests {
                 None,
                 ingress.clone(),
                 None,
+                Arc::default(),
+                None,
+                Arc::default(),
             ));
             shared.prompt_epoch.store(1, Ordering::Relaxed);
             for frame in setup {
@@ -1155,7 +1240,12 @@ mod tests {
             let filler = || Event::Stopped {
                 reason: "filler".into(),
             };
-            while shared.event_tx.try_send(filler()).is_ok() {}
+            while event_tx
+                .try_send(crate::acp::event_sender::SdkEvent::Data(
+                    crate::acp::event_sender::AcpEventData::from_history(filler()),
+                ))
+                .is_ok()
+            {}
 
             let task = tokio::spawn({
                 let (ingress, shared) = (ingress.clone(), shared.clone());

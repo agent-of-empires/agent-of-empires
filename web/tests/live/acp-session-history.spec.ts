@@ -3,19 +3,20 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect, bootDashboard, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd, waitForView } from "../helpers/aoeServe";
 import {
   enableStructuredViewAndWait,
   postAcp,
   postPrompt,
   replayFrames,
-  seedAcpSession,
+  startAcpSession,
   sessionIdByTitle,
   waitForAcpReady,
+  waitForReplayContains,
 } from "../helpers/acp";
 
 // A unit variant serializes as a bare string, others as a single-key object.
-type FrameEvent = string | Record<string, { acp_session_id?: string; reason?: string }>;
+type FrameEvent = string | Record<string, { acp_session_id?: string }>;
 const eventsOf = async (serve: ServeHandle, sessionId: string) =>
   ((await replayFrames(serve.baseUrl, sessionId)) as { event?: FrameEvent }[]).map(({ event }) => ({
     kind: typeof event === "string" ? event : event ? Object.keys(event)[0] : undefined,
@@ -26,52 +27,47 @@ const assignedIds = async (serve: ServeHandle, sessionId: string) =>
     e.kind === "AcpSessionAssigned" && e.payload?.acp_session_id ? [e.payload.acp_session_id] : [],
   );
 
-/** SessionCleared, SessionContextReset, a second AcpSessionAssigned, then Stopped(session_reset), in that order. */
-const resetSequenceComplete = async (serve: ServeHandle, sessionId: string) => {
-  const events = await eventsOf(serve, sessionId);
-  const after = (from: number, match: (e: (typeof events)[number]) => boolean) =>
-    from < 0 ? -1 : events.findIndex((e, i) => i > from && match(e));
-  const cleared = events.findIndex((e) => e.kind === "SessionCleared");
-  const reset = after(cleared, (e) => e.kind === "SessionContextReset");
-  const assigned = after(reset, (e) => e.kind === "AcpSessionAssigned");
-  return after(assigned, (e) => e.kind === "Stopped" && e.payload?.reason === "session_reset") >= 0;
-};
-
-// The server drives the reset with a fresh session/new; the assignment landing last is what gets persisted.
+// Reset creates a fresh native session and persists its assignment.
 for (const c of [
   { tool: "claude", command: "/clear", claude: true },
   // #2979: codex-acp has no native /new, so a forwarded alias was swallowed as an unknown command.
   { tool: "codex", command: "/new", claude: false },
 ]) {
   test(`${c.tool} ${c.command} opens a fresh session/new and swaps the acp session id`, async ({ spawnServe }) => {
-    const { serve, sessionId } = await seedAcpSession(spawnServe, { title: `${c.tool}-reset`, tool: c.tool });
-    await postAcp(serve.baseUrl, sessionId, "/enable");
+    const { serve, sessionId } = await startAcpSession(spawnServe, { title: `${c.tool}-reset`, tool: c.tool });
     // The first assignment proves the worker's initial session/new completed; the reset is submitted once.
     await expect
       .poll(async () => (await assignedIds(serve, sessionId)).length, { timeout: 45_000, intervals: [500] })
       .toBeGreaterThan(0);
     const [firstId] = await assignedIds(serve, sessionId);
-    expect((await postPrompt(serve.baseUrl, sessionId, c.command)).status).toBe(202);
+    const reset = await postPrompt(serve.baseUrl, sessionId, c.command);
+    expect(reset.status, reset.ok ? undefined : await reset.text()).toBe(202);
 
     const resetDone = async () => {
-      if (c.claude) return resetSequenceComplete(serve, sessionId);
-      const json = JSON.stringify(await replayFrames(serve.baseUrl, sessionId));
-      return (
-        json.includes('"SessionCleared"') &&
-        json.includes("SessionContextReset") &&
-        json.includes("session_reset") &&
-        (await assignedIds(serve, sessionId)).length >= 2
-      );
+      const freshId = (await assignedIds(serve, sessionId)).at(-1);
+      const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
+      return Boolean(freshId && freshId !== firstId && session?.acp_session_id === freshId);
     };
     await expect.poll(resetDone, { timeout: 45_000, intervals: [500] }).toBe(true);
     const freshId = (await assignedIds(serve, sessionId)).at(-1);
     expect(freshId, "the reset must mint a NEW acp session id via session/new").not.toBe(firstId);
+    expect(freshId).toBeTruthy();
+    expect(await assignedIds(serve, sessionId)).toContain(firstId);
+    const nextInput = `${c.tool} input after reset`;
+    expect((await postPrompt(serve.baseUrl, sessionId, nextInput)).status).toBe(202);
+    await waitForReplayContains(serve.baseUrl, sessionId, nextInput);
+    expect((await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)).toMatchObject({
+      view: "structured",
+      acp_session_id: freshId,
+    });
+    const nativeRequests = readFileSync(join(serve.home, "fake-acp.log"), "utf8");
+    expect(nativeRequests.match(/handleRequest method=session\/new id=/g)).toHaveLength(2);
 
     if (!c.claude) {
       expect(JSON.stringify(await replayFrames(serve.baseUrl, sessionId))).not.toContain("unknown command");
     } else {
       // Regression guard: this settled on null, leaving a later respawn nothing to session/load.
-      // acp_session_id is not on the REST API; the profile dir name is resolved at boot, so scan them.
+      // Read disk independently of REST; the profile directory resolves at boot.
       const persistedAcpSessionId = () => {
         const profilesDir = join(appDirFor(serve.home, serve.env.XDG_CONFIG_HOME!, resolveAoeBinary()), "profiles");
         for (const profile of readdirSync(profilesDir)) {
@@ -244,16 +240,33 @@ test("view switch preserves the claude conversation in both directions", async (
   const sessionId: string = (await createRes.json()).id;
   await expectReplay(sessionId);
 
-  expect((await postAcp(serve.baseUrl, sessionId, "/disable")).ok).toBe(true);
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
   await expect
-    .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.view === "structured", {
-      timeout: 10_000,
-      intervals: [100, 200, 400],
-    })
-    .toBe(false);
+    .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id)
+    .toBe(sid);
+  await expect
+    .poll(
+      async () => {
+        const check = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/terminal-check`);
+        return check.ok ? await check.json() : { status: check.status, body: await check.text() };
+      },
+      { timeout: 10_000 },
+    )
+    .toMatchObject({ context: "continues" });
+  const disable = await postAcp(serve.baseUrl, sessionId, "/disable");
+  expect(disable.ok, await disable.text()).toBe(true);
+  await waitForView(serve.baseUrl, sessionId, "terminal");
+  const fakeLog = join(serve.home, "fake-acp.log");
+  await expect.poll(() => readFileSync(fakeLog, "utf8"), { timeout: 15_000 }).toContain(`"--resume","${sid}"`);
 
-  // The carried agent_session_id drives a seeded session/load.
-  expect((await postAcp(serve.baseUrl, sessionId, "/enable")).ok).toBe(true);
+  const enable = await postAcp(serve.baseUrl, sessionId, "/enable");
+  expect(enable.ok, await enable.text()).toBe(true);
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  await expect
+    .poll(() => readFileSync(fakeLog, "utf8").match(/handleRequest method=session\/load /g)?.length ?? 0, {
+      timeout: 15_000,
+    })
+    .toBe(2);
   await expectReplay(sessionId);
   await expect
     .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId), {
@@ -264,9 +277,7 @@ test("view switch preserves the claude conversation in both directions", async (
 });
 
 test("switch to terminal resumes the claude conversation (keep context)", async ({ spawnServe }) => {
-  const { serve, sessionId } = await seedAcpSession(spawnServe, { title: "acp-keep-context", tool: "claude" });
-  expect((await postAcp(serve.baseUrl, sessionId, "/enable")).ok).toBeTruthy();
-  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-keep-context", tool: "claude" });
 
   let acpSessionId = "";
   await expect
@@ -279,6 +290,10 @@ test("switch to terminal resumes the claude conversation (keep context)", async 
       { timeout: 15_000, intervals: [100, 200, 400] },
     )
     .not.toBe("");
+  const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
+  expect(typeof session?.project_path).toBe("string");
+  const cwd = realpathSync(session!.project_path as string);
+  seedTranscript(serve.home, cwd.replace(/[^a-zA-Z0-9-]/g, "-"), acpSessionId, cwd, "keep-context handoff");
 
   const disableRes = await postAcp(serve.baseUrl, sessionId, "/disable");
   expect(disableRes.ok).toBeTruthy();
@@ -301,10 +316,18 @@ test("switch to terminal is refused when the command's session flag conflicts wi
   spawnServe,
 }) => {
   const title = "acp-selector-conflict";
+  const sid = "11111111-2222-4333-8444-555555555555";
   const serve = await spawnServe({
     acp: true,
     seedFn: (seed) => {
-      seedSessionViaAoeAdd({ title, tool: "claude" })(seed);
+      seedSessionViaAoeAdd({
+        title,
+        tool: "claude",
+        prepare: (path) => {
+          const cwd = realpathSync(path);
+          seedTranscript(seed.home, cwd.replace(/[^a-zA-Z0-9-]/g, "-"), sid, cwd, "retained conversation");
+        },
+      })(seed);
       const profilesDir = join(appDirFor(seed.home, seed.env.XDG_CONFIG_HOME!, resolveAoeBinary()), "profiles");
       let seeded = false;
       for (const profile of readdirSync(profilesDir)) {
@@ -314,7 +337,7 @@ test("switch to terminal is refused when the command's session flag conflicts wi
         const row = rows.find((r) => r.title === title);
         if (!row) continue;
         row.command = "claude --resume old-id";
-        row.agent_session_id = "sid-held";
+        row.agent_session_id = sid;
         writeFileSync(path, JSON.stringify(rows));
         seeded = true;
       }
@@ -341,7 +364,7 @@ test("switch to terminal is refused when the command's session flag conflicts wi
   await expect(page.getByText(/remove the session flag from its command or arguments to switch/)).toBeVisible();
 
   const session = (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId);
-  expect(session?.view).toBe("structured");
+  expect(session).toMatchObject({ view: "structured", acp_session_id: sid });
   const fakeLog = join(serve.home, "fake-acp.log");
   expect(existsSync(fakeLog) ? readFileSync(fakeLog, "utf8") : "").not.toContain('"--resume","old-id"');
 });

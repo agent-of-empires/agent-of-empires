@@ -192,7 +192,10 @@ impl McpServer {
                 return Err(not_found(&id));
             }
         }
-        let page = after_seq.map(|since| transcript_page(&self.state, &id, since));
+        let page = after_seq
+            .map(|since| transcript_page(&self.state, &id, since))
+            .transpose()
+            .map_err(|_| tool_error("internal", "Could not read stored output"))?;
         Ok(Json(WaitResult {
             status: current.into(),
             timed_out,

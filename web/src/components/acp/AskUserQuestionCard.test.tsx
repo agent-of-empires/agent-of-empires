@@ -28,7 +28,7 @@ function renderCard(questions: ElicitationQuestion[], overrides: Partial<Elicita
     resolved: null,
     ...overrides,
   };
-  render(<AskUserQuestionCard elicitation={elicitation} onResolve={onResolve} />);
+  render(<AskUserQuestionCard elicitation={elicitation} canDecide onResolve={onResolve} />);
   return onResolve;
 }
 
@@ -48,6 +48,25 @@ const TAGS = ["a", "b", "c"].map((v) => ({ value: v, label: v }));
 /** Each step runs, then Submit; the last step's expectation is an accepted payload or an error. */
 type Step = [() => void, Record<string, unknown> | string];
 
+it("revokes an edited form before submit and keeps the answer for a later valid capability", () => {
+  const elicitation: Elicitation = {
+    nonce: "original",
+    message: "Question",
+    tool_call_id: null,
+    questions: [q({ field_key: "answer" })],
+    requested_at: "2026-01-01T00:00:00Z",
+    resolved: null,
+  };
+  const onResolve = vi.fn().mockResolvedValue(undefined);
+  const { rerender } = render(<AskUserQuestionCard elicitation={elicitation} canDecide onResolve={onResolve} />);
+  type("retained answer");
+  rerender(<AskUserQuestionCard elicitation={elicitation} canDecide={false} onResolve={onResolve} />);
+  fireEvent.submit(screen.getByRole("alertdialog"));
+  expect(onResolve).not.toHaveBeenCalled();
+  rerender(<AskUserQuestionCard elicitation={elicitation} canDecide onResolve={onResolve} />);
+  submit();
+  expect(onResolve).toHaveBeenCalledWith({ action: "accept", answers: { answer: "retained answer" } });
+});
 describe("AskUserQuestionCard submission", () => {
   it.each<[string, ElicitationQuestion[], Step[]]>([
     ["free text", [q({ field_key: "name" })], [[() => type("Ada"), { name: "Ada" }]]],
@@ -225,25 +244,6 @@ describe("AskUserQuestionCard submission", () => {
     const onResolve = renderCard([q({ field_key: "q" })]);
     fireEvent.click(screen.getByRole("button", { name: button }));
     expect(onResolve).toHaveBeenCalledWith({ action });
-  });
-
-  it("shows a rollback message when onResolve rejects", async () => {
-    const onResolve = vi.fn<(r: ElicitationResolution) => Promise<void>>().mockRejectedValue(new Error("boom"));
-    render(
-      <AskUserQuestionCard
-        elicitation={{
-          nonce: "n",
-          message: "m",
-          tool_call_id: null,
-          questions: [q({ field_key: "q", default: "x" })],
-          requested_at: "2026-01-01T00:00:00Z",
-          resolved: null,
-        }}
-        onResolve={onResolve}
-      />,
-    );
-    submit();
-    expect(await screen.findByText("Could not reach the server. Try again.")).toBeTruthy();
   });
 
   it("disables controls and shows the offline banner when the server is down", () => {

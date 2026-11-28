@@ -1105,7 +1105,7 @@ async fn restart(session: &str) -> Result<()> {
             &Some(intent),
         )?;
     }
-    worker_registry::mark_restart_pending(session, record.generation);
+    worker_registry::mark_restart_pending(session, record.generation)?;
 
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
@@ -1264,7 +1264,7 @@ async fn approve(
 async fn cancel(session: &str) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
-    client.cancel(session).await.map_err(map_http)?;
+    client.cancel(session, None).await.map_err(map_http)?;
     println!(
         "{}",
         cancel_confirmation_message(crate::acp::acp_client::CANCEL_ESCALATION_GRACE.as_secs())
@@ -1379,6 +1379,7 @@ mod tests {
         let frame = move |seq: u64| {
             serde_json::json!({
                 "session_id": "s", "seq": seq,
+                "scope": "history_only",
                 "event": {"AgentMessageChunk": {"text": format!("m{seq}"), "message_id": format!("id{seq}")}},
             })
         };
@@ -1547,6 +1548,7 @@ mod tests {
             let mut row = Instance::new("native CLI restart", project.path().to_str().unwrap());
             row.source_profile = "default".into();
             row.view = View::Structured;
+            crate::server::test_support::select_retained_for_test(&mut row);
             row.status = Status::Stopped;
             row.mark_idle_dormant();
             let observed = row
@@ -1640,9 +1642,11 @@ mod tests {
                 assert!(stored.lifecycle_reservation.is_none());
                 assert!(worker_registry::stop_intent(&row.id).unwrap().is_none());
                 let admission = crate::acp::supervisor::LaunchAdmission {
+                    establishment: None,
                     store: std::sync::Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: stored.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 };
                 let mut admitted = crate::acp::supervisor::with_durable_launch(
                     Some(admission),
@@ -1656,7 +1660,7 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(admitted.wait().unwrap().success());
-                worker_registry::clear_restart_marker(&row.id);
+                let _ = worker_registry::claim_restart_marker(&row.id);
             }
         }
     }

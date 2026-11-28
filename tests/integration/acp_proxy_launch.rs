@@ -1,20 +1,142 @@
 //! A plugin proxy launched ahead of the adapter: the runner passes the proxy's
 //! argv through intact and hands it an owner-only launch config that is gone
-//! once the session ends. Spawns a real `aoe __acp-runner` over the fake proxy
-//! (`acp-worker/test-shim/fake-proxy.mjs`) wrapping the Node shim.
+//! once the session ends. The isolated child uses the production runner CLI
+//! arguments and runner over `acp-worker/test-shim/fake-proxy.mjs`.
 
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use agent_of_empires::process::worker_registry;
+use nix::sys::signal::{kill, killpg, Signal};
+use nix::unistd::{getpgid, Pid};
 use serial_test::serial;
 
-use crate::common::{set_temp_home, shim_node, shim_path, shim_ready};
+use super::{arm_selected, managed_runner};
+use crate::acp::supervisor::test_support::managed::{shim_node, shim_path, shim_ready};
+use crate::process::{process_birth_identity, worker_registry, CapturedProcess};
+use crate::session::test_support::isolate_app_dir_at;
+use crate::session::{Instance, ResumeIntent, Status, Storage, View};
 
 const PROXY_SPEC_JSON: &str = r#"{"plugin_id":"fake-proxy","command":"p","args":[],"failure_policy":"neutral_boot","display_name":"Fake","compat":{"agent_names":[],"version_req":null}}"#;
+
+fn runner_command(
+    test_name: &str,
+    cwd: &Path,
+    session_id: &str,
+    append_args: impl FnOnce(&mut Command),
+) -> Command {
+    let storage = Storage::new_unwatched("default").unwrap();
+    let mut row = Instance::new("proxy launch", cwd.to_str().unwrap());
+    row.id = session_id.into();
+    row.source_profile = storage.profile().into();
+    row.agent_name = Some("codex".into());
+    row.view = View::Structured;
+    row.status = Status::Idle;
+    row.lifecycle_generation = 5;
+    row.resume_intent = ResumeIntent::Use(format!("retained-{session_id}"));
+    storage
+        .update(|rows, _| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+    let producer = uuid::Uuid::new_v4();
+    let attempt = arm_selected(&storage, session_id, producer, None);
+    let (launch, _) = managed_runner::RunnerInspection::prepare(cwd, test_name);
+    let mut args = Command::new(launch.executable());
+    args.args(["__acp-runner", "--socket"])
+        .arg(worker_registry::socket_path_for(session_id).unwrap())
+        .args(["--session-id", session_id, "--agent-name", "shim"])
+        .args(["--agent-key", "codex", "--cwd"])
+        .arg(cwd)
+        .args(["--source-profile", storage.profile()])
+        .args(["--lifecycle-generation", "5", "--establishment-attempt"])
+        .arg(attempt.id.to_string())
+        .arg("--establishment-producer")
+        .arg(producer.to_string());
+    append_args(&mut args);
+    let mut runner = launch.command(args.get_args()).unwrap();
+    runner.process_group(0);
+    runner
+}
+
+struct OwnedRunner {
+    child: Child,
+    reaped: bool,
+}
+
+impl OwnedRunner {
+    fn spawn(command: &mut Command) -> Self {
+        Self {
+            child: command.spawn().expect("spawn ACP runner"),
+            reaped: false,
+        }
+    }
+
+    fn pid(&self) -> Pid {
+        Pid::from_raw(self.child.id() as i32)
+    }
+
+    fn terminate(&mut self) {
+        kill(self.pid(), Signal::SIGTERM).unwrap();
+    }
+
+    fn wait_for_exit(&mut self, what: &str) {
+        wait_until(what, || {
+            let Some(status) = self.child.try_wait().unwrap() else {
+                return false;
+            };
+            self.reaped = true;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "runner must finish by retiring its group: {status}"
+            );
+            true
+        });
+    }
+
+    fn capture_member(&self, path: &Path) -> OwnedMember {
+        let pid = std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let birth = process_birth_identity(pid)
+            .unwrap()
+            .expect("live group member");
+        let member = CapturedProcess::capture(pid, &birth)
+            .unwrap()
+            .expect("capture live group member");
+        assert_eq!(
+            getpgid(Some(Pid::from_raw(pid as i32))).unwrap(),
+            self.pid()
+        );
+        OwnedMember(member)
+    }
+}
+
+impl Drop for OwnedRunner {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // The unreaped child still reserves the group leader's PID.
+            let _ = killpg(self.pid(), Signal::SIGKILL);
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct OwnedMember(CapturedProcess);
+
+impl Drop for OwnedMember {
+    fn drop(&mut self) {
+        if matches!(self.0.exited(), Ok(false)) {
+            let _ = self.0.signal(libc::SIGKILL);
+        }
+    }
+}
 
 fn wait_for(path: &Path, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -24,16 +146,20 @@ fn wait_for(path: &Path, what: &str) {
     }
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
+async fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
+    let name = std::thread::current().name().unwrap().to_owned();
+    if managed_runner::child_if_requested(&name).await {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
     let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _home = set_temp_home(temp.path());
+    let _home = isolate_app_dir_at(temp.path());
     let record_dir = temp.path().join("record");
     std::fs::create_dir_all(&record_dir).unwrap();
 
@@ -50,22 +176,22 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
 
     let node = shim_node().expect("shim prerequisite");
     let proxy = shim_path().with_file_name("fake-proxy.mjs");
-    let socket = worker_registry::socket_path_for(session_id).unwrap();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_aoe"))
-        .args(["__acp-runner", "--socket"])
-        .arg(&socket)
-        .args(["--session-id", session_id, "--agent-name", "shim", "--cwd"])
-        .arg(temp.path())
-        .args(["--proxy", PROXY_SPEC_JSON, "--degraded", "Fake"])
-        .arg("--proxy-launch-config")
-        .arg(&launch_config)
-        .args(["--", node.to_str().unwrap(), proxy.to_str().unwrap()])
-        .args(["--flag", "a b", "it's \"quoted\"", "--"])
-        .args([node.to_str().unwrap(), shim_path().to_str().unwrap()])
-        .env("FAKE_PROXY_RECORD_DIR", &record_dir)
-        .env("AOE_PROXY_LAUNCH_CONFIG", &launch_config)
-        .spawn()
-        .expect("spawn acp runner");
+    let mut command = runner_command(&name, temp.path(), session_id, |args| {
+        args.args(["--proxy", PROXY_SPEC_JSON, "--degraded", "Fake"])
+            .arg("--proxy-launch-config")
+            .arg(&launch_config)
+            .arg("--")
+            .arg(node)
+            .arg(proxy)
+            .args(["--flag", "a b", "it's \"quoted\"", "--"])
+            .arg(node)
+            .arg(shim_path());
+    });
+    let mut runner = OwnedRunner::spawn(
+        command
+            .env("FAKE_PROXY_RECORD_DIR", &record_dir)
+            .env("AOE_PROXY_LAUNCH_CONFIG", &launch_config),
+    );
 
     wait_for(&record_dir.join("env.json"), "proxy env record");
     let argv: Vec<String> =
@@ -106,20 +232,9 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
     );
 
     // The proxy exiting ends the session.
-    let pid = std::fs::read_to_string(record_dir.join("pid")).unwrap();
-    assert!(Command::new("kill")
-        .args(["-TERM", pid.trim()])
-        .status()
-        .unwrap()
-        .success());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while runner.try_wait().unwrap().is_none() {
-        if Instant::now() > deadline {
-            let _ = runner.kill();
-            panic!("runner did not exit after its proxy did");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let proxy = runner.capture_member(&record_dir.join("pid"));
+    proxy.0.signal(libc::SIGTERM).unwrap();
+    runner.wait_for_exit("runner did not exit after its proxy did");
     assert!(
         !launch_config.exists(),
         "config must be removed at session end"
@@ -127,49 +242,36 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
 }
 
 /// A request-supplied env var must not choose what the runner unlinks at exit.
-#[test]
+#[tokio::test]
 #[serial]
-fn runner_exit_ignores_a_launch_config_env_it_was_not_given_by_flag() {
+async fn runner_exit_ignores_a_launch_config_env_it_was_not_given_by_flag() {
+    let name = std::thread::current().name().unwrap().to_owned();
+    if managed_runner::child_if_requested(&name).await {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
     let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _home = set_temp_home(temp.path());
+    let _home = isolate_app_dir_at(temp.path());
     let victim = temp.path().join("victim");
     std::fs::write(&victim, b"keep").unwrap();
 
     let session_id = "launch-env-victim";
     let node = shim_node().expect("shim prerequisite");
-    let socket = worker_registry::socket_path_for(session_id).unwrap();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_aoe"))
-        .args(["__acp-runner", "--socket"])
-        .arg(&socket)
-        .args(["--session-id", session_id, "--agent-name", "shim", "--cwd"])
-        .arg(temp.path())
-        .args(["--", node.to_str().unwrap(), shim_path().to_str().unwrap()])
-        .env("AOE_PROXY_LAUNCH_CONFIG", &victim)
-        .spawn()
-        .expect("spawn acp runner");
+    let mut command = runner_command(&name, temp.path(), session_id, |args| {
+        args.arg("--").arg(node).arg(shim_path());
+    });
+    let mut runner = OwnedRunner::spawn(command.env("AOE_PROXY_LAUNCH_CONFIG", &victim));
 
     wait_until("runner record never appeared", || {
         worker_registry::load(session_id).unwrap().is_some()
     });
-    signal("-TERM", &runner.id().to_string());
-    wait_until("runner did not exit", || {
-        runner.try_wait().unwrap().is_some()
-    });
+    runner.terminate();
+    runner.wait_for_exit("runner did not exit");
     assert!(victim.exists(), "the runner unlinked an env-named path");
-}
-
-fn pid_alive(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap()
-        .success()
 }
 
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
@@ -183,55 +285,61 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 /// Runs a runner (its own group leader, as the daemon spawns it) over the fake
 /// proxy and a `sleep` adapter (unlike the shim, it ignores stdin EOF), ends it
 /// with `end`, and asserts neither the proxy nor the adapter outlives it.
-fn assert_no_orphans(session_id: &str, proxy_mode: &str, end: impl FnOnce(&str, &str)) {
+fn assert_no_orphans(
+    test_name: &str,
+    session_id: &str,
+    proxy_mode: &str,
+    end: impl FnOnce(&mut OwnedRunner, &CapturedProcess),
+) {
     let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _home = set_temp_home(temp.path());
+    let _home = isolate_app_dir_at(temp.path());
     let record_dir = temp.path().join("record");
     std::fs::create_dir_all(&record_dir).unwrap();
 
     let node = shim_node().expect("shim prerequisite");
     let proxy = shim_path().with_file_name("fake-proxy.mjs");
-    let socket = worker_registry::socket_path_for(session_id).unwrap();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_aoe"))
-        .args(["__acp-runner", "--socket"])
-        .arg(&socket)
-        .args(["--session-id", session_id, "--agent-name", "shim", "--cwd"])
-        .arg(temp.path())
-        .args(["--", node.to_str().unwrap(), proxy.to_str().unwrap()])
-        .args(["--", "sleep", "600"])
-        .env("FAKE_PROXY_RECORD_DIR", &record_dir)
-        .env("FAKE_PROXY_MODE", proxy_mode)
-        .process_group(0)
-        .spawn()
-        .expect("spawn acp runner");
+    let mut command = runner_command(test_name, temp.path(), session_id, |args| {
+        args.arg("--")
+            .arg(node)
+            .arg(proxy)
+            .args(["--", "sleep", "600"]);
+    });
+    let mut runner = OwnedRunner::spawn(
+        command
+            .env("FAKE_PROXY_RECORD_DIR", &record_dir)
+            .env("FAKE_PROXY_MODE", proxy_mode),
+    );
 
     wait_for(&record_dir.join("adapter_pid"), "adapter pid record");
-    let read = |name: &str| std::fs::read_to_string(record_dir.join(name)).unwrap();
-    let (proxy_pid, adapter_pid) = (read("pid"), read("adapter_pid"));
-    assert!(pid_alive(&proxy_pid) && pid_alive(&adapter_pid));
+    let proxy = runner.capture_member(&record_dir.join("pid"));
+    let adapter = runner.capture_member(&record_dir.join("adapter_pid"));
 
-    end(&runner.id().to_string(), proxy_pid.trim());
+    end(&mut runner, &proxy.0);
 
-    wait_until("runner did not exit", || {
-        runner.try_wait().unwrap().is_some()
+    runner.wait_for_exit("runner did not exit");
+    wait_until("proxy outlived the runner", || proxy.0.exited().unwrap());
+    wait_until("adapter outlived the runner", || {
+        adapter.0.exited().unwrap()
     });
-    wait_until("proxy outlived the runner", || !pid_alive(&proxy_pid));
-    wait_until("adapter outlived the runner", || !pid_alive(&adapter_pid));
 }
 
 /// An inherited fd keeps its number through the proxy even when the fds below
 /// it are closed (`--env-file /dev/fd/9` names the number).
-#[test]
+#[tokio::test]
 #[serial]
-fn proxy_keeps_inherited_fd_numbers_across_closed_slots() {
+async fn proxy_keeps_inherited_fd_numbers_across_closed_slots() {
+    let name = std::thread::current().name().unwrap().to_owned();
+    if managed_runner::child_if_requested(&name).await {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
     let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _home = set_temp_home(temp.path());
+    let _home = isolate_app_dir_at(temp.path());
     let record_dir = temp.path().join("record");
     std::fs::create_dir_all(&record_dir).unwrap();
     let env_file = temp.path().join("env-file");
@@ -240,32 +348,35 @@ fn proxy_keeps_inherited_fd_numbers_across_closed_slots() {
 
     let node = shim_node().expect("shim prerequisite");
     let proxy = shim_path().with_file_name("fake-proxy.mjs");
-    let socket = worker_registry::socket_path_for("proxy-fd9").unwrap();
     let file = std::fs::File::open(&env_file).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aoe"));
-    cmd.args(["__acp-runner", "--socket"])
-        .arg(&socket)
-        .args(["--session-id", "proxy-fd9", "--agent-name", "shim", "--cwd"])
-        .arg(temp.path())
-        .args(["--", node.to_str().unwrap(), proxy.to_str().unwrap()])
-        .args(["--", "sh", "-c", "cat /dev/fd/9 > \"$0\"; exec sleep 600"])
-        .arg(&out)
-        .env("FAKE_PROXY_RECORD_DIR", &record_dir)
-        .process_group(0);
+    let mut cmd = runner_command(&name, temp.path(), "proxy-fd9", |args| {
+        args.arg("--")
+            .arg(node)
+            .arg(proxy)
+            .args(["--", "sh", "-c", "cat /dev/fd/9 > \"$0\"; exec sleep 600"])
+            .arg(&out);
+    });
+    cmd.env("FAKE_PROXY_RECORD_DIR", &record_dir);
     let src = std::os::fd::AsRawFd::as_raw_fd(&file);
     // SAFETY: only async-signal-safe libc calls between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(src, 9) < 0 {
+            if libc::dup2(src, 9) < 0 || libc::fcntl(9, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             for fd in 3..9 {
-                libc::close(fd);
+                // Keep the exec error pipe available until exec itself.
+                if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EBADF) {
+                        return Err(error);
+                    }
+                }
             }
             Ok(())
         });
     }
-    let mut runner = cmd.spawn().expect("spawn acp runner");
+    let mut runner = OwnedRunner::spawn(&mut cmd);
     drop(file);
 
     wait_until("adapter never read fd 9", || {
@@ -273,377 +384,38 @@ fn proxy_keeps_inherited_fd_numbers_across_closed_slots() {
     });
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "SECRET=1");
 
-    signal("-TERM", &runner.id().to_string());
-    wait_until("runner did not exit", || {
-        runner.try_wait().unwrap().is_some()
-    });
+    runner.terminate();
+    runner.wait_for_exit("runner did not exit");
 }
 
-fn signal(sig: &str, pid: &str) {
-    assert!(Command::new("kill")
-        .args([sig, pid])
-        .status()
-        .unwrap()
-        .success());
-}
-
-#[test]
-#[serial]
-fn runner_shutdown_leaves_no_orphan_proxy_or_adapter() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    assert_no_orphans("proxy-orphan-term", "orphan-on-term", |runner, _| {
-        signal("-TERM", runner)
-    });
-}
-
-#[test]
-#[serial]
-fn proxy_exit_leaves_no_orphan_adapter() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    assert_no_orphans("proxy-orphan-exit", "ok", |_, proxy| signal("-KILL", proxy));
-}
-
-#[cfg(debug_assertions)]
-mod attach {
-    use agent_of_empires::acp::acp_client::{AcpClient, AcpError, ProxyFailurePolicy, ProxySpec};
-    use agent_of_empires::acp::agent_compat::ProxyCompat;
-    use agent_of_empires::acp::state::{AcpSessionId, Event, StartupErrorDetail};
-
-    use crate::common::{shim_node, shim_path, shim_ready, spawn_runner, RunnerGuard};
-    use std::time::Duration;
-
-    fn proxy_spec() -> ProxySpec {
-        ProxySpec {
-            plugin_id: "fake-proxy".into(),
-            command: String::new(),
-            args: Vec::new(),
-            failure_policy: ProxyFailurePolicy::Refuse,
-            display_name: "Fake".into(),
-            compat: ProxyCompat::default(),
-        }
-    }
-
-    fn proxy_argv() -> [String; 5] {
-        let node = shim_node().expect("shim prerequisite").to_str().unwrap();
-        let proxy = shim_path().with_file_name("fake-proxy.mjs");
-        [
-            node,
-            proxy.to_str().unwrap(),
-            "--",
-            node,
-            shim_path().to_str().unwrap(),
-        ]
-        .map(String::from)
-    }
-
-    async fn connect(
-        socket: std::path::PathBuf,
-        session_id: &str,
-        acp_session_id: &str,
-    ) -> Result<AcpClient, AcpError> {
-        AcpClient::attach(
-            socket,
-            std::env::temp_dir(),
-            vec![],
-            acp_session_id.into(),
-            false,
-            AcpSessionId(session_id.into()),
-            None,
-            "shim".into(),
-            None,
-            None,
-            None,
-            None,
-            Some(proxy_spec()),
-            false,
-        )
-        .await
-    }
-
-    async fn attach(session_id: &str, mode: &str) -> (Result<AcpClient, AcpError>, RunnerGuard) {
-        let env = [("FAKE_PROXY_MODE", mode.to_string())];
-        let (socket, runner) = spawn_runner(session_id, &env, &proxy_argv()).await;
-        (connect(socket, session_id, "unused").await, runner)
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_good_hello_connects() {
-        if let Err(reason) = shim_ready() {
-            eprintln!("skipping: {reason}");
-            return;
-        }
-        let (client, _runner) = attach("proxy-attach-ok", "ok").await;
-        let mut client = client.expect("attach");
-        let assigned = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while let Some(event) = client.next_event().await {
-                if matches!(event, Event::AcpSessionAssigned { .. }) {
-                    return true;
-                }
-            }
-            false
-        })
-        .await
-        .expect("timed out");
-        assert!(assigned, "a proxied session must reach AcpSessionAssigned");
-    }
-
-    /// Writes the proxy's own frames: `(text, after_adapter_sequence)`, where
-    /// `None` is an adapter frame.
-    fn emit(file: &std::path::Path, acp_session_id: &str, frames: &[(&str, Option<u64>)]) {
-        let lines: String = frames
-            .iter()
-            .map(|(text, after)| {
-                let mut update = serde_json::json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": text},
-                });
-                if let Some(after) = after {
-                    update["_meta"] = serde_json::json!({
-                        "aoe": {"v": 1, "key": text, "after_adapter_sequence": after}
-                    });
-                }
-                let frame = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {"sessionId": acp_session_id, "update": update},
-                });
-                format!("{frame}\n")
-            })
-            .collect();
-        let staged = file.with_extension("staged");
-        std::fs::write(&staged, lines).unwrap();
-        std::fs::rename(staged, file).unwrap();
-    }
-
-    /// Waits until the runner reports it has read `count` adapter frames.
-    async fn wait_for_adapter_frames(file: &std::path::Path, count: u64) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while std::fs::read_to_string(file)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                != Some(count)
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the runner never read the adapter frames");
-    }
-
-    async fn next_chunk(client: &mut AcpClient) -> String {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Event::AgentMessageChunk { text, .. } =
-                    client.next_event().await.expect("event stream open")
-                {
-                    return text;
-                }
-            }
-        })
-        .await
-        .expect("the expected frame never arrived")
-    }
-
-    async fn assigned_id(client: &mut AcpClient) -> String {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Event::AcpSessionAssigned { acp_session_id } =
-                    client.next_event().await.expect("event stream open")
-                {
-                    return acp_session_id;
-                }
-            }
-        })
-        .await
-        .expect("session never assigned")
-    }
-
-    /// The proxy numbers adapter frames for the life of the adapter, but a
-    /// daemon counts per connection. After a reattach a frame anchored before
-    /// it must still be released at the right adapter frame, and a replayed
-    /// backlog must not be counted twice.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_reattach_keeps_counting_the_adapters_frames() {
-        if let Err(reason) = shim_ready() {
-            eprintln!("skipping: {reason}");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("emit");
-        let ingested = dir.path().join("adapter-frames");
-        let env = [
-            ("FAKE_PROXY_EMIT_FILE", file.display().to_string()),
-            (
-                "AOE_E2E_ADAPTER_FRAMES_FILE",
-                ingested.display().to_string(),
-            ),
-        ];
-        let id = "proxy-reattach-count";
-        let (socket, _runner) = spawn_runner(id, &env, &proxy_argv()).await;
-
-        let mut client = connect(socket.clone(), id, "unused").await.expect("attach");
-        let acp = assigned_id(&mut client).await;
-        emit(&file, &acp, &[("a1", None), ("a2", None)]);
-        assert_eq!(next_chunk(&mut client).await, "a1");
-        assert_eq!(next_chunk(&mut client).await, "a2");
-        client.shutdown().await.unwrap();
-
-        // Quiet adapter: an anchor behind the count is delivered at once.
-        let mut client = connect(socket.clone(), id, &acp).await.expect("reattach");
-        assigned_id(&mut client).await;
-        emit(&file, &acp, &[("t2", Some(2))]);
-        assert_eq!(next_chunk(&mut client).await, "t2");
-
-        // An anchor ahead of the count waits for exactly the next adapter frame.
-        emit(&file, &acp, &[("t3", Some(3)), ("a3", None)]);
-        assert_eq!(next_chunk(&mut client).await, "a3");
-        assert_eq!(next_chunk(&mut client).await, "t3");
-        client.shutdown().await.unwrap();
-
-        // Frames sent while detached are replayed and counted once.
-        emit(&file, &acp, &[("a4", None), ("t5", Some(5))]);
-        wait_for_adapter_frames(&ingested, 4).await;
-        let mut client = connect(socket, id, &acp).await.expect("second reattach");
-        assigned_id(&mut client).await;
-        assert_eq!(next_chunk(&mut client).await, "a4");
-        emit(&file, &acp, &[("a5", None)]);
-        assert_eq!(next_chunk(&mut client).await, "a5");
-        assert_eq!(next_chunk(&mut client).await, "t5");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_bad_or_missing_hello_is_refused() {
-        if let Err(reason) = shim_ready() {
-            eprintln!("skipping: {reason}");
-            return;
-        }
-        for (mode, id) in [
-            ("bad-hello", "proxy-attach-bad"),
-            ("no-hello", "proxy-attach-none"),
-        ] {
-            let (result, _runner) = attach(id, mode).await;
-            match result {
-                Err(AcpError::IncompatibleAgent(error)) => assert!(
-                    matches!(error.detail, StartupErrorDetail::InvalidProxyHello { .. }),
-                    "{mode}: {:?}",
-                    error.detail
-                ),
-                Err(other) => panic!("{mode}: unexpected error {other}"),
-                Ok(_) => panic!("{mode}: a bad hello must not connect"),
-            }
-        }
-    }
-}
-
-/// Killing a proxied session's proxy mid-turn loses its integration rather
-/// than failing it as a startup error.
-#[cfg(debug_assertions)]
 #[tokio::test]
 #[serial]
-async fn killing_the_proxy_mid_turn_loses_the_integration() {
-    use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
-    use agent_of_empires::acp::agent_registry::AgentSpec;
-    use agent_of_empires::acp::state::{AcpSessionId, Event, IntegrationLostReason};
-
+async fn runner_shutdown_leaves_no_orphan_proxy_or_adapter() {
+    let name = std::thread::current().name().unwrap().to_owned();
+    if managed_runner::child_if_requested(&name).await {
+        return;
+    }
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
-    let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
-    let record_dir = temp.path().join("record");
-    std::fs::create_dir_all(&record_dir).unwrap();
-    let node = shim_node().expect("shim prerequisite");
-    let proxy = shim_path().with_file_name("fake-proxy.mjs");
-    let cwd = temp.path().to_path_buf();
-    let config = SpawnConfig {
-        launch_lease: None,
-        provider_routing: Vec::new(),
-        wrapper_substitution: None,
-        agent_key: "claude".into(),
-        tool: "claude".into(),
-        spec: AgentSpec {
-            command: node.to_string_lossy().into_owned(),
-            args: vec![
-                proxy.to_string_lossy().into_owned(),
-                "--".into(),
-                node.to_string_lossy().into_owned(),
-                shim_path().to_string_lossy().into_owned(),
-            ],
-            description: "fake proxy over the test shim".into(),
-            env_allowlist: None,
-        },
-        config_path: cwd.clone(),
-        cwd,
-        additional_dirs: vec![],
-        provider_env: vec![],
-        host_environment: vec![
-            (
-                "FAKE_PROXY_RECORD_DIR".into(),
-                record_dir.to_string_lossy().into_owned(),
-            ),
-            // Holds the prompt open until a release file that never appears.
-            (
-                "SHIM_PROMPT_COMPLETION_RELEASE_FILE".into(),
-                temp.path().join("never").to_string_lossy().into_owned(),
-            ),
-        ],
-        default_effort: None,
-        default_effort_explicit: false,
-        default_model_config: Default::default(),
-        default_mode: None,
-        default_model: None,
-        socket_path: None,
-        stored_acp_session_id: None,
-        fork_from: None,
-        seed_history_replay: false,
-        prior_conversation: false,
-        generation: 0,
-        artifact_dir: None,
-        // The fake proxy is the adapter command here; in-process spawns launch no proxy.
-        proxy: None,
-        mcp_credentials: Default::default(),
-        degraded: None,
-        sandbox_info: None,
-        workspace_info: None,
-        source_profile: None,
-        mcp_servers: Vec::new(),
-        claude_store_pin: None,
-        base_host_environment: vec![],
-    };
-    let mut client = AcpClient::spawn(config, AcpSessionId("proxy-mid-turn".into()))
-        .await
-        .expect("spawn fake proxy");
-    client.send_prompt("hello", &[]).await.expect("send_prompt");
+    assert_no_orphans(&name, "proxy-orphan-term", "orphan-on-term", |runner, _| {
+        runner.terminate();
+    });
+}
 
-    let lost = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut killed = false;
-        while let Some(event) = client.next_event().await {
-            match event {
-                // The turn is open: the shim has streamed and now parks the prompt.
-                Event::AgentMessageChunk { ref text, .. } if text == "done" && !killed => {
-                    let pid = std::fs::read_to_string(record_dir.join("pid")).unwrap();
-                    signal("-KILL", pid.trim());
-                    killed = true;
-                }
-                Event::IntegrationLost { reason } => return Some(reason),
-                Event::AgentStartupError { message, .. } => {
-                    panic!("a proxy exit is not a startup error: {message}")
-                }
-                _ => {}
-            }
-        }
-        None
-    })
-    .await
-    .expect("the proxy's death is reported");
-    assert_eq!(lost, Some(IntegrationLostReason::ProxyExited));
+#[tokio::test]
+#[serial]
+async fn proxy_exit_leaves_no_orphan_adapter() {
+    let name = std::thread::current().name().unwrap().to_owned();
+    if managed_runner::child_if_requested(&name).await {
+        return;
+    }
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    assert_no_orphans(&name, "proxy-orphan-exit", "ok", |_, proxy| {
+        proxy.signal(libc::SIGKILL).unwrap();
+    });
 }

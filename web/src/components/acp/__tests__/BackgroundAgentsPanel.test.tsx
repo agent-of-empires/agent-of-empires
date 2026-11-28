@@ -1,9 +1,13 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ActivityRow, BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
+import type * as AcpSessionHooks from "../../../hooks/useAcpSession";
+import { applyEvent, applyReducedState, emptyAcpState } from "../../../lib/acpTypes";
+import { currentControlSnapshot } from "../../../../tests/helpers/acpControlSnapshot";
 import { writeClipboard } from "../../../lib/clipboard";
+import { flushAsync, installAcpFakes, lastSocket, profileWrapper } from "../../../hooks/__tests__/acpHarness";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
@@ -360,6 +364,71 @@ describe("BackgroundAgentsPanel", () => {
     runsMock.mockReturnValue({});
   });
 
+  it("keeps the current run live when covered history reuses its task id, while retaining the old run", () => {
+    const current = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 20,
+      event: {
+        BackgroundTaskStarted: {
+          task_id: "reused-task",
+          tool_call_id: "current-tool",
+          description: "current workflow",
+          workflow: { run_id: "current-run", name: "Current workflow", summary: "Waiting for its next phase" },
+        },
+      },
+    });
+    const snapshot = currentControlSnapshot(current, { ready: true }, 20);
+    let replay = applyReducedState(emptyAcpState(), snapshot.state, [], snapshot.seq);
+    replay = applyEvent(replay, {
+      session_id: "s-1",
+      seq: 5,
+      event: {
+        BackgroundTaskStarted: {
+          task_id: "reused-task",
+          tool_call_id: "historical-tool",
+          description: "old workflow",
+          workflow: { run_id: "historical-run", name: "Historical workflow", summary: null },
+        },
+      },
+    });
+    replay = applyEvent(replay, {
+      session_id: "s-1",
+      seq: 6,
+      event: {
+        BackgroundTaskFinished: { task_id: "reused-task", ended_at: "2026-05-21T00:01:00Z" },
+      },
+    });
+    const endedAt = "2026-05-21T00:00:30Z";
+    agentsMock.mockReturnValue([
+      agent({
+        agentId: "current-agent",
+        toolCallId: "current-tool",
+        workflow: { run_id: "current-run", name: "Current workflow", phase: "Draft" },
+        status: "completed",
+        endedAt,
+      }),
+      agent({
+        agentId: "historical-agent",
+        toolCallId: "historical-tool",
+        description: "Retained historical work",
+        workflow: { run_id: "historical-run", name: "Historical workflow", phase: "Draft" },
+        status: "completed",
+        endedAt,
+      }),
+    ]);
+    tasksMock.mockReturnValue(replay.backgroundTasks);
+    runsMock.mockReturnValue(replay.workflowRuns);
+    const panel = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const runHeader = (name: string) =>
+      [...panel.container.querySelectorAll("button")].find((button) => button.textContent?.includes(name))!;
+    expect(runHeader("Current workflow").querySelector("span")!.className).toContain("animate-pulse");
+    expect(runHeader("Historical workflow").querySelector("span")!.className).not.toContain("animate-pulse");
+    expect(panel.container.textContent).toContain("Retained historical work");
+    panel.unmount();
+    tasksMock.mockReturnValue([]);
+    runsMock.mockReturnValue({});
+  });
+
   it("offers Stop on a running agent only when the session is writable", () => {
     agentsMock.mockReturnValue([agent()]);
     const stopButtons = (c: HTMLElement) => [...c.querySelectorAll("button")].filter((b) => b.textContent === "Stop");
@@ -452,22 +521,14 @@ describe("BackgroundAgentsPanel", () => {
     expect(runIdx).toBeLessThan(doneIdx);
   });
 
-  it("shows a Stop button for active agents that POSTs the session cancel", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve({ ok: true } as Response));
-    vi.stubGlobal("fetch", fetchMock);
-    agentsMock.mockReturnValue([agent({ status: "running" })]);
-    const { getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    const stop = getByRole("button", { name: /stop/i });
-    fireEvent.click(stop);
-    // ACP stops the whole session, so Stop asks first.
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(getByRole("alertdialog").textContent).toContain("interrupts the main agent and all 1 running sub-agent");
-    fireEvent.click(getByRole("button", { name: "Interrupt session" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" }));
-    vi.unstubAllGlobals();
-  });
-
   it("disables both dialog buttons while the interrupt request is in flight", async () => {
+    const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>("../../../hooks/useAcpSession");
+    installAcpFakes();
+    const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message(currentControlSnapshot(runtime.result.current.state, { ready: true }));
+    await flushAsync();
     let finish: (res: Response) => void = () => {};
     const fetchMock = vi.fn(() => new Promise<Response>((resolve) => (finish = resolve)));
     vi.stubGlobal("fetch", fetchMock);
@@ -480,6 +541,7 @@ describe("BackgroundAgentsPanel", () => {
     expect((getByRole("button", { name: "Interrupt session" }) as HTMLButtonElement).disabled).toBe(true);
     finish({ ok: true } as Response);
     await waitFor(() => expect(queryByRole("alertdialog")).toBeNull());
+    runtime.unmount();
     vi.unstubAllGlobals();
   });
 
@@ -516,6 +578,13 @@ describe("BackgroundAgentsPanel", () => {
     });
 
     it("asks before POSTing the child cancel route, and surfaces a failure", async () => {
+      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>("../../../hooks/useAcpSession");
+      installAcpFakes();
+      const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(runtime.result.current.state, { ready: true }));
+      await flushAsync();
       const fetchMock = vi.fn(() =>
         Promise.resolve({ ok: false, status: 409, text: () => Promise.resolve("subagent cannot be cancelled") }),
       );
@@ -528,11 +597,19 @@ describe("BackgroundAgentsPanel", () => {
       fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
       expect(await findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
+      runtime.unmount();
       vi.unstubAllGlobals();
       subagentsMock.mockReturnValue([]);
     });
 
     it("lists and stops a child that has no legacy background-agent record", async () => {
+      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>("../../../hooks/useAcpSession");
+      installAcpFakes();
+      const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(runtime.result.current.state, { ready: true }));
+      await flushAsync();
       const fetchMock = vi.fn(() => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve("") }));
       vi.stubGlobal("fetch", fetchMock);
       agentsMock.mockReturnValue([]);
@@ -556,6 +633,7 @@ describe("BackgroundAgentsPanel", () => {
       fireEvent.click(stops[0]!);
       fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
+      runtime.unmount();
       vi.unstubAllGlobals();
       subagentsMock.mockReturnValue([]);
     });
@@ -742,6 +820,83 @@ describe("BackgroundAgentsPanel", () => {
       expect(getAllByTitle("Stop this sub-agent")).toHaveLength(1);
       subagentsMock.mockReturnValue([]);
     });
+
+    describe("accepted subagent snapshot cards", () => {
+      afterEach(() => {
+        agentsMock.mockReturnValue([]);
+        subagentsMock.mockReturnValue([]);
+        tasksMock.mockReturnValue([]);
+        runsMock.mockReturnValue({});
+      });
+
+      it.each([
+        ["idle", "end_turn", "completed", "done", null],
+        ["idle", "end_turn", "completed", "done", "2026-01-01T00:00:05Z"],
+        ["idle", "error", "error", "error", null],
+        ["idle", "error", "error", "error", "2026-01-01T00:00:05Z"],
+        ["requires_action", null, "requires_action", "Waiting on you", null],
+        ["requires_action", null, "requires_action", "Waiting on you", "2026-01-01T00:00:05Z"],
+      ] as const)(
+        "restores %s/%s as %s (%s) without inventing clock evidence %s",
+        (state, stopReason, status, label, endedAt) => {
+          const startedAt = "2026-01-01T00:00:00Z";
+          const linked = agent({ startedAt, endedAt, status: endedAt === null ? "running" : "completed" });
+          const local = agent({ agentId: "local-card", toolCallId: "local-tool", description: "Local-only card" });
+          const localChild = record({
+            session_id: "local-child",
+            parent_tool_call_id: null,
+            title: "Local-only child",
+            cancel_capable: false,
+          });
+          const held = {
+            ...emptyAcpState(),
+            lastSeq: 7,
+            backgroundAgents: [linked, local],
+            subagents: [record(), localChild],
+          };
+          const header = currentControlSnapshot(held, { ready: true }, 8);
+          const wire = {
+            ...header.state,
+            subagents: [record({ state, stop_reason: stopReason })],
+          };
+          const restored = applyReducedState(held, wire, header.unchanged, header.seq);
+          expect(restored.backgroundAgents.find((item) => item.agentId === linked.agentId)).toMatchObject({
+            status,
+            startedAt,
+            endedAt,
+          });
+          expect(restored.backgroundAgents.find((item) => item.agentId === local.agentId)).toEqual(local);
+          expect(restored.subagents).toContainEqual(localChild);
+          agentsMock.mockReturnValue(restored.backgroundAgents);
+          subagentsMock.mockReturnValue(restored.subagents);
+          tasksMock.mockReturnValue([]);
+          runsMock.mockReturnValue({});
+          const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+          expect(view.getByText(label)).toBeTruthy();
+          expect(view.queryAllByTitle("Stop this sub-agent")).toHaveLength(state === "idle" ? 0 : 1);
+          expect(view.getByText("Local-only card")).toBeTruthy();
+          expect(view.getByText("Local-only child")).toBeTruthy();
+
+          const older = applyReducedState(
+            restored,
+            {
+              ...wire,
+              subagents: [record({ state: "running", stop_reason: null })],
+            },
+            [],
+            7,
+          );
+          expect(older.backgroundAgents).toEqual(restored.backgroundAgents);
+          expect(older.subagents).toEqual(restored.subagents);
+          agentsMock.mockReturnValue(older.backgroundAgents);
+          subagentsMock.mockReturnValue(older.subagents);
+          view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+          expect(view.getByText(label)).toBeTruthy();
+          expect(view.queryAllByTitle("Stop this sub-agent")).toHaveLength(state === "idle" ? 0 : 1);
+          view.unmount();
+        },
+      );
+    });
   });
 
   it("opens the shared detail view with the full prompt and result, and steps between agents", () => {
@@ -751,7 +906,7 @@ describe("BackgroundAgentsPanel", () => {
         toolCallId: "t1",
         status: "completed",
         startedAt: "2026-01-01T00:00:10Z",
-        endedAt: new Date().toISOString(),
+        endedAt: "2026-01-01T00:00:15Z",
         prompt: "a very long prompt that the narrow panel would clamp",
         result: "the complete final result text",
         tools: [{ name: "Bash", title: "ls", ok: true }],
@@ -762,7 +917,7 @@ describe("BackgroundAgentsPanel", () => {
         description: "Second one",
         status: "completed",
         startedAt: "2026-01-01T00:00:00Z",
-        endedAt: "2020-01-01",
+        endedAt: "2026-01-01T00:00:05Z",
       }),
     ]);
     const { getByRole, container } = render(<BackgroundAgentsPanel sessionId="s-1" />);

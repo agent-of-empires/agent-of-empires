@@ -167,10 +167,20 @@ mod tests {
     fn search_matches_prose_literally_and_groups_by_session() {
         let (_tmp, store) = open_store(1000);
         store
-            .record("s1", 1, &user_prompt("please refactor the reconciler"))
+            .record(
+                "s1",
+                1,
+                &user_prompt("please refactor the reconciler"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         store
-            .record("s2", 1, &agent_chunk("I updated the supervisor"))
+            .record(
+                "s2",
+                1,
+                &agent_chunk("I updated the supervisor"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         store
             .record(
@@ -180,6 +190,7 @@ mod tests {
                     tool_call_id: "t1".into(),
                     content: "grep matched reconciler in supervisor.rs".into(),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         record_from(
@@ -212,7 +223,14 @@ mod tests {
             1,
             (1..=20).map(|_| agent_chunk("needle again")),
         );
-        store.record("s_quiet", 1, &agent_chunk("needle")).unwrap();
+        store
+            .record(
+                "s_quiet",
+                1,
+                &agent_chunk("needle"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let all = store.search_content("needle", 10);
         assert!(ids(&all).contains(&"s_busy") && ids(&all).contains(&"s_quiet"));
         assert_eq!(store.search_content("needle", 1).len(), 1);

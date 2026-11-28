@@ -65,6 +65,12 @@ pub enum Order {
     Desc,
 }
 
+pub(crate) struct ScanWindow {
+    pub bound: SeqBound,
+    pub order: Order,
+    pub limit: Option<usize>,
+}
+
 /// Uses anonymous `?` placeholders, so callers bind positionally: topic or cutoff first,
 /// then these patterns in order.
 fn not_like_clauses(prefixes: &[&str]) -> (String, Vec<String>) {
@@ -110,6 +116,12 @@ fn create_dangling_target(path: &Path) -> std::io::Result<()> {
 }
 
 pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
+    let conn = connect(db_path)?;
+    initialize_schema(&conn, schema)?;
+    Ok(conn)
+}
+
+pub(crate) fn connect(db_path: &Path) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -129,6 +141,10 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
         .context("enable WAL mode")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .context("set synchronous=NORMAL")?;
+    Ok(conn)
+}
+
+pub(crate) fn initialize_schema(conn: &Connection, schema: &Schema) -> Result<()> {
     let events = schema.events_table();
     let attachments = schema.attachments_table();
     let pending_attachments = schema.pending_attachments_table();
@@ -181,8 +197,8 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
         );"
     ))
     .context("create event log schema")?;
-    ensure_discriminant_column(&conn, events)?;
-    Ok(conn)
+    ensure_discriminant_column(conn, events)?;
+    Ok(())
 }
 
 fn ensure_discriminant_column(conn: &Connection, events: &str) -> Result<()> {
@@ -360,13 +376,55 @@ pub fn scan(
     order: Order,
     limit: Option<usize>,
 ) -> Vec<(u64, String)> {
-    // Clamp before the cast so a `u64::MAX` cursor does not wrap negative.
-    let (predicate, mut values) = match bound {
-        SeqBound::After(v) => ("seq > ?", vec![v]),
-        SeqBound::Before(v) if v > i64::MAX as u64 => ("seq <= ?", vec![v]),
-        SeqBound::Before(v) => ("seq < ?", vec![v]),
-        SeqBound::AfterThrough(after, through) => ("seq > ? AND seq <= ?", vec![after, through]),
+    scan_projected(
+        conn,
+        schema,
+        topic,
+        ScanWindow {
+            bound,
+            order,
+            limit,
+        },
+        "seq, event_json",
+        |row| {
+            let decoded = row
+                .get::<_, i64>(0)
+                .and_then(|seq| row.get::<_, String>(1).map(|json| (seq as u64, json)));
+            Ok(match decoded {
+                Ok(pair) => Some(pair),
+                Err(error) => {
+                    warn!(target: "events", "row error: {error}");
+                    None
+                }
+            })
+        },
+    )
+    .unwrap_or_else(|error| {
+        warn!(target: "events", "scan for {topic}: {error}");
+        Vec::new()
+    })
+}
+
+pub(crate) fn scan_projected<T>(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+    window: ScanWindow,
+    columns: &str,
+    map_row: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<Option<T>>,
+) -> Result<Vec<T>> {
+    let ScanWindow {
+        bound,
+        order,
+        limit,
+    } = window;
+    let (predicate, value, upper) = match bound {
+        SeqBound::After(value) => ("seq > ?2", value, None),
+        SeqBound::AfterThrough(after, through) => ("seq > ?2 AND seq <= ?3", after, Some(through)),
+        SeqBound::Before(value) if value > i64::MAX as u64 => ("seq <= ?2", value, None),
+        SeqBound::Before(value) => ("seq < ?2", value, None),
     };
+    let value_i64 = i64::try_from(value).unwrap_or(i64::MAX);
     let order_sql = match order {
         Order::Asc => "ASC",
         Order::Desc => "DESC",
@@ -374,46 +432,27 @@ pub fn scan(
     let events = schema.events_table();
     let limit_sql = if limit.is_some() { " LIMIT ?" } else { "" };
     let sql = format!(
-        "SELECT seq, event_json FROM {events}
-         WHERE session_id = ? AND {predicate}
+        "SELECT {columns} FROM {events}
+         WHERE session_id = ?1 AND {predicate}
          ORDER BY seq {order_sql}{limit_sql}"
     );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(target: "events", "prepare scan for {topic}: {e}");
-            return Vec::new();
+    let mut statement = conn
+        .prepare(&sql)
+        .with_context(|| format!("prepare scan for {topic}"))?;
+    let limit = limit.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+    let upper = upper.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+    let rows = match (upper, limit) {
+        (Some(upper), Some(limit)) => {
+            statement.query_map(params![topic, value_i64, upper, limit], map_row)
         }
-    };
-    let map_row = |row: &rusqlite::Row| {
-        let seq: i64 = row.get(0)?;
-        let json: String = row.get(1)?;
-        Ok((seq as u64, json))
-    };
-    if let Some(n) = limit {
-        values.push(n as u64);
+        (Some(upper), None) => statement.query_map(params![topic, value_i64, upper], map_row),
+        (None, Some(limit)) => statement.query_map(params![topic, value_i64, limit], map_row),
+        (None, None) => statement.query_map(params![topic, value_i64], map_row),
     }
-    let args = std::iter::once(Value::Text(topic.to_string())).chain(
-        values
-            .into_iter()
-            .map(|v| Value::Integer(i64::try_from(v).unwrap_or(i64::MAX))),
-    );
-    let rows = stmt.query_map(params_from_iter(args), map_row);
-    let rows = match rows {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(target: "events", "query scan for {topic}: {e}");
-            return Vec::new();
-        }
-    };
-    let mut out = Vec::new();
-    for row in rows {
-        match row {
-            Ok(pair) => out.push(pair),
-            Err(e) => warn!(target: "events", "row error: {e}"),
-        }
-    }
-    out
+    .with_context(|| format!("query scan for {topic}"))?;
+    rows.filter_map(|row| row.transpose())
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("decode scan for {topic}"))
 }
 
 pub fn highest_seq(conn: &Connection, schema: &Schema, topic: &str) -> u64 {

@@ -666,8 +666,7 @@ fn drain_stderr(stderr: tokio::process::ChildStderr, command: String, pid: Optio
 mod tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::{env_test_spawn_config, reset_fake_spawn_config};
-    use crate::acp::acp_client::AcpClient;
-    use crate::acp::state::{AcpSessionId, Event};
+    use crate::acp::state::Event;
     use std::collections::HashMap;
 
     fn applied_env(config: &SpawnConfig) -> HashMap<String, String> {
@@ -690,7 +689,7 @@ mod tests {
     async fn spawn_classifies_missing_binary_and_missing_cwd() {
         let mut config = env_test_spawn_config(std::env::temp_dir());
         config.spec.command = "/nonexistent/agent/binary/aoe-test".into();
-        let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
+        let result = spawn_subprocess(&config);
         assert!(matches!(result, Err(AcpError::Spawn(_))));
 
         // A bare adapter missing from a configured PATH names that PATH.
@@ -699,7 +698,7 @@ mod tests {
         config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
         config.base_host_environment = vec![("PATH".into(), empty.path().display().to_string())];
         config.host_environment = config.base_host_environment.clone();
-        match AcpClient::spawn(config, AcpSessionId("s-1".into())).await {
+        match spawn_subprocess(&config) {
             Err(AcpError::Spawn(msg)) => {
                 assert!(
                     msg.contains("the PATH `environment` sets for the agent"),
@@ -717,7 +716,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&missing);
         let mut config = env_test_spawn_config(missing.clone());
         config.spec.command = "/bin/true".into();
-        match AcpClient::spawn(config, AcpSessionId("s-1".into())).await {
+        match spawn_subprocess(&config) {
             Err(AcpError::ProjectPathMissing { path }) => assert_eq!(path, missing),
             Err(other) => panic!("expected ProjectPathMissing, got {other:?}"),
             Ok(_) => panic!("expected ProjectPathMissing, got Ok"),
@@ -1124,22 +1123,28 @@ mod tests {
         }
     }
 
-    /// A stdio agent that answers `initialize` with `load_session`, and `reply`
-    /// for its matching method.
+    /// A stdio agent with configured replies; after its first prompt response,
+    /// later explicit prompts complete on the same native session.
     #[cfg(unix)]
-    async fn scripted_agent(
+    fn scripted_config(
         dir: &std::path::Path,
         load_session: bool,
         replies: &[(&str, &str)],
         stored: Option<&str>,
-    ) -> AcpClient {
+    ) -> SpawnConfig {
         let mut cases = format!(
             "    *'\"method\":\"initialize\"'*)\n      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{\"loadSession\":{load_session}}}}}}}\\n' \"$id\" ;;\n"
         );
         for (method, body) in replies {
-            cases.push_str(&format!(
-                "    *'\"method\":\"{method}\"'*)\n      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,{body}}}\\n' \"$id\" ;;\n"
-            ));
+            if *method == "session/prompt" {
+                cases.push_str(&format!(
+                    "    *'\"method\":\"{method}\"'*)\n      if [ \"$prompted\" = 1 ]; then\n        printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"stopReason\":\"end_turn\"}}}}\\n' \"$id\"\n      else\n        prompted=1\n        printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,{body}}}\\n' \"$id\"\n      fi ;;\n"
+                ));
+            } else {
+                cases.push_str(&format!(
+                    "    *'\"method\":\"{method}\"'*)\n      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,{body}}}\\n' \"$id\" ;;\n"
+                ));
+            }
         }
         let script = format!(
             "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -En 's/.*\"id\":(\"[^\"]*\"|[0-9]+).*/\\1/p')\n  case $line in\n{cases}  esac\ndone\n"
@@ -1150,25 +1155,33 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let mut config = reset_fake_spawn_config(&path, &cwd);
         config.stored_acp_session_id = stored.map(Into::into);
-        AcpClient::spawn(config, AcpSessionId("scripted".into()))
-            .await
-            .expect("spawn fake agent")
+        config
     }
 
-    /// Events until the channel closes, as `kind[:detail]` strings; a startup
-    /// error fails the test.
+    /// Collect through the actual terminal publication. Native custody may
+    /// outlive a failed establishment, so channel closure is not a terminal.
     #[cfg(unix)]
-    async fn terminal_events(client: &mut AcpClient) -> Vec<String> {
+    async fn terminal_events(
+        events: &mut tokio::sync::broadcast::Receiver<crate::server::AcpBroadcastFrame>,
+        id: &str,
+    ) -> Vec<String> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut kinds = Vec::new();
-        while let Some(event) = tokio::time::timeout_at(deadline, client.next_event())
-            .await
-            .expect("timed out waiting for the connection to end")
-        {
-            match event {
-                Event::SessionContextReset { reason } => kinds.push(format!("reset:{reason}")),
+        loop {
+            let frame = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .expect("actual failed constructor reaches a terminal")
+                .expect("constructor observer must not close or lose publications");
+            if frame.session_id != id {
+                continue;
+            }
+            match frame.event.as_ref() {
+                Event::SessionContextReset { reason, .. } => kinds.push(format!("reset:{reason}")),
                 Event::RateLimit { info } => kinds.push(format!("rate_limit:{}", info.kind)),
-                Event::Stopped { reason } => kinds.push(format!("stopped:{reason}")),
+                Event::Stopped { reason } => {
+                    kinds.push(format!("stopped:{reason}"));
+                    break;
+                }
                 Event::AgentStartupError { message, .. } => {
                     panic!("recoverable failure surfaced a startup error: {message}")
                 }
@@ -1178,14 +1191,14 @@ mod tests {
         kinds
     }
 
-    /// #3560: a prompt rejected because the agent dropped the resumed session
-    /// resets context before the connection ends on a soft stop.
+    /// Unsupported-session prose on a prompt is not permission to drop identity.
+    /// A subsequent explicit prompt uses the same SDK connection and native PID.
     #[cfg(unix)]
     #[tokio::test]
     async fn recoverable_startup_failures_do_not_surface_startup_errors() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let mut client = scripted_agent(
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+        let dir = scope.tempdir();
+        let config = scripted_config(
             dir.path(),
             true,
             &[
@@ -1197,23 +1210,51 @@ mod tests {
                 ),
             ],
             Some("sid-stored"),
-        )
-        .await;
-        client.send_prompt("continue", &[]).await.unwrap();
-        let kinds = terminal_events(&mut client).await;
-        assert_eq!(kinds.len(), 2, "{kinds:?}");
-        assert!(
-            kinds[0].contains("resumed session no longer available"),
-            "{kinds:?}"
         );
-        assert_eq!(kinds[1], "stopped:stored_session_rejected");
+        let mut client = scope.spawn(config, "scripted-prompt-failure")
+            .await.expect("real managed Native constructor");
+        client.ready().await;
+        let owner = client.connected_runner().expect("actual original Native owner");
+        let selected = client.selected_native_session();
+        let mut events = Vec::new();
+        for (text, reason) in [
+            ("continue", "prompt_rejected"),
+            ("next explicit input", "prompt_complete"),
+        ] {
+            client.send_prompt(text, &[]).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let event = client.next_event().await.expect("same Native must yield data");
+                    let stopped = matches!(&event, Event::Stopped { reason: got } if got == reason);
+                    events.push(event);
+                    if stopped {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("explicit turn ends");
+            assert_eq!(client.connected_runner(), Some(owner));
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::PromptRuntimeError { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(event, Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id == &selected)));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::SessionContextReset { .. } | Event::AgentStartupError { .. }
+        )));
         let _ = client.shutdown().await;
 
         // #3514: a limit hit at `session/new` parks the session instead of
         // failing startup and burning the restart budget.
         {
-            let dir = tempfile::tempdir().unwrap();
-            let mut client = scripted_agent(
+            let dir = scope.tempdir();
+            let config = scripted_config(
                 dir.path(),
                 false,
                 &[(
@@ -1221,11 +1262,13 @@ mod tests {
                     r#""error":{"code":-32603,"message":"Internal error","data":{"details":"You have hit your limit","errorKind":"rate_limit"}}"#,
                 )],
                 None,
-            )
-            .await;
-            let kinds = terminal_events(&mut client).await;
+            );
+            let (id, mut events) = scope.create_observed(config, "scripted-new-limit").await;
+            let kinds = terminal_events(&mut events, &id).await;
             assert_eq!(kinds, ["rate_limit:rate_limit", "stopped:rate_limited"]);
-            let _ = client.shutdown().await;
+            assert!(!scope.state.acp_event_store.replay_from(&id, 0).unwrap().iter()
+                .any(|stored| matches!(stored.event.as_ref(), Event::AcpSessionAssigned { .. })));
         }
+        })).await;
     }
 }

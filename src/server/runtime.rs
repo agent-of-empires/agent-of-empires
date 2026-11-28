@@ -280,13 +280,19 @@ impl NativeRuntime {
         state: &Arc<AppState>,
     ) -> anyhow::Result<Arc<PublishedSnapshot>> {
         let _lane = self.publish_lane.lock().await;
+        // Producers retain lifecycle while taking the native flock; native
+        // observers retain that flock while publishing. Never acquire lifecycle
+        // under publication or instances exclusion and complete that lock cycle.
+        let worker_states = state.acp_supervisor.worker_states_snapshot().await;
+        let queue_controls = super::api::sessions::queue_control_states(state).await?;
         let _publication = state.publication.read().await;
         let mutation_epoch = state
             .mutation_epoch
             .load(std::sync::atomic::Ordering::SeqCst);
         let health = state.canonical_health.read().await.clone();
         let project_started = std::time::Instant::now();
-        let sessions = super::api::sessions::project_sessions(state).await;
+        let sessions =
+            super::api::sessions::project_sessions(state, &worker_states, &queue_controls).await?;
         let project_ms = project_started.elapsed().as_secs_f64() * 1000.0;
         let metadata = state.canonical_metadata.read().await;
         let workspace_ordering =
@@ -425,6 +431,10 @@ impl NativeRuntime {
 
     pub(crate) fn has_subscribers(&self) -> bool {
         self.snapshots.receiver_count() != 0
+    }
+
+    pub(crate) fn subscribe_snapshots(&self) -> watch::Receiver<Option<Arc<PublishedSnapshot>>> {
+        self.snapshots.subscribe()
     }
 
     /// Replace the advisory creation progress. Never fails and never blocks:
@@ -1006,55 +1016,29 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn sandbox_progress_poison_keeps_last_activity_without_publishing() {
-        use crate::migrations::progress::{ConsoleProgress, Event};
-
-        let initial = crate::daemon::SandboxProgress {
-            operation_id: "copy".into(),
-            session_id: "session".into(),
-            profile: "test".into(),
-            activity: "starting".into(),
-        };
-        let (progress, mut receiver) = watch::channel(vec![initial]);
-        let console = std::sync::Mutex::new(ConsoleProgress::default());
-        update_sandbox_progress(
-            &progress,
-            "copy",
-            &console,
-            Event::Started {
-                version: 27,
-                name: "isolate_sandbox_stores",
-                position: 1,
-                total: 1,
-            },
-        );
-        update_sandbox_progress(
-            &progress,
-            "copy",
-            &console,
-            Event::Step("copying store".into()),
-        );
-        let previous = receiver.borrow_and_update().clone();
-        assert!(previous[0].activity.starts_with("copying store ("));
-        let poisoned = std::panic::catch_unwind(|| {
-            let _guard = console.lock().unwrap();
-            panic!("poison progress renderer");
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn worker_snapshot_precedes_publication_and_instance_exclusion() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        let captured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::acp::supervisor::before_worker_states_snapshot_for_test({
+            let state = state.clone();
+            let captured = captured.clone();
+            move || {
+                assert!(
+                    state.publication.try_write().is_ok(),
+                    "publication→lifecycle would close the producer/native-flock cycle"
+                );
+                assert!(
+                    state.instances.try_write().is_ok(),
+                    "row projection must not hold instances while acquiring lifecycle"
+                );
+                captured.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         });
-        assert!(poisoned.is_err());
-        assert!(console.is_poisoned());
-
-        for event in [
-            Event::Progress("discarded update".into()),
-            Event::Finished {
-                version: 27,
-                elapsed: Duration::from_secs(1),
-            },
-        ] {
-            update_sandbox_progress(&progress, "copy", &console, event);
-            assert_eq!(*receiver.borrow(), previous);
-            assert!(!receiver.has_changed().unwrap());
-        }
+        state.runtime.publish(&state).await.unwrap();
+        assert!(captured.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[cfg(unix)]
@@ -1256,30 +1240,6 @@ mod tests {
         Ok(())
     }
 
-    /// Only kernel-authenticated Unix owners receive hook output.
-    #[test]
-    fn if_none_match_compares_weakly_across_a_list() {
-        let etag = "\"e.1.None\"";
-        for (header, expected) in [
-            ("\"e.1.None\"", true),
-            ("W/\"e.1.None\"", true),
-            ("\"x\", W/\"e.1.None\"", true),
-            ("*", true),
-            ("\"a,*,b\"", false),
-            ("\"a,e.1.None\"", false),
-            ("\"e.2.None\"", false),
-            ("", false),
-        ] {
-            let mut headers = axum::http::HeaderMap::new();
-            headers.append(
-                axum::http::header::IF_NONE_MATCH,
-                axum::http::HeaderValue::from_str(header).unwrap(),
-            );
-            assert_eq!(if_none_match(&headers, etag), expected, "{header:?}");
-        }
-        assert!(!if_none_match(&axum::http::HeaderMap::new(), etag));
-    }
-
     #[test]
     fn creation_progress_is_granted_only_to_the_local_owner() {
         assert!(creation_progress_granted(Some(&Principal::LocalPeer {
@@ -1344,6 +1304,81 @@ mod tests {
                 None => std::fs::remove_file(&path).unwrap(),
             }
         }
+    }
+
+    #[test]
+    fn sandbox_progress_poison_keeps_last_activity_without_publishing() {
+        use crate::migrations::progress::{ConsoleProgress, Event};
+
+        let initial = crate::daemon::SandboxProgress {
+            operation_id: "copy".into(),
+            session_id: "session".into(),
+            profile: "test".into(),
+            activity: "starting".into(),
+        };
+        let (progress, mut receiver) = watch::channel(vec![initial]);
+        let console = std::sync::Mutex::new(ConsoleProgress::default());
+        update_sandbox_progress(
+            &progress,
+            "copy",
+            &console,
+            Event::Started {
+                version: 27,
+                name: "isolate_sandbox_stores",
+                position: 1,
+                total: 1,
+            },
+        );
+        update_sandbox_progress(
+            &progress,
+            "copy",
+            &console,
+            Event::Step("copying store".into()),
+        );
+        let previous = receiver.borrow_and_update().clone();
+        assert!(previous[0].activity.starts_with("copying store ("));
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = console.lock().unwrap();
+            panic!("poison progress renderer");
+        });
+        assert!(poisoned.is_err());
+        assert!(console.is_poisoned());
+
+        for event in [
+            Event::Progress("discarded update".into()),
+            Event::Finished {
+                version: 27,
+                elapsed: Duration::from_secs(1),
+            },
+        ] {
+            update_sandbox_progress(&progress, "copy", &console, event);
+            assert_eq!(*receiver.borrow(), previous);
+            assert!(!receiver.has_changed().unwrap());
+        }
+    }
+
+    /// Only kernel-authenticated Unix owners receive hook output.
+    #[test]
+    fn if_none_match_compares_weakly_across_a_list() {
+        let etag = "\"e.1.None\"";
+        for (header, expected) in [
+            ("\"e.1.None\"", true),
+            ("W/\"e.1.None\"", true),
+            ("\"x\", W/\"e.1.None\"", true),
+            ("*", true),
+            ("\"a,*,b\"", false),
+            ("\"a,e.1.None\"", false),
+            ("\"e.2.None\"", false),
+            ("", false),
+        ] {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.append(
+                axum::http::header::IF_NONE_MATCH,
+                axum::http::HeaderValue::from_str(header).unwrap(),
+            );
+            assert_eq!(if_none_match(&headers, etag), expected, "{header:?}");
+        }
+        assert!(!if_none_match(&axum::http::HeaderMap::new(), etag));
     }
 
     #[tokio::test]

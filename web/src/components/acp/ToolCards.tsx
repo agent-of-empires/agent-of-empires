@@ -34,7 +34,7 @@ import {
 import { useSubagentFor } from "./backgroundAgentsContext";
 import { SubagentCard } from "./GroupToolCards";
 import { classifyTodoWrite, TodoUpdateCard } from "./TodoCards";
-import { statusFor } from "./ToolCardChrome";
+import { statusFor, toolOutput } from "./ToolCardChrome";
 import { ToolIdProvider } from "./ToolExpansion";
 import { ToolOutputMedia } from "./ToolOutputMedia";
 
@@ -55,12 +55,13 @@ export function ToolCard({ tool, result, nested }: Props) {
   ) : (
     renderToolCard(tool, result, profile)
   );
-  // The read card shows its own output media inside its body.
+  const output = toolOutput(tool, result);
+  // Completed Read media stays inside its card. Nonterminal output has no completion card.
   const content =
-    result?.output?.length && card.type !== ReadToolCard ? (
+    output?.length && (!result || card.type !== ReadToolCard) ? (
       <>
         {card}
-        <ToolOutputMedia blocks={result.output} />
+        <ToolOutputMedia blocks={output} />
       </>
     ) : (
       card
