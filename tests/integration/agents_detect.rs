@@ -42,7 +42,7 @@ fn agents_detect_reports_the_deciding_rule_and_exit_code() {
         path.to_string_lossy().into_owned()
     };
     let manifest = write("manifest.toml", MANIFEST);
-    let busy = write("busy.txt", "\x1b[1mWorking\x1b[0m on it\n");
+    let busy = write("busy.txt", "Wor\x1b[1mking\x1b[0m on it\n");
     let quiet = write("quiet.txt", "nothing to see\n");
     let broken = write("broken.toml", "not = [valid");
     let hook = write("hook", "waiting\n");
