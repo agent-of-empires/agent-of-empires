@@ -559,13 +559,21 @@ pub fn alias_profile(alias: &str) -> Option<&'static AgentProfile> {
     }
 }
 
-/// [`resolve_for`], except that a custom agent takes the reset alias `session` declares for it.
+/// [`resolve_for`] that also knows the session's custom agents, and where a custom agent takes the reset alias `session` declares for it.
 pub fn resolve_with_config(
     registry: Arc<crate::plugin::PluginRegistry>,
     key: &str,
     session: &crate::session::config::SessionConfig,
 ) -> Arc<AgentProfile> {
-    let resolved = resolve_for(registry, key);
+    let resolved = resolve_declared(
+        registry,
+        key,
+        session
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
+    );
     if matches!(resolved.source, ProfileSource::Plugin { .. }) {
         return resolved.profile;
     }
@@ -627,11 +635,21 @@ impl ResolvedProfile {
     }
 }
 
-/// The profile for `key` under `registry`: the declaration of the plugin that wins the tool
-/// (same selection as the launch declaration), else the core profile, else the default.
+/// The profile for `key` under `registry`: the declaration of the plugin that wins the tool,
+/// else the core profile, else the default. It does not know the user's custom agents, so a
+/// custom agent named like a plugin tool still gets the plugin's profile; use
+/// [`resolve_with_config`] where the session config is at hand.
 pub fn resolve_for(registry: Arc<crate::plugin::PluginRegistry>, key: &str) -> ResolvedProfile {
+    resolve_declared(registry, key, std::iter::empty())
+}
+
+fn resolve_declared<'a>(
+    registry: Arc<crate::plugin::PluginRegistry>,
+    key: &str,
+    custom_agents: impl Iterator<Item = &'a str>,
+) -> ResolvedProfile {
     if let Some(agent) =
-        crate::plugin::agent_integration::declared_agent(registry, key, std::iter::empty())
+        crate::plugin::agent_integration::declared_agent(registry, key, custom_agents)
     {
         if let Some(declaration) = &agent.contribution().profile {
             return ResolvedProfile {

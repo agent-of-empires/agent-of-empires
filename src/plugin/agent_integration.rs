@@ -3546,6 +3546,23 @@ command = "acme-omp-shim"
     }
 
     #[test]
+    fn a_custom_agent_named_like_a_plugin_tool_gets_no_plugin_profile() {
+        use crate::acp::agent_profiles::resolve_with_config;
+        let registry = test_registry(&[(
+            profile_manifest("acme.new", "fresh", "clear_aliases = [\"/reset\"]\n"),
+            true,
+        )]);
+        let mut session = crate::session::config::SessionConfig::default();
+        let plugin = resolve_with_config(registry.clone(), "fresh", &session);
+        assert_eq!(plugin.clear_aliases, ["/reset"]);
+        session
+            .custom_agents
+            .insert("fresh".into(), "my-fresh".into());
+        let custom = resolve_with_config(registry, "fresh", &session);
+        assert!(custom.clear_aliases.is_empty());
+    }
+
+    #[test]
     fn a_plugin_profile_keeps_no_host_trust_fields() {
         use crate::acp::agent_profiles::resolve_for;
         let registry = test_registry(&[(

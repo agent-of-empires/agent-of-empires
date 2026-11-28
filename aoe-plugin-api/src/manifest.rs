@@ -904,18 +904,18 @@ fn slash_alias_ok(alias: &str) -> bool {
     alias.starts_with('/') && !alias.chars().any(char::is_whitespace)
 }
 
-/// `{n}`, `{n,}` or `{n,m}` starting at `chars[i] == '{'`: the end index and
-/// whether the repeat is unbounded.
-fn brace_quantifier(chars: &[char], i: usize) -> Option<(usize, bool)> {
+/// End index of a `{n}`, `{n,}` or `{n,m}` repeat starting at `chars[i] == '{'`.
+fn brace_quantifier(chars: &[char], i: usize) -> Option<usize> {
     let close = chars[i..].iter().position(|&c| c == '}')? + i;
     let body: String = chars[i + 1..close].iter().collect();
     let (lo, hi) = body.split_once(',').unwrap_or((&body, &body));
     let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    (!lo.is_empty() && digits(lo) && digits(hi)).then_some((close, hi.is_empty()))
+    (!lo.is_empty() && digits(lo) && digits(hi)).then_some(close)
 }
 
-/// True when a group that holds a quantifier is itself repeated without bound:
-/// such patterns backtrack catastrophically in the browser's regex engine.
+/// True when any repeat (`*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}`) applies to a group that holds
+/// a quantifier or an alternation: such patterns backtrack catastrophically in the browser's
+/// regex engine.
 fn has_nested_quantifier(pattern: &str) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
     let mut groups: Vec<bool> = Vec::new();
@@ -926,12 +926,17 @@ fn has_nested_quantifier(pattern: &str) -> bool {
             '\\' => i += 1,
             _ if in_class => in_class = chars[i] != ']',
             '[' => in_class = true,
-            '(' => groups.push(false),
+            '(' => {
+                groups.push(false);
+                if chars.get(i + 1) == Some(&'?') {
+                    i += 1;
+                }
+            }
             ')' => {
                 let inner = groups.pop().unwrap_or(false);
                 let repeated = match chars.get(i + 1) {
-                    Some('*' | '+') => true,
-                    Some('{') => brace_quantifier(&chars, i + 1).is_some_and(|(_, open)| open),
+                    Some('*' | '+' | '?') => true,
+                    Some('{') => brace_quantifier(&chars, i + 1).is_some(),
                     _ => false,
                 };
                 if inner && repeated {
@@ -941,18 +946,45 @@ fn has_nested_quantifier(pattern: &str) -> bool {
                     *parent |= inner;
                 }
             }
-            '*' | '+' => {
+            '*' | '+' | '?' | '|' => {
                 if let Some(group) = groups.last_mut() {
                     *group = true;
                 }
             }
             '{' => {
-                if let Some((end, _)) = brace_quantifier(&chars, i) {
+                if let Some(end) = brace_quantifier(&chars, i) {
                     if let Some(group) = groups.last_mut() {
                         *group = true;
                     }
                     i = end;
                 }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when the pattern uses syntax the Rust `regex` crate accepts but a browser's
+/// `RegExp` rejects or reads differently: inline flag groups, `(?P<` named groups and the
+/// `\A`, `\z` and `\Z` anchors. Only `(?:` groups are allowed.
+fn has_rust_only_regex_syntax(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                if matches!(chars.get(i + 1), Some('A' | 'z' | 'Z')) {
+                    return true;
+                }
+                i += 1;
+            }
+            _ if in_class => in_class = chars[i] != ']',
+            '[' => in_class = true,
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) != Some(&':') => {
+                return true;
             }
             _ => {}
         }
@@ -1036,7 +1068,14 @@ fn validate_agent_profile(
             !has_nested_quantifier(pattern),
             format!(
                 "agent_integrations[{i}].profile.memory_path_regex must not repeat a group that \
-                 holds a quantifier"
+                 holds a quantifier or an alternation"
+            ),
+        );
+        check(
+            !has_rust_only_regex_syntax(pattern),
+            format!(
+                "agent_integrations[{i}].profile.memory_path_regex must not use inline flags, \
+                 named groups or the \\A, \\z and \\Z anchors, which browsers do not read the same"
             ),
         );
     }
@@ -1804,6 +1843,10 @@ impl PluginManifest {
                 );
             }
             if let Some(profile) = &integration.profile {
+                check(
+                    integration.command.is_some(),
+                    format!("agent_integrations[{i}].profile requires command"),
+                );
                 check(
                     self.api_version >= 30,
                     format!("agent_integrations[{i}].profile requires api_version >= 30"),

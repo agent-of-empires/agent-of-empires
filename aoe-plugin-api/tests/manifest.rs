@@ -1119,6 +1119,46 @@ fn agent_profile_is_validated() {
             PROFILE.replace("\"(^|/)", &format!("\"{}", "a".repeat(257))),
             Some("memory_path_regex"),
         ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(a|b)?"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(a|b){2}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(?:a+){3}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(?i)a"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(?P<n>a)"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\Aa"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"a\\\\z"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"a\\\\Z"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(?>a)"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("command = \"example\"\n", ""),
+            Some("profile requires command"),
+        ),
     ];
     for (body, want) in cases {
         let body = if body.is_empty() {

@@ -137,13 +137,13 @@ For reply-enabled integrations, the provider report's `reply_keys` must contain 
 
 ### Agent profile (API 30)
 
-`[agent_integrations.profile]` declares how the web dashboard and TUI render and drive the agent's structured view, with the field names of the host's built-in agent profile. It requires `api_version >= 30`. Every field is optional.
+`[agent_integrations.profile]` declares how the web dashboard and TUI render and drive the agent's structured view, with the field names of the host's built-in agent profile. It requires `api_version >= 30` and the entry's `command`. Every field is optional.
 
 - Slash commands: `clear_aliases` and `compact_aliases`, each a single token starting with `/`; `clear_requires_driven_reset`.
 - Capabilities: `supports_exit_plan_mode`, `supports_wakeup_tools`, `emits_heartbeat_keepalives`, `supports_subagents`, `todos`, `skills`, `mobile_monitor_only`.
 - Names: `parent_meta_namespaces`, `subagent_tool_names`, `mcp_prefixes`, `yolo_mode_id`.
 - Tool cards: `card_aliases` with `execute`, `read`, `edit`, `delete`, `search`, `fetch`, `think`; `special_titles` with `skill_names`, `schedule_names`, `harness_names`, `workflow_names`.
-- `memory_path_regex`: a path regex that marks memory file operations. It must compile with the Rust `regex` crate and, because browsers run it, must not repeat a group that contains a quantifier.
+- `memory_path_regex`: a path regex that marks memory file operations. It must compile with the Rust `regex` crate and, because browsers run it, must not repeat a group (with `*`, `+`, `?` or `{n,m}`) that contains a quantifier or an alternation, and must not use inline flags, `(?P<` named groups or the `\A`, `\z` and `\Z` anchors.
 
 Lists hold at most 32 unique, nonempty, printable strings of at most 128 bytes; `memory_path_regex` is at most 256 bytes. The agent key, fullscreen probe, one-shot capture patterns, native config agent, MCP env expansion and legacy mode fallback are not declarable.
 

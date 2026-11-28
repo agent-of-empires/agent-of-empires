@@ -1036,12 +1036,14 @@ struct BannerMatcher {
     lines: regex::RegexSet,
 }
 
-/// Compiled once per profile key; a profile's patterns are static.
+/// Compiled once per distinct pattern set, so profiles sharing a key never share a matcher.
 fn banner_matcher(profile: &AgentProfile) -> &'static BannerMatcher {
-    static CACHE: LazyLock<Mutex<HashMap<String, &'static BannerMatcher>>> =
+    type Patterns = (Option<&'static str>, &'static [&'static str]);
+    static CACHE: LazyLock<Mutex<HashMap<Patterns, &'static BannerMatcher>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    cache.entry(profile.key.clone()).or_insert_with(|| {
+    let patterns = (profile.oneshot_gate, profile.oneshot_strip_patterns);
+    cache.entry(patterns).or_insert_with(|| {
         let ci = |pattern: &str| format!("(?i){pattern}");
         Box::leak(Box::new(BannerMatcher {
             gate: profile
@@ -2728,6 +2730,20 @@ Patched the race in auth.rs and added a regression test.";
         // The real conversation survives.
         assert!(stripped.contains("fix the flaky login redirect test"));
         assert!(stripped.contains("Patched the race in auth.rs"));
+    }
+
+    #[test]
+    fn strip_agent_banner_follows_the_profile_patterns_not_its_key() {
+        let mut bare = resolve("claude").clone();
+        bare.oneshot_gate = None;
+        bare.oneshot_strip_patterns = &[];
+        // The bare profile is matched first so a key-keyed cache would poison the core one.
+        assert_eq!(
+            strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, &bare),
+            CLAUDE_BANNER_TRANSCRIPT
+        );
+        let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, resolve("claude"));
+        assert!(!stripped.contains("Welcome back"));
     }
 
     #[test]
